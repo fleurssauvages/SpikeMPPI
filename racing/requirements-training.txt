@@ -1,0 +1,8 @@
+# Keep the CUDA-enabled JAX/MuJoCo installation already working on the machine.
+# Brax PyPI 0.14.2 still contains jax.device_put_replicated with newer JAX,
+# so use current upstream Brax until a newer compatible release is installed.
+brax @ git+https://github.com/google/brax.git
+flax
+ml-collections
+# The project also expects the user's existing MuJoCo/MJX-Warp and
+# mujoco_playground installations; do not force-reinstall them here.

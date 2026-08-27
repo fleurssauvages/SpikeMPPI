@@ -1,0 +1,130 @@
+[
+  {
+    "vx": -1.0,
+    "wz": -1.0,
+    "tracking_lin": 0.010683242178983886,
+    "tracking_yaw": 0.13984343962659182,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": -0.5,
+    "tracking_lin": 0.01827098658608477,
+    "tracking_yaw": 0.30389406707779915,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": 0.0,
+    "tracking_lin": 0.043702252177076344,
+    "tracking_yaw": 0.477527897212979,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": 0.5,
+    "tracking_lin": 0.09180856848622239,
+    "tracking_yaw": 0.36560524994457116,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": 1.0,
+    "tracking_lin": 0.1422149414745174,
+    "tracking_yaw": 0.24545299924332314,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -0.5,
+    "wz": -1.0,
+    "tracking_lin": 0.3369962002215718,
+    "tracking_yaw": 0.06979416129837092,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -0.5,
+    "wz": 1.0,
+    "tracking_lin": 0.32393161979397467,
+    "tracking_yaw": 0.14888543692783382,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 0.0,
+    "wz": -1.0,
+    "tracking_lin": 0.8796093496371205,
+    "tracking_yaw": 0.06039584797293447,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 0.0,
+    "wz": 1.0,
+    "tracking_lin": 0.787811484926708,
+    "tracking_yaw": 0.06309732226745829,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 0.5,
+    "wz": -1.0,
+    "tracking_lin": 0.21825432229452,
+    "tracking_yaw": 0.1843797480193747,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 0.5,
+    "wz": 1.0,
+    "tracking_lin": 0.20673692649672282,
+    "tracking_yaw": 0.12697147266486752,
+    "survived": 0.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": -1.0,
+    "tracking_lin": 0.14011143352462307,
+    "tracking_yaw": 0.21573668233509047,
+    "survived": 0.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": -0.5,
+    "tracking_lin": 0.09308987964510633,
+    "tracking_yaw": 0.3285374063702456,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": 0.0,
+    "tracking_lin": 0.04011793343242008,
+    "tracking_yaw": 0.8445749849455808,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": 0.5,
+    "tracking_lin": 0.039635336564529215,
+    "tracking_yaw": 0.34604403808333845,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": 1.0,
+    "tracking_lin": 0.04052103425786591,
+    "tracking_yaw": 0.07668603519173414,
+    "survived": 1.0,
+    "passed": 0.0
+  }
+]

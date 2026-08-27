@@ -1,0 +1,402 @@
+[
+  {
+    "vx": -3.0,
+    "wz": -0.5,
+    "tracking_lin": 0.19123858755388862,
+    "tracking_yaw": 0.42211057234943944,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -3.0,
+    "wz": 0.0,
+    "tracking_lin": 2.4912606481122927e-12,
+    "tracking_yaw": 0.19621297513738806,
+    "survived": 0.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -3.0,
+    "wz": 1.0,
+    "tracking_lin": 0.5218620543115463,
+    "tracking_yaw": 0.35631882317479774,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -2.5,
+    "wz": -2.0,
+    "tracking_lin": 0.6394098314786154,
+    "tracking_yaw": 0.36759741284031555,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -2.5,
+    "wz": -1.5,
+    "tracking_lin": 0.6815803262804044,
+    "tracking_yaw": 0.5517009856072339,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -2.5,
+    "wz": -1.0,
+    "tracking_lin": 0.6530634145015167,
+    "tracking_yaw": 0.6367552499394888,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -2.5,
+    "wz": 0.5,
+    "tracking_lin": 0.7354565176541011,
+    "tracking_yaw": 0.763360391138402,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -2.5,
+    "wz": 1.5,
+    "tracking_lin": 0.683351213202376,
+    "tracking_yaw": 0.5715687555496755,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -2.0,
+    "wz": -2.5,
+    "tracking_lin": 0.7423728468542649,
+    "tracking_yaw": 0.5923853116353907,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -2.0,
+    "wz": 2.0,
+    "tracking_lin": 0.7017496153636538,
+    "tracking_yaw": 0.5175797255760739,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -2.0,
+    "wz": 2.5,
+    "tracking_lin": 0.6827374904455678,
+    "tracking_yaw": 0.2614476452722155,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.5,
+    "wz": -4.0,
+    "tracking_lin": 0.6737034841069942,
+    "tracking_yaw": 0.294511352755,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.5,
+    "wz": -3.5,
+    "tracking_lin": 0.7078473423354775,
+    "tracking_yaw": 0.48606469506998395,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.5,
+    "wz": -3.0,
+    "tracking_lin": 0.7487500945396541,
+    "tracking_yaw": 0.6278616329069736,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.5,
+    "wz": 3.0,
+    "tracking_lin": 0.708679680489674,
+    "tracking_yaw": 0.3926563279274157,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": -5.0,
+    "tracking_lin": 0.7477351302915366,
+    "tracking_yaw": 0.2599557974215811,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": -4.5,
+    "tracking_lin": 0.7556706267772009,
+    "tracking_yaw": 0.49784602642137565,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": 3.5,
+    "tracking_lin": 0.7991786633449826,
+    "tracking_yaw": 0.6787702603008445,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": 4.0,
+    "tracking_lin": 0.7663748129961224,
+    "tracking_yaw": 0.5540385062073324,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": 4.5,
+    "tracking_lin": 0.6861802857160006,
+    "tracking_yaw": 0.46342149482771733,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": 5.0,
+    "tracking_lin": 0.6747755710270301,
+    "tracking_yaw": 0.4618371721423603,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -1.0,
+    "wz": 5.5,
+    "tracking_lin": 0.5706892224318024,
+    "tracking_yaw": 0.3371236848771479,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -0.5,
+    "wz": -6.0,
+    "tracking_lin": 0.8217170438818393,
+    "tracking_yaw": 0.31779883909027223,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -0.5,
+    "wz": -5.5,
+    "tracking_lin": 0.8477384891314176,
+    "tracking_yaw": 0.4402620034435965,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": -0.5,
+    "wz": 6.0,
+    "tracking_lin": 0.8219462751384963,
+    "tracking_yaw": 0.6129914780132384,
+    "survived": 1.0,
+    "passed": 1.0
+  },
+  {
+    "vx": 0.5,
+    "wz": -6.0,
+    "tracking_lin": 0.8141942102761216,
+    "tracking_yaw": 0.4254886745687715,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 0.5,
+    "wz": 5.5,
+    "tracking_lin": 0.8353523365375507,
+    "tracking_yaw": 0.6148202614433719,
+    "survived": 1.0,
+    "passed": 1.0
+  },
+  {
+    "vx": 0.5,
+    "wz": 6.0,
+    "tracking_lin": 0.7522163107984403,
+    "tracking_yaw": 0.6577070324086622,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": -5.5,
+    "tracking_lin": 0.7019721318238002,
+    "tracking_yaw": 0.20536024135606679,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": -5.0,
+    "tracking_lin": 0.7011039189903404,
+    "tracking_yaw": 0.3694440456793654,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": -4.5,
+    "tracking_lin": 0.7257092736385506,
+    "tracking_yaw": 0.49689272082206665,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": -4.0,
+    "tracking_lin": 0.7975027955414735,
+    "tracking_yaw": 0.6342661031544395,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": 4.0,
+    "tracking_lin": 0.7937301298063717,
+    "tracking_yaw": 0.6046614216285948,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": 4.5,
+    "tracking_lin": 0.7496001648972249,
+    "tracking_yaw": 0.5599106479270117,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.0,
+    "wz": 5.0,
+    "tracking_lin": 0.7009559199279272,
+    "tracking_yaw": 0.39096631733924636,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.5,
+    "wz": -3.5,
+    "tracking_lin": 0.7336988251352126,
+    "tracking_yaw": 0.2536178635662386,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.5,
+    "wz": -3.0,
+    "tracking_lin": 0.7461102204238926,
+    "tracking_yaw": 0.418921022347319,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.5,
+    "wz": 2.5,
+    "tracking_lin": 0.7270514771186773,
+    "tracking_yaw": 0.658065002175791,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.5,
+    "wz": 3.0,
+    "tracking_lin": 0.7690628860135158,
+    "tracking_yaw": 0.6235600616623461,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 1.5,
+    "wz": 3.5,
+    "tracking_lin": 0.6938173709460326,
+    "tracking_yaw": 0.48619237381919744,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.0,
+    "wz": -2.5,
+    "tracking_lin": 0.6164062965662283,
+    "tracking_yaw": 0.29828481049622213,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.0,
+    "wz": -2.0,
+    "tracking_lin": 0.7053447873553789,
+    "tracking_yaw": 0.44564155535100847,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.0,
+    "wz": -1.0,
+    "tracking_lin": 0.7811545095514189,
+    "tracking_yaw": 0.7476930866096582,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.0,
+    "wz": 2.0,
+    "tracking_lin": 0.7325947345460528,
+    "tracking_yaw": 0.6996413031769664,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.5,
+    "wz": -1.5,
+    "tracking_lin": 0.7136489266123021,
+    "tracking_yaw": 0.5891962549730098,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.5,
+    "wz": -0.5,
+    "tracking_lin": 0.7091216560264738,
+    "tracking_yaw": 0.7611754299459516,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.5,
+    "wz": 0.0,
+    "tracking_lin": 0.7358210619447577,
+    "tracking_yaw": 0.8046733434689243,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.5,
+    "wz": 0.5,
+    "tracking_lin": 0.7484627117609702,
+    "tracking_yaw": 0.8573902830296398,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.5,
+    "wz": 1.0,
+    "tracking_lin": 0.6929903853405698,
+    "tracking_yaw": 0.742423333733328,
+    "survived": 1.0,
+    "passed": 0.0
+  },
+  {
+    "vx": 2.5,
+    "wz": 1.5,
+    "tracking_lin": 0.658833861586777,
+    "tracking_yaw": 0.5946727237542628,
+    "survived": 1.0,
+    "passed": 0.0
+  }
+]
