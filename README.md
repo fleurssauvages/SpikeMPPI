@@ -2,8 +2,6 @@
 
 This project uses the MuJoCo locomotion robots, with **Ant** as the primary 2-D stadium racer. The default policy trainer is an adaptation of Margolis et al., *Rapid Locomotion via Reinforcement Learning* (RSS 2022 / IJRR), and an MPPI controller refines the learned policy online for racing.
 
-The trainer keeps the morphology-independent ideas from Rapid Locomotion—command-conditioned locomotion, PPO, a joint forward-velocity/yaw-rate curriculum, domain randomization and push disturbances—but adapts them to the classic MuJoCo Ant/Humanoid models and **direct native MuJoCo actuator controls** rather than the Mini Cheetah PD joint-position interface.
-
 - Paper: https://doi.org/10.1177/02783649231224053
 - Released reference code: https://github.com/Improbable-AI/rapid-locomotion-rl
 
