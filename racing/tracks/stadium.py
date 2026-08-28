@@ -21,6 +21,52 @@ class StadiumTrack:
     origin_xy: tuple[float, float] = (0.0, 0.0)
     origin_yaw: float = 0.0
 
+    def __post_init__(self) -> None:
+        # Cache the rigid transform used by every online geometry query.
+        # Track geometry is immutable during a race, so rebuilding these tiny
+        # arrays thousands of times per second is pure overhead.
+        c = math.cos(float(self.origin_yaw))
+        sn = math.sin(float(self.origin_yaw))
+        self._rot = np.asarray([[c, -sn], [sn, c]], dtype=np.float64)
+        self._origin = np.asarray(self.origin_xy, dtype=np.float64)
+        # start_s lies halfway along the lower straight in canonical space.
+        self._canonical_start = np.asarray(
+            [self.left_arc_x + self.start_s, self.center_y - self.centerline_radius],
+            dtype=np.float64,
+        )
+
+    def _canonical_sample_scalar(self, s: float) -> tuple[float, float]:
+        s = float(s) % self.length
+        r = self.centerline_radius
+        straight = self.straight_length
+        yc = self.center_y
+        arc = math.pi * r
+        if s < straight:
+            return self.left_arc_x + s, yc - r
+        if s < straight + arc:
+            theta = -0.5 * math.pi + (s - straight) / r
+            return self.right_arc_x + r * math.cos(theta), yc + r * math.sin(theta)
+        if s < 2.0 * straight + arc:
+            st = s - straight - arc
+            return self.right_arc_x - st, yc + r
+        theta = 0.5 * math.pi + (s - 2.0 * straight - arc) / r
+        return self.left_arc_x + r * math.cos(theta), yc + r * math.sin(theta)
+
+    def _canonical_tangent_scalar(self, s: float) -> tuple[float, float]:
+        s = float(s) % self.length
+        r = self.centerline_radius
+        straight = self.straight_length
+        arc = math.pi * r
+        if s < straight:
+            return 1.0, 0.0
+        if s < straight + arc:
+            theta = -0.5 * math.pi + (s - straight) / r
+            return -math.sin(theta), math.cos(theta)
+        if s < 2.0 * straight + arc:
+            return -1.0, 0.0
+        theta = 0.5 * math.pi + (s - 2.0 * straight - arc) / r
+        return -math.sin(theta), math.cos(theta)
+
     @property
     def outer_radius(self) -> float:
         return 0.5 * self.height
@@ -106,33 +152,34 @@ class StadiumTrack:
 
     def _transform(self, xy: np.ndarray, vectors: bool = False) -> np.ndarray:
         xy = np.asarray(xy, dtype=np.float64)
-        start = self._canonical_sample(np.asarray([self.start_s]))[0]
-        c = math.cos(self.origin_yaw)
-        sn = math.sin(self.origin_yaw)
-        rot = np.asarray([[c, -sn], [sn, c]], dtype=np.float64)
         if vectors:
-            return xy @ rot.T
-        return (xy - start) @ rot.T + np.asarray(self.origin_xy, dtype=np.float64)
+            return xy @ self._rot.T
+        return (xy - self._canonical_start) @ self._rot.T + self._origin
 
     def _inverse_transform(self, xy: np.ndarray) -> np.ndarray:
         xy = np.asarray(xy, dtype=np.float64)
-        start = self._canonical_sample(np.asarray([self.start_s]))[0]
-        c = math.cos(self.origin_yaw)
-        sn = math.sin(self.origin_yaw)
-        rot = np.asarray([[c, -sn], [sn, c]], dtype=np.float64)
-        return (xy - np.asarray(self.origin_xy, dtype=np.float64)) @ rot + start
+        return (xy - self._origin) @ self._rot + self._canonical_start
 
     def sample(self, s) -> np.ndarray:
-        scalar = np.ndim(s) == 0
-        arr = np.atleast_1d(np.asarray(s, dtype=np.float64))
-        out = self._transform(self._canonical_sample(arr))
-        return out[0] if scalar else out
+        if np.ndim(s) == 0:
+            x, y = self._canonical_sample_scalar(float(s))
+            dx, dy = x - self._canonical_start[0], y - self._canonical_start[1]
+            return np.asarray([
+                dx * self._rot[0, 0] + dy * self._rot[0, 1] + self._origin[0],
+                dx * self._rot[1, 0] + dy * self._rot[1, 1] + self._origin[1],
+            ], dtype=np.float64)
+        arr = np.asarray(s, dtype=np.float64)
+        return self._transform(self._canonical_sample(arr))
 
     def tangent(self, s) -> np.ndarray:
-        scalar = np.ndim(s) == 0
-        arr = np.atleast_1d(np.asarray(s, dtype=np.float64))
-        out = self._transform(self._canonical_tangent(arr), vectors=True)
-        return out[0] if scalar else out
+        if np.ndim(s) == 0:
+            x, y = self._canonical_tangent_scalar(float(s))
+            return np.asarray([
+                x * self._rot[0, 0] + y * self._rot[0, 1],
+                x * self._rot[1, 0] + y * self._rot[1, 1],
+            ], dtype=np.float64)
+        arr = np.asarray(s, dtype=np.float64)
+        return self._transform(self._canonical_tangent(arr), vectors=True)
 
     def normal(self, s) -> np.ndarray:
         t = np.asarray(self.tangent(s), dtype=np.float64)
@@ -146,19 +193,49 @@ class StadiumTrack:
         The stadium is piecewise straight/circular.  Positive curvature follows
         the track's forward direction on both semicircles.
         """
-        scalar = np.ndim(s) == 0
-        arr = np.mod(np.atleast_1d(np.asarray(s, dtype=np.float64)), self.length)
         straight = self.straight_length
         arc = math.pi * self.centerline_radius
+        if np.ndim(s) == 0:
+            x = float(s) % self.length
+            on_arc = (straight <= x < straight + arc) or x >= 2.0 * straight + arc
+            return 1.0 / max(self.centerline_radius, 1e-12) if on_arc else 0.0
+        arr = np.mod(np.asarray(s, dtype=np.float64), self.length)
         on_arc = ((arr >= straight) & (arr < straight + arc)) | (arr >= 2.0 * straight + arc)
-        out = np.where(on_arc, 1.0 / max(self.centerline_radius, 1e-12), 0.0)
-        return float(out[0]) if scalar else out
+        return np.where(on_arc, 1.0 / max(self.centerline_radius, 1e-12), 0.0)
 
     def project(self, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         p = np.asarray(xy, dtype=np.float64)
         scalar = p.ndim == 1
         if scalar:
-            p = p[None, :]
+            # Allocation-free scalar path. This is used heavily by the policy
+            # nominal and by the online race loop.
+            dx = float(p[0]) - float(self._origin[0])
+            dy = float(p[1]) - float(self._origin[1])
+            px = dx * self._rot[0, 0] + dy * self._rot[1, 0] + self._canonical_start[0]
+            py = dx * self._rot[0, 1] + dy * self._rot[1, 1] + self._canonical_start[1]
+            r = self.centerline_radius
+            xl, xr, yc = self.left_arc_x, self.right_arc_x, self.center_y
+            straight = self.straight_length
+
+            bx = min(max(px, xl), xr)
+            candidates = [((px - bx) ** 2 + (py - (yc - r)) ** 2, bx - xl)]
+
+            tr = min(max(math.atan2(py - yc, px - xr), -0.5 * math.pi), 0.5 * math.pi)
+            rx, ry = xr + r * math.cos(tr), yc + r * math.sin(tr)
+            candidates.append(((px - rx) ** 2 + (py - ry) ** 2, straight + r * (tr + 0.5 * math.pi)))
+
+            tx = min(max(px, xl), xr)
+            candidates.append(((px - tx) ** 2 + (py - (yc + r)) ** 2, straight + math.pi * r + (xr - tx)))
+
+            tl = math.atan2(py - yc, px - xl)
+            if tl < 0.5 * math.pi:
+                tl += 2.0 * math.pi
+            tl = min(max(tl, 0.5 * math.pi), 1.5 * math.pi)
+            lx, ly = xl + r * math.cos(tl), yc + r * math.sin(tl)
+            candidates.append(((px - lx) ** 2 + (py - ly) ** 2, 2.0 * straight + math.pi * r + r * (tl - 0.5 * math.pi)))
+
+            best_d2, best_s = min(candidates, key=lambda item: item[0])
+            return np.asarray(best_s % self.length), np.asarray(best_d2)
         p = self._inverse_transform(p)
         px, py = p[:, 0], p[:, 1]
         r = self.centerline_radius

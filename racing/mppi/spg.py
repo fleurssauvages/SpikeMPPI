@@ -7,9 +7,11 @@ import numpy as np
 @dataclass
 class SPGFactors:
     task_factor: np.ndarray      # [H, nu, 2]
-    null_projector: np.ndarray   # [H, nu, nu]
+    null_projector: np.ndarray   # [H, nu, nu] (kept for diagnostics)
     corrected_covariance: np.ndarray  # [H, 2, 2]
     displacement: np.ndarray     # [H, 2]
+    pseudoinverse: np.ndarray | None = None  # [H, nu, 2]
+    jacobian: np.ndarray | None = None       # [H, 2, nu]
 
 
 def damped_pseudoinverse(jacobian: np.ndarray, damping: float) -> np.ndarray:
@@ -56,6 +58,7 @@ def build_spg_factors(
     null_projector = np.zeros((h, nu, nu), dtype=np.float64)
     corrected = np.zeros((h, 2, 2), dtype=np.float64)
     displacement = np.zeros((h, 2), dtype=np.float64)
+    pseudoinverse = np.zeros((h, nu, 2), dtype=np.float64)
 
     eye_u = np.eye(nu, dtype=np.float64)
     for t in range(h):
@@ -65,11 +68,12 @@ def build_spg_factors(
         eigval = np.maximum(eigval, float(covariance_jitter))
         root = eigvec @ np.diag(np.sqrt(eigval)) @ eigvec.T
         pinv = damped_pseudoinverse(J[t], damping)
+        pseudoinverse[t] = pinv
         task_factor[t] = pinv @ root
         null_projector[t] = eye_u - pinv @ J[t]
         corrected[t] = sigma_hat
         displacement[t] = d
-    return SPGFactors(task_factor, null_projector, corrected, displacement)
+    return SPGFactors(task_factor, null_projector, corrected, displacement, pseudoinverse, J.copy())
 
 
 def sample_joint_noise(
@@ -95,7 +99,14 @@ def sample_joint_noise(
     z_default = rng.standard_normal((count, h, nu))
 
     task = np.einsum("huj,nhj->nhu", factors.task_factor, z_task)
-    null = np.einsum("huv,nhv->nhu", factors.null_projector, z_null)
+    if nu >= 12 and factors.pseudoinverse is not None and factors.jacobian is not None:
+        # Apply (I - J^dagger J)z in factorized form for larger actuator sets.
+        # For small nu (e.g. Ant=8), NumPy's dense einsum is actually faster.
+        task_coords = np.einsum("hju,nhu->nhj", factors.jacobian, z_null)
+        correction = np.einsum("huj,nhj->nhu", factors.pseudoinverse, task_coords)
+        null = z_null - correction
+    else:
+        null = np.einsum("huv,nhv->nhu", factors.null_projector, z_null)
     null *= np.asarray(default_std, dtype=np.float64)[None, None, :] * float(null_std_scale)
     default = z_default * np.asarray(default_std, dtype=np.float64)[None, None, :]
 

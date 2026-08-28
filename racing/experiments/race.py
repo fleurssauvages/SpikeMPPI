@@ -74,6 +74,8 @@ def run_race(
     viewer_ui: bool = False,
     controller_overlay: bool = False,
     rollout_workers: int = 0,
+    rollout_backend: str = "native",
+    profile_controller: bool = False,
     verbose: bool = True,
     friction_scale: float = 1.0,
     mass_scale: float = 1.0,
@@ -137,6 +139,7 @@ def run_race(
         sensitivity_epsilon_fraction=float(sensitivity_epsilon_fraction),
         joint_noise_fraction=float(joint_noise_fraction),
         rollout_workers=int(rollout_workers),
+        rollout_backend=str(rollout_backend),
     )
     controller = JointMPPIController(planner, track, prior, policy, cfg, variant=variant, seed=seed)
 
@@ -173,6 +176,7 @@ def run_race(
     fell = False
     estimate_rows: list[list[float]] = [[1.0, 1.0, 1.0, 0.0]]
     estimate_steps: list[int] = [0]
+    profile_rows: list[dict[str, float]] = []
 
     handle = None
     if viewer:
@@ -187,7 +191,8 @@ def run_race(
     if verbose:
         print(
             f"controller={controller.variant.value}  robot={plant.name}  nu={plant.nu}  "
-            f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s"
+            f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
+            f"backend={controller.rollout_backend_name}"
         )
         if controller.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
             print(
@@ -205,6 +210,25 @@ def run_race(
             # The controller reads the physical qpos/qvel through the snapshot,
             # but all candidate rollouts use the separate planning MuJoCo model.
             ctrl, info = controller.step(plant.data, current_s)
+            if profile_controller:
+                tm_all = info.get("timing_ms", {})
+                if step >= 5:
+                    profile_rows.append({k: float(v) for k, v in tm_all.items()})
+            if profile_controller and (step < 5 or (step + 1) % 50 == 0):
+                tm = info.get("timing_ms", {})
+                total_ms = float(tm.get("total", math.nan))
+                deadline_ms = 1000.0 * cfg.control_dt
+                rtf = deadline_ms / total_ms if total_ms > 0.0 else math.nan
+                print(
+                    "MPPI timing "
+                    f"step={step + 1} nominal={tm.get('nominal', math.nan):.2f}ms "
+                    f"(policy={tm.get('policy', 0.0):.2f} spg_jac={tm.get('sensitivity', 0.0):.2f} "
+                    f"prior={tm.get('prior', 0.0):.2f}) "
+                    f"sample={tm.get('sampling', 0.0):.2f}ms "
+                    f"rollouts={tm.get('rollouts', 0.0):.2f}ms "
+                    f"update={tm.get('update', 0.0):.2f}ms total={total_ms:.2f}ms "
+                    f"deadline={deadline_ms:.2f}ms xRT={rtf:.2f}"
+                )
             plant.step_control(ctrl, substeps=controller.control_substeps, data=plant.data)
             after = plant.snapshot()
 
@@ -272,8 +296,21 @@ def run_race(
         if handle is not None:
             close_viewer(handle)
             handle = None
+        controller.close()
 
     runtime = time.perf_counter() - t0
+    if profile_controller and profile_rows:
+        keys = ("policy", "sensitivity", "prior", "sampling", "rollouts", "update", "total")
+        deadline_ms = 1000.0 * cfg.control_dt
+        summary = []
+        for key in keys:
+            vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
+            summary.append(f"{key}=p50 {np.median(vals):.2f}/p95 {np.percentile(vals, 95):.2f}ms")
+        totals = np.asarray([r.get("total", math.inf) for r in profile_rows], dtype=np.float64)
+        miss = 100.0 * float(np.mean(totals > deadline_ms))
+        print("MPPI profile (warm-up excluded): " + ", ".join(summary))
+        print(f"deadline={deadline_ms:.2f}ms  misses={miss:.1f}%  samples={len(profile_rows)}")
+
     return RaceResult(
         robot_name=plant.name,
         controller_variant=controller.variant.value,
@@ -381,7 +418,18 @@ def main() -> None:
         help="SPG is the default; standard_mppi is retained only as an ablation",
     )
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="native rollout threads; 0=auto (all logical CPU cores)",
+    )
+    parser.add_argument(
+        "--rollout-backend", choices=["native", "python"], default="native",
+        help="native uses MuJoCo's C++ batched rollout/thread pool; python keeps the legacy evaluator",
+    )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="print MPPI timing breakdown for the first steps and every 50 updates",
+    )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--headless", action="store_true", help="disable the MuJoCo viewer")
     parser.add_argument("--viewer-ui", action="store_true", help="show MuJoCo left/right UI panels")
@@ -431,6 +479,8 @@ def main() -> None:
         viewer_ui=args.viewer_ui,
         controller_overlay=args.controller_overlay,
         rollout_workers=args.workers,
+        rollout_backend=args.rollout_backend,
+        profile_controller=args.profile,
         friction_scale=args.friction_scale,
         mass_scale=args.mass_scale,
         motor_scale=args.motor_scale,
@@ -440,11 +490,15 @@ def main() -> None:
         sysid_interval=args.sysid_interval,
         sysid_estimate_slope=args.sysid_estimate_slope,
     )
+    realtime_factor = (
+        result.simulated_time_s / result.runtime_s if result.runtime_s > 0.0 else math.inf
+    )
     print(
         f"finished {result.robot_name}: {result.completed_laps}/{result.requested_laps} laps, "
         f"off_track={result.off_track}, fell={result.fell}, "
         f"progress={result.cumulative_progress[-1]:.2f}m, "
-        f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s"
+        f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s, "
+        f"xRT={realtime_factor:.2f}"
     )
     if len(result.model_estimates) > 1:
         f, m, a, slope = result.model_estimates[-1]

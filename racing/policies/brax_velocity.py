@@ -78,22 +78,35 @@ class RapidCommandEnvelope:
         positive = self.cells[self.cells[:, 0] > 1e-6]
         self.max_forward = float(np.max(positive[:, 0])) if len(positive) else 1.0
         self.max_yaw = float(np.max(np.abs(self.cells[:, 1]))) if len(self.cells) else 1.0
+        # This query runs many times while constructing every policy nominal.
+        # Keep positive commands pre-sorted instead of filtering + argsorting the
+        # curriculum cell array for every curvature lookahead.
+        if len(positive):
+            order = np.argsort(positive[:, 0])[::-1]
+            self._positive_desc = np.ascontiguousarray(positive[order], dtype=np.float64)
+        else:
+            self._positive_desc = np.empty((0, 2), dtype=np.float64)
 
     def fastest_speed(self, curvature: float, cap: float | None = None) -> float:
         kappa = float(curvature)
         cap_value = self.max_forward if cap is None else min(self.max_forward, max(0.0, float(cap)))
-        candidates = self.cells[(self.cells[:, 0] > 0.0) & (self.cells[:, 0] <= cap_value + 1e-9)]
-        if len(candidates) == 0:
-            return max(0.2, cap_value)
-        order = np.argsort(candidates[:, 0])[::-1]
         yaw_tol = max(0.30, 0.76 * self.step_wz)
-        for idx in order:
-            vx, wz_cell = candidates[idx]
+        found_candidate = False
+        fastest_candidate = 0.0
+        for vx, wz_cell in self._positive_desc:
+            vx = float(vx)
+            if vx > cap_value + 1e-9:
+                continue
+            if not found_candidate:
+                fastest_candidate = vx
+                found_candidate = True
             required_wz = vx * kappa
-            if abs(wz_cell - required_wz) <= yaw_tol:
-                return float(vx)
+            if abs(float(wz_cell) - required_wz) <= yaw_tol:
+                return vx
+        if not found_candidate:
+            return max(0.2, cap_value)
         if abs(kappa) < 1e-8:
-            return float(np.max(candidates[:, 0]))
+            return fastest_candidate
         return float(max(0.2, min(cap_value, self.max_yaw / abs(kappa))))
 
 
@@ -158,6 +171,10 @@ class BraxVelocityPolicy(JointPolicy):
         make_inference_fn = ppo_networks.make_inference_fn(networks)
         self._inference = jax.jit(make_inference_fn(params, deterministic=True))
         self._key = jax.random.PRNGKey(0)
+        self._ctrl_low = None
+        self._ctrl_high = None
+        self._ctrl_mid = None
+        self._ctrl_half = None
 
     @property
     def learned_max_speed(self) -> float:
@@ -171,18 +188,32 @@ class BraxVelocityPolicy(JointPolicy):
             )
         if int(self.metadata["action_size"]) != robot.nu:
             raise ValueError("Policy action dimension does not match MuJoCo model.nu")
+        low, high = robot.control_bounds()
+        self._ctrl_low = np.asarray(low, dtype=np.float64)
+        self._ctrl_high = np.asarray(high, dtype=np.float64)
+        self._ctrl_mid = 0.5 * (self._ctrl_low + self._ctrl_high)
+        self._ctrl_half = np.maximum(0.5 * (self._ctrl_high - self._ctrl_low), 1e-8)
 
     def _normalized_previous_action(self, robot, data) -> np.ndarray:
-        low, high = robot.control_bounds()
-        half = np.maximum(0.5 * (high - low), 1e-8)
+        if self._ctrl_mid is None or self._ctrl_half is None:
+            low, high = robot.control_bounds()
+            mid = 0.5 * (low + high)
+            half = np.maximum(0.5 * (high - low), 1e-8)
+        else:
+            mid, half = self._ctrl_mid, self._ctrl_half
         return np.clip(
-            (np.asarray(data.ctrl, dtype=np.float64) - 0.5 * (low + high)) / half,
+            (np.asarray(data.ctrl, dtype=np.float64) - mid) / half,
             -1.0,
             1.0,
         )
 
     def action_for_command(self, robot, data, command: np.ndarray) -> np.ndarray:
-        low, high = robot.control_bounds()
+        if self._ctrl_mid is None or self._ctrl_half is None:
+            low, high = robot.control_bounds()
+            mid = 0.5 * (low + high)
+            half = 0.5 * (high - low)
+        else:
+            mid, half = self._ctrl_mid, self._ctrl_half
         previous_action = self._normalized_previous_action(robot, data)
         if self.observation_version == "rapid_v2":
             obs = rapid_observation_numpy(robot, data, command, previous_action)
@@ -195,8 +226,9 @@ class BraxVelocityPolicy(JointPolicy):
         self._key, act_key = self._jax.random.split(self._key)
         action, _ = self._inference(self._jnp.asarray(obs), act_key)
         normalized = np.asarray(action, dtype=np.float64).reshape(robot.nu)
-        ctrl = 0.5 * (low + high) + 0.5 * (high - low) * np.clip(normalized, -1.0, 1.0)
-        return robot.clip_ctrl(ctrl)
+        # normalized is clipped before affine mapping, so ctrl is already inside
+        # the cached actuator bounds; avoid rebuilding those bounds once more.
+        return mid + half * np.clip(normalized, -1.0, 1.0)
 
     def _fast_track_command(self, robot, data, track, prior, current_s: float) -> np.ndarray:
         # Look ahead in curvature and select the fastest command lying inside

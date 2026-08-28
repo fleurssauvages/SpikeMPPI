@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 import math
+import time
 import numpy as np
 
 from .lbps import optimize_lbps_temperature, weighted_control_sequence
 from .rollout import (
     RolloutCostConfig,
+    NativeRolloutBatcher,
     evaluate_control_batch,
     rollout_policy_nominal,
     refine_policy_nominal,
@@ -58,6 +60,7 @@ class ControllerConfig:
     upright_weight: float = 0.05
     control_deviation_weight: float = 1e-4
     rollout_workers: int = 0
+    rollout_backend: str = "native"
 
     def __post_init__(self) -> None:
         self.horizon = max(1, int(self.horizon))
@@ -80,6 +83,9 @@ class ControllerConfig:
             raise ValueError("SPG damping and covariance jitter must be nonnegative")
         if self.sensitivity_epsilon_fraction <= 0.0:
             raise ValueError("sensitivity_epsilon_fraction must be positive")
+        self.rollout_backend = str(self.rollout_backend).strip().lower()
+        if self.rollout_backend not in {"native", "python"}:
+            raise ValueError("rollout_backend must be 'native' or 'python'")
 
 
 class JointMPPIController:
@@ -128,6 +134,28 @@ class JointMPPIController:
             upright_weight=cfg.upright_weight,
             control_deviation_weight=cfg.control_deviation_weight,
         )
+        self.native_batcher = None
+        if cfg.rollout_backend == "native":
+            try:
+                self.native_batcher = NativeRolloutBatcher(
+                    robot, workers=cfg.rollout_workers, batch_hint=cfg.num_rollouts
+                )
+            except Exception:
+                # Keep the old evaluator as a compatibility fallback for older
+                # MuJoCo builds or uncommon robot root layouts.
+                self.native_batcher = None
+
+    @property
+    def rollout_backend_name(self) -> str:
+        if self.native_batcher is not None and self.native_batcher.supports_vectorized_cost:
+            return f"native/{self.native_batcher.nthread}t"
+        return "python"
+
+    def close(self) -> None:
+        """Release native rollout worker threads explicitly."""
+        if self.native_batcher is not None:
+            self.native_batcher.close()
+            self.native_batcher = None
 
     def _build_nominal(self, data, current_s: float):
         """Build a policy-seeded nominal, computing sensitivities only when needed.
@@ -137,6 +165,7 @@ class JointMPPIController:
         difference every joint.  Sensitivity construction is reserved for SPG
         or an explicitly requested nominal refinement.
         """
+        t0 = time.perf_counter()
         start = self.robot.snapshot(data)
         policy_rollout = rollout_policy_nominal(
             self.robot,
@@ -148,6 +177,7 @@ class JointMPPIController:
             horizon=self.cfg.horizon,
             control_substeps=self.control_substeps,
         )
+        t_policy = time.perf_counter()
 
         need_spg = self.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI
         need_refine = int(self.cfg.nominal_refine_iterations) > 0
@@ -170,13 +200,21 @@ class JointMPPIController:
                 step_size=self.cfg.nominal_refine_step_size,
                 max_control_step_fraction=self.cfg.nominal_max_step_fraction,
                 epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
+                native_batcher=self.native_batcher,
             )
+        t_sensitivity = time.perf_counter()
 
         endpoint_s, _ = self.track.project(endpoints)
         prior_mean, prior_cov = self.prior.sample(self.track, endpoint_s)
+        t_prior = time.perf_counter()
+        nominal_timing_ms = {
+            "policy": 1e3 * (t_policy - t0),
+            "sensitivity": 1e3 * (t_sensitivity - t_policy),
+            "prior": 1e3 * (t_prior - t_sensitivity),
+        }
         return (
             start, policy_rollout, refined, jac, endpoints,
-            np.asarray(prior_mean), np.asarray(prior_cov),
+            np.asarray(prior_mean), np.asarray(prior_cov), nominal_timing_ms,
         )
 
     def _sample_standard(self, nominal: np.ndarray) -> np.ndarray:
@@ -223,7 +261,9 @@ class JointMPPIController:
         return controls, factors
 
     def step(self, data, current_s: float) -> tuple[np.ndarray, dict[str, Any]]:
-        start, policy_nom, refined, jac, endpoints, prior_mean, prior_cov = self._build_nominal(data, current_s)
+        t_total = time.perf_counter()
+        start, policy_nom, refined, jac, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
+        t_nominal = time.perf_counter()
         nominal = refined.controls
 
         if self.variant == ControllerVariant.POLICY_NOMINAL:
@@ -237,6 +277,12 @@ class JointMPPIController:
                 "temperature": math.nan,
                 "ess": 1.0,
                 "finite_rollouts": 1,
+                "rollout_backend": self.rollout_backend_name,
+                "timing_ms": {
+                    "nominal": 1e3 * (t_nominal - t_total),
+                    **nominal_parts,
+                    "total": 1e3 * (time.perf_counter() - t_total),
+                },
             }
 
         factors = None
@@ -244,6 +290,7 @@ class JointMPPIController:
             controls, factors = self._sample_spg(nominal, jac, endpoints, prior_mean, prior_cov)
         else:
             controls = self._sample_standard(nominal)
+        t_sample = time.perf_counter()
 
         positions, costs, terminal_progress, failed = evaluate_control_batch(
             self.robot,
@@ -255,7 +302,9 @@ class JointMPPIController:
             nominal_controls=nominal,
             cost_cfg=self.cost_cfg,
             workers=self.cfg.rollout_workers,
+            native_batcher=self.native_batcher,
         )
+        t_rollout = time.perf_counter()
 
         if self.cfg.adaptive_temperature_lbps:
             lbps = optimize_lbps_temperature(
@@ -283,6 +332,7 @@ class JointMPPIController:
         candidate = weighted_control_sequence(costs, controls, temperature)
         candidate = self.robot.clip_ctrl(candidate, self.cfg.unlimited_control_span)
         best = int(np.argmin(costs)) if len(costs) else 0
+        t_update = time.perf_counter()
         info = {
             "planned_control_sequence": candidate,
             "policy_nominal": policy_nom.controls,
@@ -300,5 +350,14 @@ class JointMPPIController:
             "best_rollout": positions[best].copy(),
             "best_cost": float(costs[best]),
             "best_terminal_progress": float(terminal_progress[best]),
+            "rollout_backend": self.rollout_backend_name,
+            "timing_ms": {
+                "nominal": 1e3 * (t_nominal - t_total),
+                **nominal_parts,
+                "sampling": 1e3 * (t_sample - t_nominal),
+                "rollouts": 1e3 * (t_rollout - t_sample),
+                "update": 1e3 * (t_update - t_rollout),
+                "total": 1e3 * (t_update - t_total),
+            },
         }
         return candidate[0].copy(), info

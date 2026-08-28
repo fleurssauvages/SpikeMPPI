@@ -228,5 +228,6 @@ class ClassicRobot:
         d = self.data if data is None else data
         if self.model.nu:
             d.ctrl[:] = self.clip_ctrl(ctrl)
-        for _ in range(max(1, int(substeps))):
-            self.mujoco.mj_step(self.model, d)
+        # MuJoCo's Python binding supports nstep directly, so repeated physics
+        # steps stay inside C++ without reacquiring the GIL between substeps.
+        self.mujoco.mj_step(self.model, d, nstep=max(1, int(substeps)))

@@ -49,9 +49,10 @@ class EmpiricalPrior(SpatialPrior):
         offset = self._interp(self.lateral_mean, arr)
         nvar = self._interp(self.normal_variance, arr)
         mean = center + offset[:, None] * normal
-        cov = np.empty((len(arr), 2, 2), dtype=np.float64)
-        for i, (t, n) in enumerate(zip(tangent, normal)):
-            cov[i] = self.tangent_std**2 * np.outer(t, t) + nvar[i] * np.outer(n, n)
+        cov = (
+            self.tangent_std**2 * tangent[:, :, None] * tangent[:, None, :]
+            + nvar[:, None, None] * normal[:, :, None] * normal[:, None, :]
+        )
         if scalar:
             return mean[0], cov[0]
         return mean, cov

@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
+import os
 from typing import Sequence
 import numpy as np
 
@@ -14,6 +15,225 @@ class RolloutCostConfig:
     min_root_up: float = 0.15
     upright_weight: float = 0.05
     control_deviation_weight: float = 1e-4
+
+
+
+
+class NativeRolloutBatcher:
+    """Fast batched open-loop rollouts using MuJoCo's native C++ rollout module.
+
+    This backend removes the Python loop over MPPI samples and keeps a persistent
+    native thread pool.  For the classic Ant/Humanoid models, whose root body is
+    attached to world by a free joint, rollout costs are computed directly from
+    the returned qpos trajectories in vectorized NumPy.  Unsupported root layouts
+    fall back to the legacy Python evaluator.
+    """
+
+    def __init__(self, robot, *, workers: int = 0, batch_hint: int = 128) -> None:
+        from mujoco import rollout as mj_rollout
+
+        self.robot = robot
+        self.mj = robot.mujoco
+        self.model = robot.model
+        cpu = max(1, int(os.cpu_count() or 1))
+        requested = int(workers)
+        if requested <= 0:
+            requested = min(cpu, max(1, int(batch_hint)))
+        self.nthread = max(1, requested)
+        # nthread=0 executes on the calling thread and avoids thread-pool overhead.
+        runner_threads = self.nthread if self.nthread > 1 else 0
+        self.runner = mj_rollout.Rollout(nthread=runner_threads)
+        self.data = (
+            [self.mj.MjData(self.model) for _ in range(self.nthread)]
+            if self.nthread > 1
+            else self.mj.MjData(self.model)
+        )
+        self.state_spec = self.mj.mjtState.mjSTATE_FULLPHYSICS
+        self.nstate = int(self.mj.mj_stateSize(self.model, self.state_spec))
+        self._state_scratch = self.mj.MjData(self.model)
+        self._root_qadr = self._find_world_free_root_qadr()
+        self.supports_vectorized_cost = self._root_qadr is not None
+        self._ctrl_scale = np.maximum(robot.control_scale(), 1e-6)
+        self._ctrl_low, self._ctrl_high = robot.control_bounds()
+
+    def close(self) -> None:
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            try:
+                runner.close()
+            except Exception:
+                pass
+            self.runner = None
+
+    def __del__(self):
+        self.close()
+
+    def _find_world_free_root_qadr(self) -> int | None:
+        m = self.model
+        root = int(self.robot.root_body_id)
+        # Direct qpos extraction is exact only when the free root is attached to world.
+        if int(m.body_parentid[root]) != 0:
+            return None
+        free_type = int(self.mj.mjtJoint.mjJNT_FREE)
+        for j in range(int(m.njnt)):
+            if int(m.jnt_bodyid[j]) == root and int(m.jnt_type[j]) == free_type:
+                return int(m.jnt_qposadr[j])
+        return None
+
+    def snapshot_to_state(self, snapshot) -> np.ndarray:
+        d = self._state_scratch
+        d.time = float(snapshot.time)
+        d.qpos[:] = snapshot.qpos
+        d.qvel[:] = snapshot.qvel
+        if self.model.na:
+            d.act[:] = snapshot.act
+        out = np.empty(self.nstate, dtype=np.float64)
+        self.mj.mj_getState(self.model, d, out, self.state_spec)
+        return out
+
+    def snapshots_to_states(self, snapshots: Sequence) -> np.ndarray:
+        return np.stack([self.snapshot_to_state(s) for s in snapshots], axis=0)
+
+    def _root_from_state(self, state: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._root_qadr is None:
+            raise RuntimeError("root pose is not directly available from qpos")
+        # mjSTATE_FULLPHYSICS is ordered as time, qpos, qvel, act, ...
+        q = 1 + int(self._root_qadr)
+        pos = state[..., q:q + 3]
+        quat = state[..., q + 3:q + 7]
+        # MuJoCo quaternion convention is [w, x, y, z]. R_zz = 1 - 2(x^2+y^2).
+        up = 1.0 - 2.0 * (quat[..., 1] ** 2 + quat[..., 2] ** 2)
+        return pos[..., :2], pos[..., 2], up
+
+    def rollout_states(self, initial_state: np.ndarray, controls: np.ndarray) -> np.ndarray:
+        state, _ = self.runner.rollout(
+            self.model,
+            self.data,
+            np.asarray(initial_state, dtype=np.float64),
+            np.ascontiguousarray(controls, dtype=np.float64),
+        )
+        return state
+
+    def evaluate(
+        self,
+        start_snapshot,
+        control_batch: np.ndarray,
+        track,
+        current_s: float,
+        *,
+        control_substeps: int,
+        nominal_controls: np.ndarray,
+        cost_cfg: RolloutCostConfig,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if not self.supports_vectorized_cost:
+            raise RuntimeError("vectorized rollout cost is unsupported for this root layout")
+        batch = np.asarray(control_batch, dtype=np.float64)
+        n, h, _ = batch.shape
+        substeps = max(1, int(control_substeps))
+        # Repeat each control over the underlying physics steps in native code.
+        expanded = np.repeat(batch, substeps, axis=1)
+        initial = self.snapshot_to_state(start_snapshot)[None, :]
+        states = self.rollout_states(initial, expanded)
+        sampled = states[:, substeps - 1::substeps, :]
+        positions, height, up = self._root_from_state(sampled)
+
+        flat_s, flat_d2 = track.project(positions.reshape(-1, 2))
+        progress_s = np.asarray(flat_s, dtype=np.float64).reshape(n, h)
+        d2 = np.asarray(flat_d2, dtype=np.float64).reshape(n, h)
+        allowed = max(0.0, 0.5 * float(track.road_width) - float(cost_cfg.hard_collision_clearance))
+        failure = d2 > allowed * allowed
+        failure |= height < float(cost_cfg.fall_height_fraction) * max(self.robot.initial_root_height, 1e-6)
+        failure |= up < float(cost_cfg.min_root_up)
+
+        # MuJoCo rollout fills the tail after divergence with an unchanged state.
+        times = sampled[..., 0]
+        prev_t = np.concatenate(
+            [np.full((n, 1), float(start_snapshot.time), dtype=np.float64), times[:, :-1]], axis=1
+        )
+        failure |= times <= prev_t + 1e-15
+
+        prev_s = np.concatenate(
+            [np.full((n, 1), float(current_s), dtype=np.float64), progress_s[:, :-1]], axis=1
+        )
+        ds = progress_s - prev_s
+        half = 0.5 * float(track.length)
+        ds = np.where(ds > half, ds - float(track.length), ds)
+        ds = np.where(ds < -half, ds + float(track.length), ds)
+
+        alive = np.logical_and.accumulate(~failure, axis=1)
+        cumulative_alive = np.cumsum(np.where(alive, ds, 0.0), axis=1)
+        terminal_progress = cumulative_alive[:, -1]
+        failed = np.any(failure, axis=1)
+
+        costs = np.full(n, math.inf, dtype=np.float64)
+        finite = ~failed
+        if np.any(finite):
+            cumulative = np.cumsum(ds[finite], axis=1)
+            progress_cost = -np.sum(cumulative, axis=1) / max(1, h)
+            upright_cost = float(cost_cfg.upright_weight) * np.sum((1.0 - up[finite]) ** 2, axis=1)
+            du = batch[finite] - np.asarray(nominal_controls, dtype=np.float64)[None, :, :]
+            control_cost = float(cost_cfg.control_deviation_weight) * np.sum(
+                np.mean((du / self._ctrl_scale[None, None, :]) ** 2, axis=2), axis=1
+            )
+            costs[finite] = progress_cost + upright_cost + control_cost
+        return positions, costs, terminal_progress, failed
+
+    def estimate_joint_task_jacobians(
+        self,
+        snapshots: Sequence,
+        nominal_controls: np.ndarray,
+        *,
+        control_substeps: int,
+        lookahead_steps: int,
+        epsilon_fraction: float = 1e-3,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self.supports_vectorized_cost:
+            raise RuntimeError("vectorized Jacobians are unsupported for this root layout")
+        u_nom = np.asarray(nominal_controls, dtype=np.float64)
+        h, nu = u_nom.shape
+        jac = np.zeros((h, 2, nu), dtype=np.float64)
+        endpoints = np.empty((h, 2), dtype=np.float64)
+        scale = np.maximum(self.robot.control_scale(fraction=1.0), 1e-6)
+        substeps = max(1, int(control_substeps))
+        L = max(1, int(lookahead_steps))
+        initial_all = self.snapshots_to_states(snapshots)
+
+        # Near the horizon the legacy implementation uses shorter futures. Group
+        # by that length so every native batch remains exactly equivalent.
+        for ell in range(1, L + 1):
+            tids = [t for t in range(h) if min(L, h - t) == ell]
+            if not tids:
+                continue
+            init_rows = []
+            control_rows = []
+            meta = []
+            for t in tids:
+                future = u_nom[t:t + ell]
+                init_rows.append(initial_all[t])
+                control_rows.append(future)
+                meta.append((t, -1, 1.0))
+                for j in range(nu):
+                    eps = max(1e-7, float(epsilon_fraction) * float(scale[j]))
+                    plus = future.copy()
+                    plus[0, j] += eps
+                    plus[0] = np.clip(plus[0], self._ctrl_low, self._ctrl_high)
+                    denom = float(plus[0, j] - future[0, j])
+                    init_rows.append(initial_all[t])
+                    control_rows.append(plus)
+                    meta.append((t, j, denom))
+
+            init_batch = np.asarray(init_rows, dtype=np.float64)
+            controls = np.repeat(np.asarray(control_rows, dtype=np.float64), substeps, axis=1)
+            out = self.rollout_states(init_batch, controls)
+            xy, _, _ = self._root_from_state(out[:, -1, :])
+            base_by_t = {}
+            for k, (t, j, denom) in enumerate(meta):
+                if j < 0:
+                    endpoints[t] = xy[k]
+                    base_by_t[t] = xy[k]
+                elif abs(denom) > 1e-12:
+                    jac[t, :, j] = (xy[k] - base_by_t[t]) / denom
+        return jac, endpoints
 
 
 @dataclass
@@ -85,6 +305,7 @@ def rollout_controls(
     upright_cost = 0.0
     allowed = max(0.0, 0.5 * float(track.road_width) - float(cfg.hard_collision_clearance))
     off_track = False
+    ctrl_scale = np.maximum(robot.control_scale(), 1e-6) if robot.nu else None
 
     for t, u in enumerate(controls):
         robot.step_control(u, substeps=control_substeps, data=d)
@@ -108,8 +329,7 @@ def rollout_controls(
         upright_cost += float(cfg.upright_weight) * (1.0 - up) ** 2
         if robot.nu:
             du = u - nominal_controls[min(t, len(nominal_controls) - 1)]
-            scale = np.maximum(robot.control_scale(), 1e-6)
-            control_cost += float(cfg.control_deviation_weight) * float(np.mean((du / scale) ** 2))
+            control_cost += float(cfg.control_deviation_weight) * float(np.mean((du / ctrl_scale) ** 2))
 
     if off_track:
         return positions, math.inf, cumulative, True
@@ -128,7 +348,15 @@ def evaluate_control_batch(
     nominal_controls: np.ndarray,
     cost_cfg: RolloutCostConfig,
     workers: int = 0,
+    native_batcher: NativeRolloutBatcher | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if native_batcher is not None and native_batcher.supports_vectorized_cost:
+        return native_batcher.evaluate(
+            start_snapshot, control_batch, track, current_s,
+            control_substeps=control_substeps,
+            nominal_controls=nominal_controls,
+            cost_cfg=cost_cfg,
+        )
     batch = np.asarray(control_batch, dtype=np.float64)
     n, h, _ = batch.shape
     positions = np.empty((n, h, 2), dtype=np.float64)
@@ -237,6 +465,7 @@ def refine_policy_nominal(
     step_size: float = 0.35,
     max_control_step_fraction: float = 0.15,
     epsilon_fraction: float = 1e-3,
+    native_batcher: NativeRolloutBatcher | None = None,
 ) -> tuple[NominalRollout, np.ndarray, np.ndarray]:
     """Policy-seeded iLQR-like task-space refinement.
 
@@ -252,15 +481,23 @@ def refine_policy_nominal(
     endpoints = current.positions.copy()
     max_step = max_control_step_fraction * np.maximum(robot.control_scale(fraction=1.0), 1e-6)
 
-    for _ in range(max(0, int(iterations))):
-        jac, endpoints = estimate_joint_task_jacobians(
-            robot,
-            current.snapshots,
-            controls,
+    def _estimate(snaps, ctrls):
+        if native_batcher is not None and native_batcher.supports_vectorized_cost:
+            return native_batcher.estimate_joint_task_jacobians(
+                snaps, ctrls,
+                control_substeps=control_substeps,
+                lookahead_steps=lookahead_steps,
+                epsilon_fraction=epsilon_fraction,
+            )
+        return estimate_joint_task_jacobians(
+            robot, snaps, ctrls,
             control_substeps=control_substeps,
             lookahead_steps=lookahead_steps,
             epsilon_fraction=epsilon_fraction,
         )
+
+    for _ in range(max(0, int(iterations))):
+        jac, endpoints = _estimate(current.snapshots, controls)
         for t in range(len(controls)):
             s_target, _ = track.project(endpoints[t])
             mean, _ = prior.sample(track, float(s_target))
@@ -293,12 +530,5 @@ def refine_policy_nominal(
         current = NominalRollout(controls.copy(), snapshots, positions, progress_s, cumulative)
 
     # Ensure sensitivities correspond to the final nominal.
-    jac, endpoints = estimate_joint_task_jacobians(
-        robot,
-        current.snapshots,
-        current.controls,
-        control_substeps=control_substeps,
-        lookahead_steps=lookahead_steps,
-        epsilon_fraction=epsilon_fraction,
-    )
+    jac, endpoints = _estimate(current.snapshots, current.controls)
     return current, jac, endpoints
