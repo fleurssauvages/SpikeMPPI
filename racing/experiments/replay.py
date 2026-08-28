@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 from racing.adaptation import ModelParameterScales
+from racing.environments import RaceEnvironmentConfig
 from racing.robots import make_robot
 from racing.tracks import (
     StadiumTrack,
@@ -55,7 +56,21 @@ def load_recording(path: str | Path) -> dict[str, np.ndarray | str | float]:
 def _prepare_replay(path: str | Path):
     record = load_recording(path)
     robot_name = str(record["robot_name"])
-    robot = make_robot(robot_name)
+
+    track_values = np.asarray(record["track"], dtype=np.float64).reshape(-1)
+    if len(track_values) < 6:
+        raise ValueError("track recording is incomplete")
+    track = StadiumTrack(
+        width=float(track_values[0]),
+        height=float(track_values[1]),
+        road_width=float(track_values[2]),
+        origin_xy=(float(track_values[3]), float(track_values[4])),
+        origin_yaw=float(track_values[5]),
+    )
+    env_text = _scalar_text(record["environment_json"]) if "environment_json" in record else ""
+    environment = RaceEnvironmentConfig.from_json(env_text)
+    robot = make_robot(robot_name, extra_worldbody_xml=environment.plant_worldbody_xml(track))
+    robot.set_task_target_body(environment.task_body_name)
 
     plant_params = np.asarray(record["plant_parameters"], dtype=np.float64).reshape(-1)
     if len(plant_params) < 4:
@@ -67,17 +82,6 @@ def _prepare_replay(path: str | Path):
             motor=float(plant_params[2]),
             slope_deg=float(plant_params[3]),
         )
-    )
-
-    track_values = np.asarray(record["track"], dtype=np.float64).reshape(-1)
-    if len(track_values) < 6:
-        raise ValueError("track recording is incomplete")
-    track = StadiumTrack(
-        width=float(track_values[0]),
-        height=float(track_values[1]),
-        road_width=float(track_values[2]),
-        origin_xy=(float(track_values[3]), float(track_values[4])),
-        origin_yaw=float(track_values[5]),
     )
 
     qpos = np.asarray(record["qpos"], dtype=np.float64)

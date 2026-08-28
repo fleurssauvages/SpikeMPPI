@@ -67,6 +67,17 @@ class ControllerConfig:
     min_root_up: float = 0.15
     upright_weight: float = 0.05
     control_deviation_weight: float = 1e-4
+
+    # Dense task-transfer shaping for push_box. Ignored for ordinary racing.
+    # The box term is primary; robot motion and robot-box approach only remove
+    # the zero-signal plateau before the first contact.
+    box_progress_weight: float = 1.0
+    robot_progress_weight: float = 0.35
+    robot_box_approach_weight: float = 1.00
+    # Keep pushing in the quasi-planar regime. Ballistic/tipped box candidates
+    # are not useful solutions to a ground-pushing task.
+    box_max_lift: float = 0.12
+    box_min_up: float = 0.75
     rollout_workers: int = 0
     rollout_backend: str = "native"
     rollout_chunk_size: int = 0
@@ -98,6 +109,12 @@ class ControllerConfig:
             raise ValueError("SPG damping and covariance jitter must be nonnegative")
         if self.sensitivity_epsilon_fraction <= 0.0:
             raise ValueError("sensitivity_epsilon_fraction must be positive")
+        if self.box_progress_weight < 0.0 or self.robot_progress_weight < 0.0 or self.robot_box_approach_weight < 0.0:
+            raise ValueError("push-task reward weights must be nonnegative")
+        if self.box_max_lift < 0.0:
+            raise ValueError("box_max_lift must be nonnegative")
+        if not -1.0 <= self.box_min_up <= 1.0:
+            raise ValueError("box_min_up must lie in [-1, 1]")
         self.rollout_chunk_size = max(0, int(self.rollout_chunk_size))
         self.rollout_backend = str(self.rollout_backend).strip().lower()
         if self.rollout_backend not in {"fused", "native", "python"}:
@@ -149,6 +166,11 @@ class JointMPPIController:
             min_root_up=cfg.min_root_up,
             upright_weight=cfg.upright_weight,
             control_deviation_weight=cfg.control_deviation_weight,
+            box_progress_weight=cfg.box_progress_weight,
+            robot_progress_weight=cfg.robot_progress_weight,
+            robot_box_approach_weight=cfg.robot_box_approach_weight,
+            box_max_lift=cfg.box_max_lift,
+            box_min_up=cfg.box_min_up,
         )
         self.native_batcher = None
         self._previous_plan: np.ndarray | None = None
@@ -421,28 +443,59 @@ class JointMPPIController:
 
     def step(self, data, current_s: float) -> tuple[np.ndarray, dict[str, Any]]:
         t_total = time.perf_counter()
-        start, policy_nom, refined, jac, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
-        t_nominal = time.perf_counter()
-        nominal = refined.controls
 
+        # A nominal-policy benchmark is closed-loop: only the action applied at
+        # the current real state is needed.  Building an H-step simulated policy
+        # rollout here used to perform H JAX inferences + H MuJoCo propagations
+        # every 20 ms, making `policy_nominal` much slower computationally than
+        # the nominal used by warm-started MPPI.  One inference per tick is both
+        # faster and the faithful way to execute the pretrained running policy.
         if self.variant == ControllerVariant.POLICY_NOMINAL:
-            return nominal[0].copy(), {
-                "nominal": nominal,
-                "policy_nominal": policy_nom.controls,
-                "nominal_positions": refined.positions,
-                "prior_mean": prior_mean,
-                "spatial_covariance": prior_cov,
-                "joint_task_jacobians": jac,
+            t_policy0 = time.perf_counter()
+            robot_s, _ = self.track.project(self.robot.xy(data))
+            ctrl = np.asarray(
+                self.policy.action(
+                    self.robot, data, track=self.track, prior=self.prior,
+                    current_s=float(robot_s),
+                ),
+                dtype=np.float64,
+            )
+            ctrl = self.robot.clip_ctrl(ctrl)
+            t_policy1 = time.perf_counter()
+            task_xy = np.asarray(self.robot.task_xy(data), dtype=np.float64).reshape(1, 2)
+            one = ctrl.reshape(1, -1)
+            elapsed = 1e3 * (t_policy1 - t_policy0)
+            return ctrl.copy(), {
+                "nominal": one.copy(),
+                "policy_nominal": one.copy(),
+                "nominal_positions": task_xy,
+                "prior_mean": np.empty((0, 2), dtype=np.float64),
+                "spatial_covariance": np.empty((0, 2, 2), dtype=np.float64),
+                "joint_task_jacobians": None,
                 "temperature": math.nan,
                 "ess": 1.0,
                 "finite_rollouts": 1,
-                "rollout_backend": self.rollout_backend_name,
+                "rollout_backend": "policy-closed-loop",
+                "spg_refresh_mode": "none",
                 "timing_ms": {
-                    "nominal": 1e3 * (t_nominal - t_total),
-                    **nominal_parts,
+                    "nominal": elapsed,
+                    "policy": elapsed,
+                    "warm_start": 0.0,
+                    "sensitivity": 0.0,
+                    "prior": 0.0,
+                    "sampling": 0.0,
+                    "rollouts": 0.0,
+                    "rollout_physics": 0.0,
+                    "rollout_cost": 0.0,
+                    "rollout_fused": 0.0,
+                    "update": 0.0,
                     "total": 1e3 * (time.perf_counter() - t_total),
                 },
             }
+
+        start, policy_nom, refined, jac, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
+        t_nominal = time.perf_counter()
+        nominal = refined.controls
 
         factors = None
         if self.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:

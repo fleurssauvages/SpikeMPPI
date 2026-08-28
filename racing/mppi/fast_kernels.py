@@ -53,14 +53,95 @@ def spg_dense_project_and_smooth(
 
 
 @njit(cache=True, nogil=True, fastmath=False)
+def _stadium_project_scalar(
+    xw: float, yw: float,
+    origin_x: float, origin_y: float,
+    rot00: float, rot01: float, rot10: float, rot11: float,
+    canonical_start_x: float, canonical_start_y: float,
+    radius: float, left_arc_x: float, right_arc_x: float, center_y: float,
+    straight_length: float, track_length: float,
+) -> tuple[float, float]:
+    dx = xw - origin_x
+    dy = yw - origin_y
+    px = dx * rot00 + dy * rot10 + canonical_start_x
+    py = dx * rot01 + dy * rot11 + canonical_start_y
+    arc = math.pi * radius
+
+    bx = min(max(px, left_arc_x), right_arc_x)
+    ex = px - bx
+    ey = py - (center_y - radius)
+    best_d2 = ex * ex + ey * ey
+    best_s = bx - left_arc_x
+
+    theta = min(max(math.atan2(py - center_y, px - right_arc_x), -0.5 * math.pi), 0.5 * math.pi)
+    rx = right_arc_x + radius * math.cos(theta)
+    ry = center_y + radius * math.sin(theta)
+    ex = px - rx
+    ey = py - ry
+    d2 = ex * ex + ey * ey
+    if d2 < best_d2:
+        best_d2 = d2
+        best_s = straight_length + radius * (theta + 0.5 * math.pi)
+
+    tx = min(max(px, left_arc_x), right_arc_x)
+    ex = px - tx
+    ey = py - (center_y + radius)
+    d2 = ex * ex + ey * ey
+    if d2 < best_d2:
+        best_d2 = d2
+        best_s = straight_length + arc + (right_arc_x - tx)
+
+    theta = math.atan2(py - center_y, px - left_arc_x)
+    if theta < 0.5 * math.pi:
+        theta += 2.0 * math.pi
+    theta = min(max(theta, 0.5 * math.pi), 1.5 * math.pi)
+    lx = left_arc_x + radius * math.cos(theta)
+    ly = center_y + radius * math.sin(theta)
+    ex = px - lx
+    ey = py - ly
+    d2 = ex * ex + ey * ey
+    if d2 < best_d2:
+        best_d2 = d2
+        best_s = 2.0 * straight_length + arc + radius * (theta - 0.5 * math.pi)
+
+    return best_s % track_length, best_d2
+
+
+@njit(cache=True, nogil=True, fastmath=False)
+def _stadium_distance_sq_scalar(
+    xw: float, yw: float,
+    origin_x: float, origin_y: float,
+    rot00: float, rot01: float, rot10: float, rot11: float,
+    canonical_start_x: float, canonical_start_y: float,
+    radius: float, left_arc_x: float, right_arc_x: float, center_y: float,
+    straight_length: float, track_length: float,
+) -> float:
+    _, d2 = _stadium_project_scalar(
+        xw, yw, origin_x, origin_y, rot00, rot01, rot10, rot11,
+        canonical_start_x, canonical_start_y, radius, left_arc_x,
+        right_arc_x, center_y, straight_length, track_length,
+    )
+    return d2
+
+
+@njit(cache=True, nogil=True, fastmath=False)
 def stadium_rollout_cost_from_states(
     sampled_states: np.ndarray,
     controls: np.ndarray,
     nominal_controls: np.ndarray,
     ctrl_scale: np.ndarray,
+    task_qpos_index: int,
     root_qpos_index: int,
     start_time: float,
     current_s: float,
+    current_root_s: float,
+    initial_task_root_distance: float,
+    box_progress_weight: float,
+    robot_progress_weight: float,
+    reach_weight: float,
+    box_max_lift: float,
+    box_min_up: float,
+    initial_task_height: float,
     origin_x: float,
     origin_y: float,
     rot00: float,
@@ -93,7 +174,8 @@ def stadium_rollout_cost_from_states(
     n = sampled_states.shape[0]
     h = sampled_states.shape[1]
     nu = controls.shape[2]
-    q = int(root_qpos_index)
+    tq = int(task_qpos_index)
+    rq = int(root_qpos_index)
     half_track = 0.5 * track_length
     arc = math.pi * radius
     top_offset = straight_length + arc
@@ -101,8 +183,12 @@ def stadium_rollout_cost_from_states(
 
     for i in range(n):
         s_prev = current_s
+        root_s_prev = current_root_s
         cumulative = 0.0
+        root_cumulative = 0.0
         prefix_sum = 0.0
+        root_prefix_sum = 0.0
+        approach_prefix_sum = 0.0
         upright_cost = 0.0
         control_cost = 0.0
         prev_time = start_time
@@ -112,11 +198,13 @@ def stadium_rollout_cost_from_states(
             state = sampled_states[i, t]
             # FULLPHYSICS is time followed by qpos, qvel, act. q indexes the
             # free-root qpos inside the packed state (already offset by time).
-            xw = state[q]
-            yw = state[q + 1]
-            z = state[q + 2]
-            qx = state[q + 4]
-            qy = state[q + 5]
+            # Track progress can belong to a separate free body (the pushed
+            # box), while fall/upright constraints always belong to the robot.
+            xw = state[tq]
+            yw = state[tq + 1]
+            z = state[rq + 2]
+            qx = state[rq + 4]
+            qy = state[rq + 5]
             up = 1.0 - 2.0 * (qx * qx + qy * qy)
             sim_time = state[0]
 
@@ -190,10 +278,33 @@ def stadium_rollout_cost_from_states(
             # np.mod semantics used by StadiumTrack.project.
             best_s = best_s % track_length
 
+            root_d2 = best_d2
+            root_s = best_s
+            if rq != tq:
+                root_s, root_d2 = _stadium_project_scalar(
+                    state[rq], state[rq + 1],
+                    origin_x, origin_y, rot00, rot01, rot10, rot11,
+                    canonical_start_x, canonical_start_y,
+                    radius, left_arc_x, right_arc_x, center_y,
+                    straight_length, track_length,
+                )
+
+            if rq != tq:
+                task_z = state[tq + 2]
+                task_qx = state[tq + 4]
+                task_qy = state[tq + 5]
+                task_up = 1.0 - 2.0 * (task_qx * task_qx + task_qy * task_qy)
+            else:
+                task_z = initial_task_height
+                task_up = 1.0
+
             if (
                 best_d2 > allowed_sq
+                or root_d2 > allowed_sq
                 or z < min_height
                 or up < min_up
+                or (rq != tq and task_z > initial_task_height + box_max_lift)
+                or (rq != tq and task_up < box_min_up)
                 or sim_time <= prev_time + 1e-15
             ):
                 failed = True
@@ -207,6 +318,23 @@ def stadium_rollout_cost_from_states(
             cumulative += ds
             prefix_sum += cumulative
             s_prev = best_s
+
+            if rq != tq:
+                root_ds = root_s - root_s_prev
+                if root_ds > half_track:
+                    root_ds -= track_length
+                elif root_ds < -half_track:
+                    root_ds += track_length
+                root_cumulative += root_ds
+                coupled = min(root_cumulative, max(cumulative, 0.0))
+                root_prefix_sum += coupled
+                root_s_prev = root_s
+
+                dx_rb = state[tq] - state[rq]
+                dy_rb = state[tq + 1] - state[rq + 1]
+                dist_rb = math.sqrt(dx_rb * dx_rb + dy_rb * dy_rb)
+                approach_prefix_sum += initial_task_root_distance - dist_rb
+
             prev_time = sim_time
 
             du_sq_sum = 0.0
@@ -222,7 +350,12 @@ def stadium_rollout_cost_from_states(
         if failed:
             costs_out[i] = math.inf
         else:
-            costs_out[i] = -prefix_sum / max(1, h) + upright_cost + control_cost
+            inv_h = 1.0 / max(1, h)
+            progress_cost = -box_progress_weight * prefix_sum * inv_h
+            if rq != tq:
+                progress_cost -= robot_progress_weight * root_prefix_sum * inv_h
+                progress_cost -= reach_weight * approach_prefix_sum * inv_h
+            costs_out[i] = progress_cost + upright_cost + control_cost
 
 @njit(cache=True, nogil=True, fastmath=False)
 def _lbps_score_fast(

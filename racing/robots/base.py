@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
+import xml.etree.ElementTree as ET
 import numpy as np
 
 from racing.adaptation.model_params import ModelParameterScales
@@ -25,7 +27,7 @@ class ClassicRobot:
     intentionally differ for online adaptation experiments.
     """
 
-    def __init__(self, info: ClassicModel) -> None:
+    def __init__(self, info: ClassicModel, *, extra_worldbody_xml: str = "") -> None:
         try:
             import mujoco
         except ImportError as exc:
@@ -33,7 +35,18 @@ class ClassicRobot:
         self.mujoco = mujoco
         self.info = info
         self.xml_path = classic_xml_path(info)
-        self.model = mujoco.MjModel.from_xml_path(str(self.xml_path))
+
+        # Keep the original robot dimensions even when the race environment adds
+        # dynamic task objects (e.g. a free box).  The pretrained locomotion
+        # policy must continue to see exactly the observation it was trained on.
+        base_model = mujoco.MjModel.from_xml_path(str(self.xml_path))
+        self.robot_nq = int(base_model.nq)
+        self.robot_nv = int(base_model.nv)
+        self.robot_nbody = int(base_model.nbody)
+        if str(extra_worldbody_xml).strip():
+            self.model = self._load_augmented_model(str(extra_worldbody_xml))
+        else:
+            self.model = base_model
         self.data = mujoco.MjData(self.model)
 
         self._baseline_geom_friction = np.asarray(self.model.geom_friction, dtype=np.float64).copy()
@@ -52,6 +65,45 @@ class ClassicRobot:
         )
         self.initial_root_height = float(self.data.xpos[self.root_body_id, 2])
         self.default_ctrl = self._default_ctrl()
+        self._task_body_id = int(self.root_body_id)
+        self._task_qpos_adr = self._find_free_qpos_adr(self._task_body_id)
+        self._task_rest_height = (
+            float(self.model.qpos0[self._task_qpos_adr + 2])
+            if self._task_qpos_adr is not None else float(self.initial_root_height)
+        )
+
+    def _load_augmented_model(self, worldbody_fragment: str):
+        """Compile the classic XML with extra worldbody elements.
+
+        Assets are supplied through MuJoCo's in-memory asset mechanism so this
+        remains robust for classic XMLs that reference files relative to the
+        Gymnasium asset directory.  No actuator/joint in the original robot is
+        modified.
+        """
+        root = ET.fromstring(Path(self.xml_path).read_text(encoding="utf-8"))
+        worldbody = root.find("worldbody")
+        if worldbody is None:
+            raise ValueError(f"MuJoCo XML has no <worldbody>: {self.xml_path}")
+        wrapper = ET.fromstring(f"<race_extra>{worldbody_fragment}</race_extra>")
+        for child in list(wrapper):
+            worldbody.append(child)
+        xml = ET.tostring(root, encoding="unicode")
+
+        assets = {}
+        asset_root = Path(self.xml_path).parent
+        for path in asset_root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                rel = path.relative_to(asset_root).as_posix()
+                assets[rel] = path.read_bytes()
+            except OSError:
+                pass
+        try:
+            return self.mujoco.MjModel.from_xml_string(xml, assets=assets)
+        except TypeError:
+            # Compatibility with MuJoCo versions where ``assets`` is positional.
+            return self.mujoco.MjModel.from_xml_string(xml, assets)
 
     @property
     def name(self) -> str:
@@ -92,6 +144,12 @@ class ClassicRobot:
         for gid in range(self.model.ngeom):
             if int(self.model.geom_type[gid]) == plane_type and gid not in ids:
                 ids.append(gid)
+                continue
+            name = self.mujoco.mj_id2name(
+                self.model, self.mujoco.mjtObj.mjOBJ_GEOM, gid
+            )
+            if name and str(name).startswith("race_terrain_") and gid not in ids:
+                ids.append(gid)
         return np.asarray(ids, dtype=np.int32)
 
     def apply_model_parameters(self, params: ModelParameterScales) -> None:
@@ -105,9 +163,10 @@ class ClassicRobot:
 
         self.model.body_mass[:] = self._baseline_body_mass
         self.model.body_inertia[:] = self._baseline_body_inertia
-        if self.model.nbody > 1:
-            self.model.body_mass[1:] = self._baseline_body_mass[1:] * float(p.mass)
-            self.model.body_inertia[1:] = self._baseline_body_inertia[1:] * float(p.mass)
+        robot_end = min(int(self.robot_nbody), int(self.model.nbody))
+        if robot_end > 1:
+            self.model.body_mass[1:robot_end] = self._baseline_body_mass[1:robot_end] * float(p.mass)
+            self.model.body_inertia[1:robot_end] = self._baseline_body_inertia[1:robot_end] * float(p.mass)
 
         self.model.actuator_gainprm[:] = self._baseline_gainprm
         if self.model.nu:
@@ -146,6 +205,41 @@ class ClassicRobot:
             if int(self.model.jnt_type[j]) == int(self.mujoco.mjtJoint.mjJNT_FREE):
                 return int(self.model.jnt_bodyid[j])
         return 1 if self.model.nbody > 1 else 0
+
+    def _find_free_qpos_adr(self, body_id: int) -> int | None:
+        free_type = int(self.mujoco.mjtJoint.mjJNT_FREE)
+        for j in range(int(self.model.njnt)):
+            if int(self.model.jnt_bodyid[j]) == int(body_id) and int(self.model.jnt_type[j]) == free_type:
+                return int(self.model.jnt_qposadr[j])
+        return None
+
+    @property
+    def task_body_id(self) -> int:
+        return int(self._task_body_id)
+
+    @property
+    def task_qpos_adr(self) -> int | None:
+        return None if self._task_qpos_adr is None else int(self._task_qpos_adr)
+
+    @property
+    def task_rest_height(self) -> float:
+        return float(self._task_rest_height)
+
+    def set_task_target_body(self, name: str | None) -> None:
+        if not name:
+            body_id = int(self.root_body_id)
+        else:
+            body_id = int(self.mujoco.mj_name2id(
+                self.model, self.mujoco.mjtObj.mjOBJ_BODY, str(name)
+            ))
+            if body_id < 0:
+                raise ValueError(f"task target body {name!r} does not exist in the MuJoCo model")
+        qadr = self._find_free_qpos_adr(body_id)
+        if qadr is None:
+            raise ValueError("task target body must have a free joint for fast rollout tracking")
+        self._task_body_id = body_id
+        self._task_qpos_adr = qadr
+        self._task_rest_height = float(self.model.qpos0[qadr + 2])
 
     def _default_ctrl(self) -> np.ndarray:
         if self.model.nu == 0:
@@ -187,6 +281,19 @@ class ClassicRobot:
     def xy(self, data=None) -> np.ndarray:
         d = self.data if data is None else data
         return np.asarray(d.xpos[self.root_body_id, :2], dtype=np.float64).copy()
+
+    def task_xy(self, data=None) -> np.ndarray:
+        d = self.data if data is None else data
+        return np.asarray(d.xpos[self._task_body_id, :2], dtype=np.float64).copy()
+
+    def task_height(self, data=None) -> float:
+        d = self.data if data is None else data
+        return float(d.xpos[self._task_body_id, 2])
+
+    def task_up(self, data=None) -> float:
+        d = self.data if data is None else data
+        mat = np.asarray(d.xmat[self._task_body_id], dtype=np.float64).reshape(3, 3)
+        return float(mat[2, 2])
 
     def root_height(self, data=None) -> float:
         d = self.data if data is None else data

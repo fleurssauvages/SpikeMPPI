@@ -20,6 +20,15 @@ class RolloutCostConfig:
     upright_weight: float = 0.05
     control_deviation_weight: float = 1e-4
 
+    # Push-task shaping.  These are ignored when task body == robot root.
+    # Box progress remains the primary objective.  The extra potential terms
+    # make approaching the box informative before the first contact.
+    box_progress_weight: float = 1.0
+    robot_progress_weight: float = 0.35
+    robot_box_approach_weight: float = 1.00
+    box_max_lift: float = 0.12
+    box_min_up: float = 0.75
+
 
 
 
@@ -60,7 +69,8 @@ class NativeRolloutBatcher:
         self._sensor_buffers: dict[tuple[int, int], np.ndarray] = {}
         self._model_batches: dict[int, list] = {}
         self._root_qadr = self._find_world_free_root_qadr()
-        self.supports_vectorized_cost = self._root_qadr is not None
+        self._task_qadr = getattr(robot, "task_qpos_adr", self._root_qadr)
+        self.supports_vectorized_cost = self._root_qadr is not None and self._task_qadr is not None
         self._ctrl_scale = np.maximum(robot.control_scale(), 1e-6)
         self._fd_scale = np.maximum(robot.control_scale(fraction=1.0), 1e-6)
         self._ctrl_low, self._ctrl_high = robot.control_bounds()
@@ -88,8 +98,8 @@ class NativeRolloutBatcher:
             self._init_fused_evaluator()
 
     def _init_fused_evaluator(self) -> None:
-        if self._root_qadr is None:
-            raise RuntimeError('fused rollout requires a world free-joint root')
+        if self._root_qadr is None or self._task_qadr is None:
+            raise RuntimeError('fused rollout requires free-joint robot and task roots')
         try:
             from racing import _fused_mujoco
         except ImportError as exc:
@@ -109,9 +119,16 @@ class NativeRolloutBatcher:
         try:
             self.mj.mj_saveModel(self.model, model_path)
             chunk = self.chunk_size if self.chunk_size > 0 else 1
-            self.fused_evaluator = _fused_mujoco.FusedRolloutEvaluator(
-                model_path, int(self.nthread), int(self._root_qadr), int(chunk)
-            )
+            try:
+                self.fused_evaluator = _fused_mujoco.FusedRolloutEvaluator(
+                    model_path, int(self.nthread), int(self._root_qadr),
+                    int(self._task_qadr), int(chunk)
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    "fused rollout extension has an old ABI. Rebuild it with: "
+                    "python racing/setup_native.py build_ext --inplace"
+                ) from exc
         finally:
             Path(model_path).unlink(missing_ok=True)
 
@@ -171,14 +188,24 @@ class NativeRolloutBatcher:
             self.snapshot_to_state(snap, out=out[i])
         return out
 
-    def _root_from_state(self, state: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self._root_qadr is None:
-            raise RuntimeError('root pose is not directly available from qpos')
-        q = 1 + int(self._root_qadr)
+    @staticmethod
+    def _pose_from_state(state: np.ndarray, qadr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        q = 1 + int(qadr)  # FULLPHYSICS packs time before qpos.
         pos = state[..., q:q + 3]
         quat = state[..., q + 3:q + 7]
         up = 1.0 - 2.0 * (quat[..., 1] ** 2 + quat[..., 2] ** 2)
         return pos[..., :2], pos[..., 2], up
+
+    def _root_from_state(self, state: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._root_qadr is None:
+            raise RuntimeError('root pose is not directly available from qpos')
+        return self._pose_from_state(state, int(self._root_qadr))
+
+    def _task_xy_from_state(self, state: np.ndarray) -> np.ndarray:
+        if self._task_qadr is None:
+            raise RuntimeError('task pose is not directly available from qpos')
+        xy, _, _ = self._pose_from_state(state, int(self._task_qadr))
+        return xy
 
     def _state_buffer(self, nbatch: int, nstep: int) -> np.ndarray:
         key = (int(nbatch), int(nstep))
@@ -299,7 +326,7 @@ class NativeRolloutBatcher:
         start_state = self.snapshot_to_state(start_snapshot)
         states = self.rollout_states(start_state[None, :], expanded)
         sampled = states[0, substeps - 1::substeps, :]
-        positions, _, _ = self._root_from_state(sampled)
+        positions = self._task_xy_from_state(sampled)
         progress_s, _ = track.project(positions)
         progress_s = np.asarray(progress_s, dtype=np.float64)
         cumulative = self._progress_from_s(track, progress_s, current_s)
@@ -325,7 +352,7 @@ class NativeRolloutBatcher:
         h = int(states.shape[0])
         L = max(1, int(lookahead_steps))
         idx = np.minimum(np.arange(h, dtype=np.int64) + L - 1, h - 1)
-        xy, _, _ = self._root_from_state(states[idx])
+        xy = self._task_xy_from_state(states[idx])
         return np.asarray(xy, dtype=np.float64).copy()
 
     def evaluate(
@@ -344,6 +371,17 @@ class NativeRolloutBatcher:
         batch = np.ascontiguousarray(control_batch, dtype=np.float64)
         n, h, _ = batch.shape
         substeps = max(1, int(control_substeps))
+
+        # Pushing uses the box as the task body, but dense shaping also rewards
+        # robot advancement and reduction of robot-box distance.  Compute the
+        # initial potentials once so fused/native/Python cost paths agree.
+        pushing = self._task_qadr != self._root_qadr
+        qpos0 = np.asarray(start_snapshot.qpos, dtype=np.float64)
+        root_xy0 = qpos0[int(self._root_qadr):int(self._root_qadr) + 2]
+        task_xy0 = qpos0[int(self._task_qadr):int(self._task_qadr) + 2]
+        current_root_s = float(track.project(root_xy0)[0])
+        initial_task_root_distance = float(np.linalg.norm(task_xy0 - root_xy0))
+        initial_task_height = float(self.robot.task_rest_height) if pushing else 0.0
 
         if self.fused_evaluator is not None:
             required = (
@@ -369,7 +407,13 @@ class NativeRolloutBatcher:
                 allowed * allowed,
                 float(cost_cfg.fall_height_fraction) * max(self.robot.initial_root_height, 1e-6),
                 float(cost_cfg.min_root_up), float(cost_cfg.upright_weight),
-                float(cost_cfg.control_deviation_weight), float(current_s),
+                float(cost_cfg.control_deviation_weight),
+                float(cost_cfg.box_progress_weight),
+                float(cost_cfg.robot_progress_weight),
+                float(cost_cfg.robot_box_approach_weight),
+                float(cost_cfg.box_max_lift), float(cost_cfg.box_min_up),
+                float(current_s), float(current_root_s),
+                float(initial_task_root_distance), float(initial_task_height),
                 float(start_snapshot.time),
             ], dtype=np.float64)
             t_fused = time.perf_counter()
@@ -445,8 +489,9 @@ class NativeRolloutBatcher:
             ))
         )
         if use_fused_cost:
-            q = 1 + int(self._root_qadr)
-            positions = sampled[..., q:q + 2]
+            task_q = 1 + int(self._task_qadr)
+            root_q = 1 + int(self._root_qadr)
+            positions = sampled[..., task_q:task_q + 2]
             costs, terminal_progress, failed = self._cost_buffer(n)
             allowed = max(
                 0.0, 0.5 * float(track.road_width) - float(cost_cfg.hard_collision_clearance)
@@ -456,9 +501,18 @@ class NativeRolloutBatcher:
                 batch,
                 np.asarray(nominal_controls, dtype=np.float64),
                 self._ctrl_scale,
-                q,
+                task_q,
+                root_q,
                 float(start_snapshot.time),
                 float(current_s),
+                float(current_root_s),
+                float(initial_task_root_distance),
+                float(cost_cfg.box_progress_weight),
+                float(cost_cfg.robot_progress_weight),
+                float(cost_cfg.robot_box_approach_weight),
+                float(cost_cfg.box_max_lift),
+                float(cost_cfg.box_min_up),
+                float(initial_task_height),
                 float(track._origin[0]),
                 float(track._origin[1]),
                 float(track._rot[0, 0]),
@@ -485,15 +539,28 @@ class NativeRolloutBatcher:
             self.last_rollout_cost_ms = 1e3 * (time.perf_counter() - t_cost)
             return positions, costs, terminal_progress, failed
 
-        positions, height, up = self._root_from_state(sampled)
+        positions = self._task_xy_from_state(sampled)
+        root_positions, height, up = self._root_from_state(sampled)
 
         flat_s, flat_d2 = track.project(positions.reshape(-1, 2))
         progress_s = np.asarray(flat_s, dtype=np.float64).reshape(n, h)
         d2 = np.asarray(flat_d2, dtype=np.float64).reshape(n, h)
         allowed = max(0.0, 0.5 * float(track.road_width) - float(cost_cfg.hard_collision_clearance))
         failure = d2 > allowed * allowed
+        if self._task_qadr != self._root_qadr:
+            _, root_flat_d2 = track.project(np.asarray(root_positions).reshape(-1, 2))
+            root_d2 = np.asarray(root_flat_d2, dtype=np.float64).reshape(n, h)
+            failure |= root_d2 > allowed * allowed
         failure |= height < float(cost_cfg.fall_height_fraction) * max(self.robot.initial_root_height, 1e-6)
         failure |= up < float(cost_cfg.min_root_up)
+        if pushing:
+            task_q = 1 + int(self._task_qadr)
+            task_z = sampled[..., task_q + 2]
+            task_qx = sampled[..., task_q + 4]
+            task_qy = sampled[..., task_q + 5]
+            task_up = 1.0 - 2.0 * (task_qx * task_qx + task_qy * task_qy)
+            failure |= task_z > float(initial_task_height) + float(cost_cfg.box_max_lift)
+            failure |= task_up < float(cost_cfg.box_min_up)
 
         times = sampled[..., 0]
         prev_t = np.empty_like(times)
@@ -511,13 +578,37 @@ class NativeRolloutBatcher:
         ds[ds > half] -= float(track.length)
         ds[ds < -half] += float(track.length)
 
+        root_ds = None
+        approach = None
+        if pushing:
+            root_s_arr, _ = track.project(np.asarray(root_positions).reshape(-1, 2))
+            root_s_arr = np.asarray(root_s_arr, dtype=np.float64).reshape(n, h)
+            root_prev = np.empty_like(root_s_arr)
+            root_prev[:, 0] = float(current_root_s)
+            if h > 1:
+                root_prev[:, 1:] = root_s_arr[:, :-1]
+            root_ds = root_s_arr - root_prev
+            root_ds[root_ds > half] -= float(track.length)
+            root_ds[root_ds < -half] += float(track.length)
+            approach = float(initial_task_root_distance) - np.linalg.norm(
+                positions - np.asarray(root_positions), axis=2
+            )
+
         failed = np.any(failure, axis=1)
         # Most racing batches are fully feasible.  Avoid the accumulate/where
         # temporaries on that common path while preserving the exact cost.
         if not np.any(failed):
             terminal_progress = np.sum(ds, axis=1)
             cumulative = np.cumsum(ds, axis=1)
-            progress_cost = -np.sum(cumulative, axis=1) / max(1, h)
+            progress_cost = -float(cost_cfg.box_progress_weight) * np.sum(cumulative, axis=1) / max(1, h)
+            if pushing:
+                root_cumulative = np.cumsum(root_ds, axis=1)
+                # Reward robot advancement only while it remains coupled to the
+                # box's forward progress. Running past a stationary box cannot
+                # earn this shaping term; the approach potential handles reach.
+                coupled = np.minimum(root_cumulative, np.maximum(cumulative, 0.0))
+                progress_cost -= float(cost_cfg.robot_progress_weight) * np.sum(coupled, axis=1) / max(1, h)
+                progress_cost -= float(cost_cfg.robot_box_approach_weight) * np.sum(approach, axis=1) / max(1, h)
             upright_cost = float(cost_cfg.upright_weight) * np.sum((1.0 - up) ** 2, axis=1)
             du = batch - np.asarray(nominal_controls, dtype=np.float64)[None, :, :]
             control_cost = float(cost_cfg.control_deviation_weight) * np.sum(
@@ -532,7 +623,12 @@ class NativeRolloutBatcher:
             finite = ~failed
             if np.any(finite):
                 cumulative = np.cumsum(ds[finite], axis=1)
-                progress_cost = -np.sum(cumulative, axis=1) / max(1, h)
+                progress_cost = -float(cost_cfg.box_progress_weight) * np.sum(cumulative, axis=1) / max(1, h)
+                if pushing:
+                    root_cumulative = np.cumsum(root_ds[finite], axis=1)
+                    coupled = np.minimum(root_cumulative, np.maximum(cumulative, 0.0))
+                    progress_cost -= float(cost_cfg.robot_progress_weight) * np.sum(coupled, axis=1) / max(1, h)
+                    progress_cost -= float(cost_cfg.robot_box_approach_weight) * np.sum(approach[finite], axis=1) / max(1, h)
                 upright_cost = float(cost_cfg.upright_weight) * np.sum((1.0 - up[finite]) ** 2, axis=1)
                 du = batch[finite] - np.asarray(nominal_controls, dtype=np.float64)[None, :, :]
                 control_cost = float(cost_cfg.control_deviation_weight) * np.sum(
@@ -601,7 +697,7 @@ class NativeRolloutBatcher:
             nominal_states_arr = np.asarray(nominal_states, dtype=np.float64)
             if nominal_states_arr.shape[0] == h:
                 idx = np.minimum(all_ids + L - 1, h - 1)
-                xy, _, _ = self._root_from_state(nominal_states_arr[idx])
+                xy = self._task_xy_from_state(nominal_states_arr[idx])
                 endpoints = np.asarray(xy, dtype=np.float64).copy()
 
         if endpoints is None:
@@ -651,7 +747,7 @@ class NativeRolloutBatcher:
             ell_base = np.minimum(L, h - base_ids)
             base_step = ell_base * substeps - 1
             base_terminal = out[np.arange(b), base_step]
-            base_xy, _, _ = self._root_from_state(base_terminal)
+            base_xy = self._task_xy_from_state(base_terminal)
             base_xy = np.asarray(base_xy, dtype=np.float64)
             endpoints[base_ids] = base_xy
 
@@ -665,7 +761,7 @@ class NativeRolloutBatcher:
             ell = np.minimum(L, h - ids)
             terminal_step = np.repeat(ell * substeps - 1, nu)
             pert_terminal = out[b + np.arange(m * nu), terminal_step]
-            xy, _, _ = self._root_from_state(pert_terminal)
+            xy = self._task_xy_from_state(pert_terminal)
             xy = np.asarray(xy, dtype=np.float64).reshape(m, nu, 2)
             jac_local = np.zeros((m, nu, 2), dtype=np.float64)
             valid = np.abs(denom) > 1e-12
@@ -724,7 +820,7 @@ def rollout_control_nominal(
         u = robot.clip_ctrl(controls[t])
         clipped[t] = u
         robot.step_control(u, substeps=control_substeps, data=d)
-        p = robot.xy(d)
+        p = robot.task_xy(d)
         s_new, _ = track.project(p)
         cum += track.signed_progress_delta(float(s_new), s_prev)
         s_prev = float(s_new)
@@ -756,11 +852,14 @@ def rollout_policy_nominal(
     cum = 0.0
     for t in range(horizon):
         snapshots.append(robot.snapshot(d))
+        # The transferred policy is still a *running* policy.  Its track
+        # command therefore follows the robot root, not the pushed object's
+        # location.  MPPI alone sees and optimizes the box objective.
         s_now, _ = track.project(robot.xy(d))
         u = np.asarray(policy.action(robot, d, track=track, prior=prior, current_s=float(s_now)), dtype=np.float64)
         controls[t] = robot.clip_ctrl(u)
         robot.step_control(controls[t], substeps=control_substeps, data=d)
-        p = robot.xy(d)
+        p = robot.task_xy(d)
         s_new, _ = track.project(p)
         cum += track.signed_progress_delta(float(s_new), s_prev)
         s_prev = float(s_new)
@@ -788,8 +887,15 @@ def rollout_controls(
     nominal_controls = controls if nominal_controls is None else np.asarray(nominal_controls, dtype=np.float64)
     positions = np.empty((len(controls), 2), dtype=np.float64)
     s_prev = float(current_s)
+    pushing = int(robot.task_body_id) != int(robot.root_body_id)
+    root_s_prev = float(track.project(robot.xy(d))[0])
+    initial_task_root_distance = float(np.linalg.norm(robot.task_xy(d) - robot.xy(d)))
+    initial_task_height = float(robot.task_rest_height) if pushing else 0.0
     cumulative = 0.0
+    root_cumulative = 0.0
     prefix_sum = 0.0
+    root_prefix_sum = 0.0
+    approach_prefix_sum = 0.0
     control_cost = 0.0
     upright_cost = 0.0
     allowed = max(0.0, 0.5 * float(track.road_width) - float(cfg.hard_collision_clearance))
@@ -798,10 +904,11 @@ def rollout_controls(
 
     for t, u in enumerate(controls):
         robot.step_control(u, substeps=control_substeps, data=d)
-        p = robot.xy(d)
+        p = robot.task_xy(d)
         positions[t] = p
         s_new, d2 = track.project(p)
-        if float(d2) > allowed * allowed:
+        _, robot_d2 = track.project(robot.xy(d))
+        if float(d2) > allowed * allowed or float(robot_d2) > allowed * allowed:
             off_track = True
             break
         if robot.root_height(d) < cfg.fall_height_fraction * max(robot.initial_root_height, 1e-6):
@@ -811,10 +918,23 @@ def rollout_controls(
         if up < cfg.min_root_up:
             off_track = True
             break
+        if pushing and (
+            robot.task_height(d) > initial_task_height + cfg.box_max_lift
+            or robot.task_up(d) < cfg.box_min_up
+        ):
+            off_track = True
+            break
         ds = track.signed_progress_delta(float(s_new), s_prev)
         cumulative += ds
         s_prev = float(s_new)
         prefix_sum += cumulative
+        if pushing:
+            root_s_new, _ = track.project(robot.xy(d))
+            root_ds = track.signed_progress_delta(float(root_s_new), root_s_prev)
+            root_cumulative += root_ds
+            root_s_prev = float(root_s_new)
+            root_prefix_sum += min(root_cumulative, max(cumulative, 0.0))
+            approach_prefix_sum += initial_task_root_distance - float(np.linalg.norm(robot.task_xy(d) - robot.xy(d)))
         upright_cost += float(cfg.upright_weight) * (1.0 - up) ** 2
         if robot.nu:
             du = u - nominal_controls[min(t, len(nominal_controls) - 1)]
@@ -822,7 +942,11 @@ def rollout_controls(
 
     if off_track:
         return positions, math.inf, cumulative, True
-    progress_cost = -prefix_sum / max(1, len(controls))
+    inv_h = 1.0 / max(1, len(controls))
+    progress_cost = -float(cfg.box_progress_weight) * prefix_sum * inv_h
+    if pushing:
+        progress_cost -= float(cfg.robot_progress_weight) * root_prefix_sum * inv_h
+        progress_cost -= float(cfg.robot_box_approach_weight) * approach_prefix_sum * inv_h
     return positions, float(progress_cost + upright_cost + control_cost), cumulative, False
 
 
@@ -888,7 +1012,7 @@ def _endpoint_from_snapshot(robot, snapshot, controls: np.ndarray, control_subst
     d = robot.new_data(snapshot)
     for u in controls:
         robot.step_control(u, substeps=control_substeps, data=d)
-    return robot.xy(d)
+    return robot.task_xy(d)
 
 
 def estimate_joint_task_jacobians(
@@ -1002,7 +1126,7 @@ def refine_policy_nominal(
 
         # Re-rollout the corrected open-loop sequence.  On the native path this
         # remains one batched C++ call and preserves the same physics exactly.
-        current_s0 = float(track.project(robot.xy(robot.new_data(start_snapshot)))[0])
+        current_s0 = float(track.project(robot.task_xy(robot.new_data(start_snapshot)))[0])
         current = rollout_control_nominal(
             robot, start_snapshot, controls, track, current_s0,
             control_substeps=control_substeps,

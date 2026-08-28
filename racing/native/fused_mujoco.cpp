@@ -34,6 +34,7 @@ struct Job {
   int nu = 0;
   int substeps = 1;
   int root_qadr = 0;
+  int task_qadr = 0;
 
   double origin_x = 0.0;
   double origin_y = 0.0;
@@ -54,7 +55,15 @@ struct Job {
   double min_up = -1.0;
   double upright_weight = 0.0;
   double control_deviation_weight = 0.0;
+  double box_progress_weight = 1.0;
+  double robot_progress_weight = 0.0;
+  double robot_box_approach_weight = 0.0;
+  double box_max_lift = 0.12;
+  double box_min_up = 0.75;
   double current_s = 0.0;
+  double current_root_s = 0.0;
+  double initial_task_root_distance = 0.0;
+  double initial_task_height = 0.0;
   double start_time = 0.0;
 };
 
@@ -131,18 +140,20 @@ inline void ProjectStadium(const Job& j, double xw, double yw,
 class FusedRolloutEvaluator {
  public:
   FusedRolloutEvaluator(const std::string& model_path, int nthread, int root_qpos_adr,
-                        int chunk_size)
+                        int task_qpos_adr, int chunk_size)
       : nthread_(std::max(1, nthread)),
         root_qadr_(root_qpos_adr),
+        task_qadr_(task_qpos_adr),
         chunk_size_(std::max(1, chunk_size)) {
     model_ = mj_loadModel(model_path.c_str(), nullptr);
     if (!model_) {
       throw std::runtime_error("mj_loadModel failed for fused rollout model: " + model_path);
     }
-    if (root_qadr_ < 0 || root_qadr_ + 7 > model_->nq) {
+    if (root_qadr_ < 0 || root_qadr_ + 7 > model_->nq ||
+        task_qadr_ < 0 || task_qadr_ + 7 > model_->nq) {
       mj_deleteModel(model_);
       model_ = nullptr;
-      throw std::runtime_error("invalid free-root qpos address for fused rollout evaluator");
+      throw std::runtime_error("invalid robot/task free-joint qpos address for fused rollout evaluator");
     }
 
     nstate_ = mj_stateSize(model_, mjSTATE_FULLPHYSICS);
@@ -219,8 +230,8 @@ class FusedRolloutEvaluator {
     if (scale_info.ndim != 1 || scale_info.shape[0] != nu) {
       throw std::runtime_error("fused ctrl_scale must have shape [nu]");
     }
-    if (param_info.ndim != 1 || param_info.shape[0] != 21) {
-      throw std::runtime_error("fused evaluator expected 21 track/cost parameters");
+    if (param_info.ndim != 1 || param_info.shape[0] != 29) {
+      throw std::runtime_error("fused evaluator expected 29 track/cost parameters");
     }
 
     py::array_t<double> positions({static_cast<py::ssize_t>(n),
@@ -245,6 +256,7 @@ class FusedRolloutEvaluator {
     job.nu = nu;
     job.substeps = std::max(1, control_substeps);
     job.root_qadr = root_qadr_;
+    job.task_qadr = task_qadr_;
     job.origin_x = p[0];
     job.origin_y = p[1];
     job.rot00 = p[2];
@@ -264,8 +276,16 @@ class FusedRolloutEvaluator {
     job.min_up = p[16];
     job.upright_weight = p[17];
     job.control_deviation_weight = p[18];
-    job.current_s = p[19];
-    job.start_time = p[20];
+    job.box_progress_weight = p[19];
+    job.robot_progress_weight = p[20];
+    job.robot_box_approach_weight = p[21];
+    job.box_max_lift = p[22];
+    job.box_min_up = p[23];
+    job.current_s = p[24];
+    job.current_root_s = p[25];
+    job.initial_task_root_distance = p[26];
+    job.initial_task_height = p[27];
+    job.start_time = p[28];
 
     {
       py::gil_scoped_release release;
@@ -389,8 +409,12 @@ class FusedRolloutEvaluator {
     double* positions_i = j.positions + static_cast<std::size_t>(i) * j.h * 2;
 
     double s_prev = j.current_s;
+    double root_s_prev = j.current_root_s;
     double cumulative = 0.0;
+    double root_cumulative = 0.0;
     double prefix_sum = 0.0;
+    double root_prefix_sum = 0.0;
+    double approach_prefix_sum = 0.0;
     double upright_cost = 0.0;
     double control_cost = 0.0;
     double prev_time = j.start_time;
@@ -421,8 +445,10 @@ class FusedRolloutEvaluator {
         mj_step(model_, d);
       }
 
-      const double xw = d->qpos[j.root_qadr + 0];
-      const double yw = d->qpos[j.root_qadr + 1];
+      // Progress belongs to the task body (robot for racing, box for pushing).
+      // Stability constraints always belong to the locomotion robot root.
+      const double xw = d->qpos[j.task_qadr + 0];
+      const double yw = d->qpos[j.task_qadr + 1];
       const double z = d->qpos[j.root_qadr + 2];
       const double qx = d->qpos[j.root_qadr + 4];
       const double qy = d->qpos[j.root_qadr + 5];
@@ -435,7 +461,29 @@ class FusedRolloutEvaluator {
       double best_d2 = 0.0;
       ProjectStadium(j, xw, yw, &best_s, &best_d2);
 
-      if (best_d2 > j.allowed_sq || z < j.min_height || up < j.min_up ||
+      // In box-pushing mode the task body and locomotion root are distinct.
+      // The box drives progress, but both box and robot must remain on-road.
+      double root_d2 = best_d2;
+      double root_s = best_s;
+      if (j.task_qadr != j.root_qadr) {
+        ProjectStadium(j, d->qpos[j.root_qadr + 0], d->qpos[j.root_qadr + 1],
+                       &root_s, &root_d2);
+      }
+
+      if (j.task_qadr != j.root_qadr) {
+        const double task_z = d->qpos[j.task_qadr + 2];
+        const double task_qx = d->qpos[j.task_qadr + 4];
+        const double task_qy = d->qpos[j.task_qadr + 5];
+        const double task_up = 1.0 - 2.0 * (task_qx * task_qx + task_qy * task_qy);
+        if (task_z > j.initial_task_height + j.box_max_lift ||
+            task_up < j.box_min_up) {
+          failed = true;
+          break;
+        }
+      }
+
+      if (best_d2 > j.allowed_sq || root_d2 > j.allowed_sq ||
+          z < j.min_height || up < j.min_up ||
           d->time <= prev_time + 1e-15) {
         failed = true;
         break;
@@ -450,6 +498,25 @@ class FusedRolloutEvaluator {
       cumulative += ds;
       prefix_sum += cumulative;
       s_prev = best_s;
+
+      if (j.task_qadr != j.root_qadr) {
+        double root_ds = root_s - root_s_prev;
+        if (root_ds > half_track) {
+          root_ds -= j.track_length;
+        } else if (root_ds < -half_track) {
+          root_ds += j.track_length;
+        }
+        root_cumulative += root_ds;
+        const double coupled = std::min(root_cumulative, std::max(cumulative, 0.0));
+        root_prefix_sum += coupled;
+        root_s_prev = root_s;
+
+        const double dx_rb = d->qpos[j.task_qadr + 0] - d->qpos[j.root_qadr + 0];
+        const double dy_rb = d->qpos[j.task_qadr + 1] - d->qpos[j.root_qadr + 1];
+        const double dist_rb = std::sqrt(dx_rb * dx_rb + dy_rb * dy_rb);
+        approach_prefix_sum += j.initial_task_root_distance - dist_rb;
+      }
+
       prev_time = d->time;
 
       double du_sq_sum = 0.0;
@@ -476,15 +543,24 @@ class FusedRolloutEvaluator {
 
     j.progress[i] = cumulative;
     j.failed[i] = failed;
-    j.costs[i] = failed
-        ? std::numeric_limits<double>::infinity()
-        : (-prefix_sum / std::max(1, j.h) + upright_cost + control_cost);
+    if (failed) {
+      j.costs[i] = std::numeric_limits<double>::infinity();
+    } else {
+      const double inv_h = 1.0 / std::max(1, j.h);
+      double progress_cost = -j.box_progress_weight * prefix_sum * inv_h;
+      if (j.task_qadr != j.root_qadr) {
+        progress_cost -= j.robot_progress_weight * root_prefix_sum * inv_h;
+        progress_cost -= j.robot_box_approach_weight * approach_prefix_sum * inv_h;
+      }
+      j.costs[i] = progress_cost + upright_cost + control_cost;
+    }
   }
 
   mjModel* model_ = nullptr;
   std::vector<mjData*> data_;
   int nthread_ = 1;
   int root_qadr_ = 0;
+  int task_qadr_ = 0;
   int chunk_size_ = 1;
   int nstate_ = 0;
 
@@ -502,9 +578,10 @@ class FusedRolloutEvaluator {
 PYBIND11_MODULE(_fused_mujoco, m) {
   m.doc() = "Exact RK4 fused MuJoCo rollout + stadium cost evaluator";
   py::class_<FusedRolloutEvaluator>(m, "FusedRolloutEvaluator")
-      .def(py::init<const std::string&, int, int, int>(),
+      .def(py::init<const std::string&, int, int, int, int>(),
            py::arg("model_path"), py::arg("nthread"),
-           py::arg("root_qpos_adr"), py::arg("chunk_size") = 1)
+           py::arg("root_qpos_adr"), py::arg("task_qpos_adr"),
+           py::arg("chunk_size") = 1)
       .def("evaluate", &FusedRolloutEvaluator::Evaluate,
            py::arg("initial_state"), py::arg("controls"),
            py::arg("nominal_controls"), py::arg("ctrl_scale"),

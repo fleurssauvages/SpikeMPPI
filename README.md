@@ -1,27 +1,37 @@
-# Racing: Rapid-Locomotion policy + direct-joint SPG-MPPI + online MuJoCo adaptation
+# Online adaptation of pre-trained policy using MPPI
 
 This project uses the MuJoCo locomotion robots, with **Ant** as the primary 2-D stadium racer. The default policy trainer is an adaptation of Margolis et al., *Rapid Locomotion via Reinforcement Learning* (RSS 2022 / IJRR), and an MPPI controller refines the learned policy online for racing.
 
 - Paper: https://doi.org/10.1177/02783649231224053
 - Released reference code: https://github.com/Improbable-AI/rapid-locomotion-rl
 
-<p align="center"><b>Nominal policy (19.38 s)</b></p>
+### Same Task Refinement
+| Nominal | SPG |
+|:---:|:---:|
+| <img src="racing/results/nominal.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
-<p align="center">
-  <img src="racing/results/nominal.gif" alt="Nominal policy" width="100%">
-</p>
+### Adaptation to novel terrain
+| Nominal | SPG |
+|:---:|:---:|
+| <img src="racing/results/nominal_ramps.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_ramps.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
-<p align="center"><b>Standard MPPI (17.06 s)</b></p>
+| Nominal | SPG |
+|:---:|:---:|
+| <img src="racing/results/nominal_stairs.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_stairs.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
-<p align="center">
-  <img src="racing/results/mppi.gif" alt="Standard MPPI" width="100%">
-</p>
+| Nominal | SPG |
+|:---:|:---:|
+| <img src="racing/results/nominal_rocky.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_rocky.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
-<p align="center"><b>Sensitivity Projected Gaussian MPPI (10.52 s)</b></p>
+| Nominal | SPG |
+|:---:|:---:|
+| <img src="racing/results/nominal_mixed.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_mixed.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
-<p align="center">
-  <img src="racing/results/spg_3.gif" alt="Sensitivity Projected Gaussian MPPI" width="100%">
-</p>
+### Adaptation to new tasks
+
+| Nominal | SPG (speed x2) |
+|:---:|:---:|
+| <img src="racing/results/nominal_box.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_box.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
 ## Overview
 

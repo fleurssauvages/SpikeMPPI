@@ -10,6 +10,7 @@ from typing import Optional
 import numpy as np
 
 from racing.adaptation import ModelParameterScales, OnlineSystemIdentifier, SystemIDConfig
+from racing.environments import RaceEnvironmentConfig
 from racing.mppi import ControllerConfig, ControllerVariant, JointMPPIController
 from racing.policies import make_policy
 from racing.priors import EmpiricalPrior, GeometricPrior, SpatialPrior
@@ -29,6 +30,7 @@ class RaceResult:
     controller_variant: str
     control_dt: float
     xy: np.ndarray
+    target_xy: np.ndarray
     qpos: np.ndarray
     qvel: np.ndarray
     act: np.ndarray
@@ -45,6 +47,7 @@ class RaceResult:
     runtime_s: float
     simulated_time_s: float
     track: StadiumTrack
+    environment: RaceEnvironmentConfig
     plant_parameters: ModelParameterScales
     model_estimates: np.ndarray
     model_estimate_steps: np.ndarray
@@ -88,6 +91,20 @@ def run_race(
     mass_scale: float = 1.0,
     motor_scale: float = 1.0,
     slope_deg: float = 0.0,
+    task: str = "run",
+    terrain: str = "flat",
+    terrain_seed: int = 1,
+    terrain_scale: float = 1.0,
+    box_distance: float = 1.8,
+    box_size: float = 0.90,
+    box_height: float = 0.45,
+    box_mass: float = 6.0,
+    box_friction: float = 0.60,
+    push_box_progress_weight: float = 1.0,
+    push_robot_progress_weight: float = 0.35,
+    push_approach_weight: float = 1.00,
+    push_box_max_lift: float = 0.12,
+    push_box_min_up: float = 0.75,
     online_adaptation: bool = False,
     sysid_history: int = 12,
     sysid_interval: int = 8,
@@ -104,15 +121,53 @@ def run_race(
     starts from nominal model parameters. When online adaptation is enabled, recent
     plant transitions update the planning model without revealing the true scales.
     """
-    plant = make_robot(robot_name)
-    planner = make_robot(robot_name)
-    if plant.nu <= 0:
-        raise ValueError(f"{plant.name} has no MuJoCo actuators (model.nu=0)")
-    if not plant.supports_stadium:
+    # Build the track from the untouched robot reset pose, then compile task/terrain
+    # additions into both plant and planner models.  PPO remains a flat-ground
+    # pretrained policy, while MPPI is given the true test-time task geometry.
+    probe = make_robot(robot_name)
+    if probe.nu <= 0:
+        raise ValueError(f"{probe.name} has no MuJoCo actuators (model.nu=0)")
+    if not probe.supports_stadium:
         raise ValueError(
-            f"{plant.display_name} is constrained to 1-D forward locomotion and cannot turn on the stadium track. "
+            f"{probe.display_name} is constrained to 1-D forward locomotion and cannot turn on the stadium track. "
             "Use ant, humanoid, or swimmer for the 2-D race."
         )
+    origin_xy = tuple(map(float, probe.xy()))
+    origin_yaw = float(probe.root_yaw())
+    track = StadiumTrack(origin_xy=origin_xy, origin_yaw=origin_yaw)
+    environment = RaceEnvironmentConfig(
+        task=task, terrain=terrain, terrain_seed=terrain_seed, terrain_scale=terrain_scale,
+        box_distance=box_distance, box_size=box_size, box_height=box_height,
+        box_mass=box_mass, box_friction=box_friction,
+    ).validated()
+
+    plant = make_robot(robot_name, extra_worldbody_xml=environment.plant_worldbody_xml(track))
+    planner = make_robot(robot_name, extra_worldbody_xml=environment.planner_worldbody_xml(track))
+    plant.set_task_target_body(environment.task_body_name)
+    planner.set_task_target_body(environment.task_body_name)
+
+    # Fail loudly if the source MJCF compiler changes/overrides the requested
+    # task-object mass.  Classic Ant/Humanoid use inertiafromgeom=true, so this
+    # guard specifically protects --box-mass from becoming a cosmetic flag.
+    compiled_box_mass_plant = None
+    compiled_box_mass_planner = None
+    if environment.task == "push_box":
+        compiled_box_mass_plant = float(plant.model.body_mass[plant.task_body_id])
+        compiled_box_mass_planner = float(planner.model.body_mass[planner.task_body_id])
+        requested_box_mass = float(environment.box_mass)
+        if not np.isclose(compiled_box_mass_plant, requested_box_mass, rtol=2e-6, atol=1e-9):
+            raise RuntimeError(
+                f"compiled plant box mass {compiled_box_mass_plant:.9g} kg does not match "
+                f"--box-mass {requested_box_mass:.9g} kg"
+            )
+        if not np.isclose(compiled_box_mass_planner, requested_box_mass, rtol=2e-6, atol=1e-9):
+            raise RuntimeError(
+                f"compiled planner box mass {compiled_box_mass_planner:.9g} kg does not match "
+                f"--box-mass {requested_box_mass:.9g} kg"
+            )
+
+    if int(plant.model.nq) != int(planner.model.nq) or int(plant.model.nv) != int(planner.model.nv):
+        raise RuntimeError("plant/planner dynamic state dimensions differ after environment construction")
 
     plant_params = ModelParameterScales(
         friction=float(friction_scale),
@@ -135,10 +190,6 @@ def run_race(
         }
         planner.model.opt.integrator = integrator_map[planner_integrator]
         planner.mujoco.mj_forward(planner.model, planner.data)
-
-    origin_xy = tuple(map(float, plant.xy()))
-    origin_yaw = float(plant.root_yaw())
-    track = StadiumTrack(origin_xy=origin_xy, origin_yaw=origin_yaw)
     prior = prior or GeometricPrior()
     policy = make_policy(policy_spec, race_speed=policy_speed, robot_name=robot_name)
     policy.reset(planner, planner.data)
@@ -164,6 +215,11 @@ def run_race(
         warm_start=bool(warm_start),
         spg_jacobian_refresh_interval=int(spg_jacobian_refresh_interval),
         spg_jacobian_refresh_prefix=int(spg_jacobian_refresh_prefix),
+        box_progress_weight=float(push_box_progress_weight),
+        robot_progress_weight=float(push_robot_progress_weight),
+        robot_box_approach_weight=float(push_approach_weight),
+        box_max_lift=float(push_box_max_lift),
+        box_min_up=float(push_box_min_up),
     )
     controller = JointMPPIController(planner, track, prior, policy, cfg, variant=variant, seed=seed)
 
@@ -178,7 +234,7 @@ def run_race(
             ),
         )
 
-    current_s, _ = track.project(plant.xy())
+    current_s, _ = track.project(plant.task_xy())
     current_s = float(current_s)
     cumulative = 0.0
     target = int(laps) * track.length
@@ -186,6 +242,7 @@ def run_race(
 
     initial_state = plant.snapshot()
     xy_hist = [plant.xy()]
+    target_xy_hist = [plant.task_xy()]
     qpos_hist = [initial_state.qpos.copy()]
     qvel_hist = [initial_state.qvel.copy()]
     act_hist = [initial_state.act.copy()]
@@ -217,8 +274,19 @@ def run_race(
             f"controller={controller.variant.value}  robot={plant.name}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
             f"backend={controller.rollout_backend_name}  planner_integrator={planner_integrator} "
-            f"warm_start={cfg.warm_start}"
+            f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain}"
         )
+        if environment.task == "push_box":
+            print(
+                "push reward: "
+                f"box_progress={cfg.box_progress_weight:g}, "
+                f"robot_progress={cfg.robot_progress_weight:g}, "
+                f"approach={cfg.robot_box_approach_weight:g}; "
+                f"box_distance={environment.box_distance:g}m "
+                f"footprint={environment.box_size:g}m height={environment.box_height:g}m "
+                f"mass={environment.box_mass:g}kg "
+                f"(compiled plant={compiled_box_mass_plant:g}kg, planner={compiled_box_mass_planner:g}kg)"
+            )
         if controller.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
             print(
                 f"SPG: lookahead={cfg.spg_lookahead_steps}, mix={cfg.spg_mix:g}, "
@@ -282,12 +350,15 @@ def run_race(
                         )
 
             p = plant.xy()
-            new_s, d2 = track.project(p)
+            task_p = plant.task_xy()
+            new_s, d2 = track.project(task_p)
+            _, robot_d2 = track.project(p)
             ds = track.signed_progress_delta(float(new_s), current_s)
             cumulative += ds
             current_s = float(new_s)
 
             xy_hist.append(p)
+            target_xy_hist.append(task_p)
             qpos_hist.append(after.qpos.copy())
             qvel_hist.append(after.qvel.copy())
             act_hist.append(after.act.copy())
@@ -308,7 +379,7 @@ def run_race(
                     )
 
             allowed = max(0.0, 0.5 * track.road_width - cfg.hard_collision_clearance)
-            off_track = float(d2) > allowed * allowed
+            off_track = float(d2) > allowed * allowed or float(robot_d2) > allowed * allowed
             fell = (
                 plant.root_height() < cfg.fall_height_fraction * max(plant.initial_root_height, 1e-6)
                 or plant.root_up() < cfg.min_root_up
@@ -353,6 +424,7 @@ def run_race(
         controller_variant=controller.variant.value,
         control_dt=float(cfg.control_dt),
         xy=np.asarray(xy_hist, dtype=np.float64),
+        target_xy=np.asarray(target_xy_hist, dtype=np.float64),
         qpos=np.asarray(qpos_hist, dtype=np.float64),
         qvel=np.asarray(qvel_hist, dtype=np.float64),
         act=np.asarray(act_hist, dtype=np.float64),
@@ -369,6 +441,7 @@ def run_race(
         runtime_s=runtime,
         simulated_time_s=len(controls) * cfg.control_dt,
         track=track,
+        environment=environment,
         plant_parameters=plant_params,
         model_estimates=np.asarray(estimate_rows, dtype=np.float64),
         model_estimate_steps=np.asarray(estimate_steps, dtype=np.int64),
@@ -381,11 +454,13 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
-        replay_format_version=np.asarray(1, dtype=np.int64),
+        replay_format_version=np.asarray(2, dtype=np.int64),
         robot_name=result.robot_name,
         controller_variant=result.controller_variant,
         control_dt=result.control_dt,
         xy=result.xy,
+        target_xy=result.target_xy,
+        environment_json=np.asarray(result.environment.to_json()),
         qpos=result.qpos,
         qvel=result.qvel,
         act=result.act,
@@ -503,6 +578,27 @@ def main() -> None:
     parser.add_argument("--motor-scale", type=float, default=1.0)
     parser.add_argument("--slope-deg", type=float, default=0.0)
 
+    parser.add_argument(
+        "--task", choices=["run", "push_box"], default="run",
+        help="run tracks robot progress; push_box uses the same pretrained running policy but MPPI/progress track the box",
+    )
+    parser.add_argument(
+        "--terrain", choices=["flat", "ramps", "stairs", "rocky", "mixed"], default="flat",
+        help="known test-time terrain on the upper straight and second turn; PPO stays flat-ground pretrained; push_box requires flat",
+    )
+    parser.add_argument("--terrain-seed", type=int, default=1, help="deterministic rocky/mixed terrain seed")
+    parser.add_argument("--terrain-scale", type=float, default=1.0, help="scale obstacle heights/ramp rise")
+    parser.add_argument("--box-distance", type=float, default=1.8, help="initial box center distance ahead of the robot along track [m] (default: 1.8)")
+    parser.add_argument("--box-size", type=float, default=0.90, help="square box footprint edge [m] (default: 0.90)")
+    parser.add_argument("--box-height", type=float, default=0.45, help="box height [m] (default: 0.45; low crate reduces kicking/tipping)")
+    parser.add_argument("--box-mass", type=float, default=6.0, help="box mass [kg] (default: 6.0)")
+    parser.add_argument("--box-friction", type=float, default=0.60, help="box sliding friction coefficient (default: 0.60)")
+    parser.add_argument("--push-box-progress-weight", type=float, default=1.0, help="primary box track-progress reward weight")
+    parser.add_argument("--push-robot-progress-weight", type=float, default=0.35, help="coupled robot-progress shaping weight; robot cannot earn it by running past a stationary box")
+    parser.add_argument("--push-approach-weight", type=float, default=1.00, help="dense reward for reducing/maintaining robot-box distance")
+    parser.add_argument("--push-box-max-lift", type=float, default=0.12, help="reject MPPI candidates lifting the box more than this above reset height [m]")
+    parser.add_argument("--push-box-min-up", type=float, default=0.75, help="reject MPPI candidates tipping the box below this world-up cosine")
+
     parser.add_argument("--adapt-model", action="store_true", help="online system-identification of the SPG-MPPI planning model")
     parser.add_argument("--sysid-history", type=int, default=12)
     parser.add_argument("--sysid-interval", type=int, default=8)
@@ -552,6 +648,20 @@ def main() -> None:
         mass_scale=args.mass_scale,
         motor_scale=args.motor_scale,
         slope_deg=args.slope_deg,
+        task=args.task,
+        terrain=args.terrain,
+        terrain_seed=args.terrain_seed,
+        terrain_scale=args.terrain_scale,
+        box_distance=args.box_distance,
+        box_size=args.box_size,
+        box_height=args.box_height,
+        box_mass=args.box_mass,
+        box_friction=args.box_friction,
+        push_box_progress_weight=args.push_box_progress_weight,
+        push_robot_progress_weight=args.push_robot_progress_weight,
+        push_approach_weight=args.push_approach_weight,
+        push_box_max_lift=args.push_box_max_lift,
+        push_box_min_up=args.push_box_min_up,
         online_adaptation=args.adapt_model,
         sysid_history=args.sysid_history,
         sysid_interval=args.sysid_interval,
@@ -561,7 +671,7 @@ def main() -> None:
         result.simulated_time_s / result.runtime_s if result.runtime_s > 0.0 else math.inf
     )
     print(
-        f"finished {result.robot_name}: {result.completed_laps}/{result.requested_laps} laps, "
+        f"finished {result.robot_name} task={result.environment.task}: {result.completed_laps}/{result.requested_laps} laps, "
         f"off_track={result.off_track}, fell={result.fell}, "
         f"progress={result.cumulative_progress[-1]:.2f}m, "
         f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s, "

@@ -4,8 +4,8 @@ from .base import ClassicRobot
 from .classic import find_classic_model, list_classic_models
 
 
-def make_robot(name: str) -> ClassicRobot:
-    return ClassicRobot(find_classic_model(name))
+def make_robot(name: str, *, extra_worldbody_xml: str = "") -> ClassicRobot:
+    return ClassicRobot(find_classic_model(name), extra_worldbody_xml=extra_worldbody_xml)
 
 
 def list_racing_candidates() -> list[dict[str, object]]:

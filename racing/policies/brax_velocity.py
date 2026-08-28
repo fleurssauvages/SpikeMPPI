@@ -27,21 +27,25 @@ def rapid_observation_numpy(
     qpos = np.asarray(data.qpos, dtype=np.float64)
     qvel = np.asarray(data.qvel, dtype=np.float64)
     qpos0 = np.asarray(robot.model.qpos0, dtype=np.float64)
+    qpos_end = int(getattr(robot, "robot_nq", qpos.shape[0]))
+    qvel_end = int(getattr(robot, "robot_nv", qvel.shape[0]))
     return np.concatenate([
         body_linear,
         body_angular,
         projected_gravity,
         np.asarray(command, dtype=np.float64).reshape(3),
-        qpos[7:] - qpos0[7:],
-        qvel[6:],
+        qpos[7:qpos_end] - qpos0[7:qpos_end],
+        qvel[6:qvel_end],
         np.asarray(previous_action, dtype=np.float64).reshape(robot.nu),
     ]).astype(np.float32, copy=False)
 
 
 def _legacy_observation(robot, data, command: np.ndarray, previous_action: np.ndarray) -> np.ndarray:
+    qpos_end = int(getattr(robot, "robot_nq", len(data.qpos)))
+    qvel_end = int(getattr(robot, "robot_nv", len(data.qvel)))
     return np.concatenate([
-        np.asarray(data.qpos[2:], dtype=np.float32),
-        np.asarray(data.qvel, dtype=np.float32),
+        np.asarray(data.qpos[2:qpos_end], dtype=np.float32),
+        np.asarray(data.qvel[:qvel_end], dtype=np.float32),
         np.asarray(command, dtype=np.float32).reshape(3),
         np.asarray(previous_action, dtype=np.float32).reshape(robot.nu),
     ]).astype(np.float32, copy=False)
