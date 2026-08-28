@@ -9,6 +9,10 @@ import numpy as np
 
 
 BOX_BODY_NAME = "race_box"
+SLED_BODY_NAME = "race_sled"
+TOW_ROBOT_SITE_NAME = "race_tow_robot_hitch"
+TOW_SLED_SITE_NAME = "race_tow_sled_hitch"
+TOW_TENDON_NAME = "race_tow_rope"
 TERRAIN_PREFIX = "race_terrain_"
 
 
@@ -22,14 +26,16 @@ class RaceEnvironmentConfig:
     the true ramp/stair/rock geometry and can adapt the flat-running nominal
     controls online.
 
-    ``push_box`` follows the same transfer principle: the box is present in both
-    plant and planner so candidate rollouts can predict robot-box contact.  The
-    pretrained locomotion policy still receives only the original robot
-    observation; the box state is hidden from the policy and used only as the
-    MPPI progress target.
+    ``push_box`` follows the same transfer principle: the object is present in
+    both plant and planner so candidate rollouts can predict robot-object
+    contact. ``tow_sled`` similarly adds a free sled plus a limited spatial
+    tendon (cable) from the robot root to the sled. The pretrained locomotion
+    policy remains unchanged; MPPI sees the transferred task dynamics and uses
+    the pushed/towed body as its progress target.
     """
 
-    task: str = "run"  # run | push_box
+    task: str = "run"  # run | push_box | tow_sled
+    push_object: str = "box"  # box | ball
     terrain: str = "flat"  # flat | ramps | stairs | rocky | mixed
     terrain_seed: int = 1
     terrain_scale: float = 1.0
@@ -41,16 +47,31 @@ class RaceEnvironmentConfig:
     box_height: float = 0.45
     box_mass: float = 6.0
     box_friction: float = 0.60
+    ball_rolling_friction: float = 0.03
+
+    # Towing transfer task. The sled is spawned behind the robot and attached by
+    # a unilateral spatial-tendon length limit, which behaves like a cable: it
+    # can pull when taut but cannot push the sled.
+    sled_distance: float = 1.8
+    sled_length: float = 1.0
+    sled_width: float = 0.80
+    sled_height: float = 0.16
+    sled_mass: float = 8.0
+    sled_friction: float = 0.60
+    sled_rope_length: float = 1.25
 
     def validated(self) -> "RaceEnvironmentConfig":
         task = str(self.task).strip().lower()
+        push_object = str(self.push_object).strip().lower()
         terrain = str(self.terrain).strip().lower()
-        if task not in {"run", "push_box"}:
-            raise ValueError("task must be 'run' or 'push_box'")
+        if task not in {"run", "push_box", "tow_sled"}:
+            raise ValueError("task must be 'run', 'push_box', or 'tow_sled'")
+        if push_object not in {"box", "ball"}:
+            raise ValueError("push_object must be 'box' or 'ball'")
         if terrain not in {"flat", "ramps", "stairs", "rocky", "mixed"}:
             raise ValueError("terrain must be flat, ramps, stairs, rocky, or mixed")
-        if task == "push_box" and terrain != "flat":
-            raise ValueError("push_box is intentionally a flat-ground task; use --terrain flat")
+        if task in {"push_box", "tow_sled"} and terrain != "flat":
+            raise ValueError(f"{task} is intentionally a flat-ground task; use --terrain flat")
         if not np.isfinite(self.terrain_scale) or self.terrain_scale <= 0.0:
             raise ValueError("terrain_scale must be positive")
         if not np.isfinite(self.box_distance) or self.box_distance <= 0.0:
@@ -63,8 +84,25 @@ class RaceEnvironmentConfig:
             raise ValueError("box_mass must be positive")
         if not np.isfinite(self.box_friction) or self.box_friction <= 0.0:
             raise ValueError("box_friction must be positive")
+        if not np.isfinite(self.ball_rolling_friction) or self.ball_rolling_friction < 0.0:
+            raise ValueError("ball_rolling_friction must be non-negative")
+        if not np.isfinite(self.sled_distance) or self.sled_distance <= 0.0:
+            raise ValueError("sled_distance must be positive")
+        if not np.isfinite(self.sled_length) or self.sled_length <= 0.1:
+            raise ValueError("sled_length must be > 0.1 m")
+        if not np.isfinite(self.sled_width) or self.sled_width <= 0.1:
+            raise ValueError("sled_width must be > 0.1 m")
+        if not np.isfinite(self.sled_height) or self.sled_height <= 0.03:
+            raise ValueError("sled_height must be > 0.03 m")
+        if not np.isfinite(self.sled_mass) or self.sled_mass <= 0.0:
+            raise ValueError("sled_mass must be positive")
+        if not np.isfinite(self.sled_friction) or self.sled_friction <= 0.0:
+            raise ValueError("sled_friction must be positive")
+        if not np.isfinite(self.sled_rope_length) or self.sled_rope_length <= 0.1:
+            raise ValueError("sled_rope_length must be > 0.1 m")
         return RaceEnvironmentConfig(
             task=task,
+            push_object=push_object,
             terrain=terrain,
             terrain_seed=int(self.terrain_seed),
             terrain_scale=float(self.terrain_scale),
@@ -73,11 +111,23 @@ class RaceEnvironmentConfig:
             box_height=float(self.box_height),
             box_mass=float(self.box_mass),
             box_friction=float(self.box_friction),
+            ball_rolling_friction=float(self.ball_rolling_friction),
+            sled_distance=float(self.sled_distance),
+            sled_length=float(self.sled_length),
+            sled_width=float(self.sled_width),
+            sled_height=float(self.sled_height),
+            sled_mass=float(self.sled_mass),
+            sled_friction=float(self.sled_friction),
+            sled_rope_length=float(self.sled_rope_length),
         )
 
     @property
     def task_body_name(self) -> str | None:
-        return BOX_BODY_NAME if self.task == "push_box" else None
+        if self.task == "push_box":
+            return BOX_BODY_NAME
+        if self.task == "tow_sled":
+            return SLED_BODY_NAME
+        return None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
@@ -109,13 +159,26 @@ class RaceEnvironmentConfig:
                 scale=self.terrain_scale,
             ))
         if self.task == "push_box":
-            parts.append(build_box_worldbody_xml(
+            parts.append(build_push_object_worldbody_xml(
                 track,
+                object_type=self.push_object,
                 distance=self.box_distance,
                 size=self.box_size,
                 height=self.box_height,
                 mass=self.box_mass,
                 friction=self.box_friction,
+                ball_rolling_friction=self.ball_rolling_friction,
+            ))
+        elif self.task == "tow_sled":
+            parts.append(build_sled_model_xml(
+                track,
+                distance=self.sled_distance,
+                length=self.sled_length,
+                width=self.sled_width,
+                height=self.sled_height,
+                mass=self.sled_mass,
+                friction=self.sled_friction,
+                rope_length=self.sled_rope_length,
             ))
         return "\n".join(x for x in parts if x)
 
@@ -133,13 +196,26 @@ class RaceEnvironmentConfig:
                 scale=self.terrain_scale,
             ))
         if self.task == "push_box":
-            parts.append(build_box_worldbody_xml(
+            parts.append(build_push_object_worldbody_xml(
                 track,
+                object_type=self.push_object,
                 distance=self.box_distance,
                 size=self.box_size,
                 height=self.box_height,
                 mass=self.box_mass,
                 friction=self.box_friction,
+                ball_rolling_friction=self.ball_rolling_friction,
+            ))
+        elif self.task == "tow_sled":
+            parts.append(build_sled_model_xml(
+                track,
+                distance=self.sled_distance,
+                length=self.sled_length,
+                width=self.sled_width,
+                height=self.sled_height,
+                mass=self.sled_mass,
+                friction=self.sled_friction,
+                rope_length=self.sled_rope_length,
             ))
         return "\n".join(x for x in parts if x)
 
@@ -387,6 +463,174 @@ def build_terrain_worldbody_xml(track, *, kind: str, seed: int = 1, scale: float
     return "\n".join(geoms)
 
 
+def build_push_object_worldbody_xml(
+    track,
+    *,
+    object_type: str = "box",
+    distance: float = 1.8,
+    size: float = 0.90,
+    height: float = 0.45,
+    mass: float = 6.0,
+    friction: float = 0.60,
+    ball_rolling_friction: float = 0.03,
+) -> str:
+    """Build the free object used by the pushing-transfer task.
+
+    ``size`` is the box footprint edge for ``box`` and the ball diameter for
+    ``ball``.  The requested mass is imposed through an explicit geom density
+    so it remains exact with the classic locomotion XMLs'
+    ``inertiafromgeom=true`` compiler setting.
+    """
+    object_type = str(object_type).strip().lower()
+    if object_type not in {"box", "ball"}:
+        raise ValueError("object_type must be 'box' or 'ball'")
+
+    s = float(track.start_s) + float(distance)
+    p, yaw = _pose_on_track(track, s)
+    body = ET.Element("body", {"name": BOX_BODY_NAME})
+    ET.SubElement(body, "freejoint", {"name": f"{BOX_BODY_NAME}_joint"})
+
+    if object_type == "ball":
+        radius = 0.5 * float(size)
+        volume = (4.0 / 3.0) * math.pi * radius ** 3
+        density = float(mass) / max(volume, 1e-12)
+        body.set("pos", _fmt([p[0], p[1], radius + 0.004]))
+        # Sphere orientation has no geometric meaning, but keeping the spawn yaw
+        # makes the free-joint initialization convention identical to the box.
+        body.set("quat", _fmt(_quat_ypr(yaw)))
+        ET.SubElement(body, "geom", {
+            "name": f"{BOX_BODY_NAME}_geom",
+            "type": "sphere",
+            "size": _fmt([radius]),
+            "density": f"{density:.12g}",
+            "friction": _fmt([float(friction), 0.01, float(ball_rolling_friction)]),
+            "rgba": _fmt([0.20, 0.55, 0.95, 1.0]),
+            "contype": "1",
+            "conaffinity": "1",
+            "condim": "6",
+            "group": "0",
+        })
+        return ET.tostring(body, encoding="unicode")
+
+    half_xy = 0.5 * float(size)
+    half_z = 0.5 * float(height)
+    body.set("pos", _fmt([p[0], p[1], half_z + 0.004]))
+    body.set("quat", _fmt(_quat_ypr(yaw)))
+
+    # Classic Ant/Humanoid models compile body inertia from geoms.  Override
+    # density explicitly so --box-mass remains exact under inertiafromgeom=true.
+    volume = float(size) * float(size) * float(height)
+    density = float(mass) / max(volume, 1e-12)
+    ET.SubElement(body, "geom", {
+        "name": f"{BOX_BODY_NAME}_geom",
+        "type": "box",
+        "size": _fmt([half_xy, half_xy, half_z]),
+        "density": f"{density:.12g}",
+        "friction": _fmt([float(friction), 0.01, 0.001]),
+        "rgba": _fmt([0.92, 0.48, 0.08, 1.0]),
+        "contype": "1",
+        "conaffinity": "1",
+        "condim": "4",
+        "group": "0",
+    })
+    return ET.tostring(body, encoding="unicode")
+
+
+
+def build_sled_model_xml(
+    track,
+    *,
+    distance: float = 1.8,
+    length: float = 1.0,
+    width: float = 0.80,
+    height: float = 0.16,
+    mass: float = 8.0,
+    friction: float = 0.60,
+    rope_length: float = 1.25,
+) -> str:
+    """Build a free sled plus a cable-like spatial tendon to the robot root.
+
+    The returned fragment intentionally contains both a worldbody ``<body>`` and
+    a model-level ``<tendon>`` section. ``ClassicRobot._load_augmented_model``
+    routes those elements to the correct MuJoCo XML sections and turns the
+    ``<race_root_site>`` marker into a site attached to the robot root body.
+
+    The spatial tendon has a one-sided length limit [0, rope_length], so it is
+    slack below the limit and only transmits tension when stretched: a tow rope,
+    not a rigid drawbar. The sled itself remains a normal free MuJoCo body.
+    """
+    length = float(length)
+    width = float(width)
+    height = float(height)
+    mass = float(mass)
+    rope_length = float(rope_length)
+
+    # Spawn behind the robot along the track direction. The front hitch site is
+    # on the sled's leading face, so the initial cable is short/slightly slack.
+    s = float(track.start_s) - float(distance)
+    p, yaw = _pose_on_track(track, s)
+    half = np.asarray([0.5 * length, 0.5 * width, 0.5 * height], dtype=np.float64)
+    volume = max(length * width * height, 1e-12)
+    density = mass / volume
+
+    body = ET.Element("body", {
+        "name": SLED_BODY_NAME,
+        "pos": _fmt([p[0], p[1], half[2] + 0.004]),
+        "quat": _fmt(_quat_ypr(yaw)),
+    })
+    ET.SubElement(body, "freejoint", {"name": f"{SLED_BODY_NAME}_joint"})
+    ET.SubElement(body, "geom", {
+        "name": f"{SLED_BODY_NAME}_geom",
+        "type": "box",
+        "size": _fmt(half),
+        "density": f"{density:.12g}",
+        "friction": _fmt([float(friction), 0.01, 0.001]),
+        "rgba": _fmt([0.18, 0.22, 0.26, 1.0]),
+        "contype": "1",
+        "conaffinity": "1",
+        "condim": "4",
+        "group": "0",
+    })
+    ET.SubElement(body, "site", {
+        "name": TOW_SLED_SITE_NAME,
+        "type": "sphere",
+        "pos": _fmt([half[0], 0.0, 0.0]),
+        "size": "0.035",
+        "rgba": _fmt([0.95, 0.75, 0.10, 1.0]),
+        "group": "0",
+    })
+
+    # This marker is consumed before MuJoCo compilation and replaced by a site
+    # on the original robot root body. Keeping it in the environment fragment
+    # avoids modifying the pretrained robot XML on disk.
+    root_site = ET.Element("race_root_site", {
+        "name": TOW_ROBOT_SITE_NAME,
+        "type": "sphere",
+        "pos": _fmt([-0.20, 0.0, -0.25]),
+        "size": "0.035",
+        "rgba": _fmt([0.95, 0.75, 0.10, 1.0]),
+        "group": "0",
+    })
+
+    tendon = ET.Element("tendon")
+    spatial = ET.SubElement(tendon, "spatial", {
+        "name": TOW_TENDON_NAME,
+        "limited": "true",
+        "range": _fmt([0.0, rope_length]),
+        "width": "0.012",
+        "rgba": _fmt([0.95, 0.72, 0.10, 1.0]),
+        "margin": "0.005",
+        "solreflimit": "0.01 1",
+    })
+    ET.SubElement(spatial, "site", {"site": TOW_ROBOT_SITE_NAME})
+    ET.SubElement(spatial, "site", {"site": TOW_SLED_SITE_NAME})
+
+    return "\n".join([
+        ET.tostring(body, encoding="unicode"),
+        ET.tostring(root_site, encoding="unicode"),
+        ET.tostring(tendon, encoding="unicode"),
+    ])
+
 def build_box_worldbody_xml(
     track,
     *,
@@ -396,51 +640,28 @@ def build_box_worldbody_xml(
     mass: float = 6.0,
     friction: float = 0.60,
 ) -> str:
-    s = float(track.start_s) + float(distance)
-    p, yaw = _pose_on_track(track, s)
-    half_xy = 0.5 * float(size)
-    half_z = 0.5 * float(height)
-    quat = _quat_ypr(yaw)
-    body = ET.Element("body", {
-        "name": BOX_BODY_NAME,
-        "pos": _fmt([p[0], p[1], half_z + 0.004]),
-        "quat": _fmt(quat),
-    })
-    ET.SubElement(body, "freejoint", {"name": f"{BOX_BODY_NAME}_joint"})
-
-    # IMPORTANT: classic Ant/Humanoid models compile body inertia from geoms.
-    # Some model/default combinations apply an inherited geom density even when
-    # an injected geom specifies ``mass=...``.  That made --box-mass cosmetic
-    # on Ant (0.90*0.90*0.45*5 = 1.8225 kg regardless of the requested mass).
-    #
-    # Use one physical collision geom and override its DENSITY explicitly.  The
-    # compiler necessarily computes mass = density * volume, so this remains
-    # exact under inertiafromgeom=true and also avoids any dependence on hidden
-    # ballast geoms being retained by compiler optimizations.
-    volume = float(size) * float(size) * float(height)
-    density = float(mass) / max(volume, 1e-12)
-
-    ET.SubElement(body, "geom", {
-        "name": f"{BOX_BODY_NAME}_geom",
-        "type": "box",
-        "size": _fmt([half_xy, half_xy, half_z]),
-        "density": f"{density:.12g}",
-        "friction": _fmt([float(friction), 0.01, 0.001]),
-        "rgba": _fmt([0.92, 0.48, 0.08, 1.0]),
-        # Do not inherit the classic robot's geom collision mask.  The box must
-        # collide with both the robot and the floor/terrain.
-        "contype": "1",
-        "conaffinity": "1",
-        "condim": "4",
-        "group": "0",
-    })
-    return ET.tostring(body, encoding="unicode")
+    """Backward-compatible wrapper for older callers/replays."""
+    return build_push_object_worldbody_xml(
+        track,
+        object_type="box",
+        distance=distance,
+        size=size,
+        height=height,
+        mass=mass,
+        friction=friction,
+    )
 
 
 __all__ = [
     "BOX_BODY_NAME",
+    "SLED_BODY_NAME",
+    "TOW_ROBOT_SITE_NAME",
+    "TOW_SLED_SITE_NAME",
+    "TOW_TENDON_NAME",
     "TERRAIN_PREFIX",
     "RaceEnvironmentConfig",
     "build_box_worldbody_xml",
+    "build_push_object_worldbody_xml",
+    "build_sled_model_xml",
     "build_terrain_worldbody_xml",
 ]

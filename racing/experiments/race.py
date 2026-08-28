@@ -92,6 +92,7 @@ def run_race(
     motor_scale: float = 1.0,
     slope_deg: float = 0.0,
     task: str = "run",
+    push_object: str = "box",
     terrain: str = "flat",
     terrain_seed: int = 1,
     terrain_scale: float = 1.0,
@@ -100,11 +101,23 @@ def run_race(
     box_height: float = 0.45,
     box_mass: float = 6.0,
     box_friction: float = 0.60,
+    ball_rolling_friction: float = 0.03,
+    sled_distance: float = 1.8,
+    sled_length: float = 1.0,
+    sled_width: float = 0.80,
+    sled_height: float = 0.16,
+    sled_mass: float = 8.0,
+    sled_friction: float = 0.60,
+    sled_rope_length: float = 1.25,
     push_box_progress_weight: float = 1.0,
     push_robot_progress_weight: float = 0.35,
     push_approach_weight: float = 1.00,
     push_box_max_lift: float = 0.12,
     push_box_min_up: float = 0.75,
+    sled_progress_weight: float = 1.0,
+    sled_robot_progress_weight: float = 0.25,
+    sled_max_lift: float = 0.12,
+    sled_min_up: float = 0.70,
     online_adaptation: bool = False,
     sysid_history: int = 12,
     sysid_interval: int = 8,
@@ -136,9 +149,12 @@ def run_race(
     origin_yaw = float(probe.root_yaw())
     track = StadiumTrack(origin_xy=origin_xy, origin_yaw=origin_yaw)
     environment = RaceEnvironmentConfig(
-        task=task, terrain=terrain, terrain_seed=terrain_seed, terrain_scale=terrain_scale,
+        task=task, push_object=push_object, terrain=terrain, terrain_seed=terrain_seed, terrain_scale=terrain_scale,
         box_distance=box_distance, box_size=box_size, box_height=box_height,
-        box_mass=box_mass, box_friction=box_friction,
+        box_mass=box_mass, box_friction=box_friction, ball_rolling_friction=ball_rolling_friction,
+        sled_distance=sled_distance, sled_length=sled_length, sled_width=sled_width,
+        sled_height=sled_height, sled_mass=sled_mass, sled_friction=sled_friction,
+        sled_rope_length=sled_rope_length,
     ).validated()
 
     plant = make_robot(robot_name, extra_worldbody_xml=environment.plant_worldbody_xml(track))
@@ -147,23 +163,30 @@ def run_race(
     planner.set_task_target_body(environment.task_body_name)
 
     # Fail loudly if the source MJCF compiler changes/overrides the requested
-    # task-object mass.  Classic Ant/Humanoid use inertiafromgeom=true, so this
-    # guard specifically protects --box-mass from becoming a cosmetic flag.
-    compiled_box_mass_plant = None
-    compiled_box_mass_planner = None
-    if environment.task == "push_box":
-        compiled_box_mass_plant = float(plant.model.body_mass[plant.task_body_id])
-        compiled_box_mass_planner = float(planner.model.body_mass[planner.task_body_id])
-        requested_box_mass = float(environment.box_mass)
-        if not np.isclose(compiled_box_mass_plant, requested_box_mass, rtol=2e-6, atol=1e-9):
+    # free task-body mass. Classic Ant/Humanoid use inertiafromgeom=true, so the
+    # environment builders impose mass through explicit geom density.
+    compiled_task_mass_plant = None
+    compiled_task_mass_planner = None
+    if environment.task in {"push_box", "tow_sled"}:
+        compiled_task_mass_plant = float(plant.model.body_mass[plant.task_body_id])
+        compiled_task_mass_planner = float(planner.model.body_mass[planner.task_body_id])
+        if environment.task == "push_box":
+            requested_task_mass = float(environment.box_mass)
+            mass_flag = "--box-mass"
+            object_label = environment.push_object
+        else:
+            requested_task_mass = float(environment.sled_mass)
+            mass_flag = "--sled-mass"
+            object_label = "sled"
+        if not np.isclose(compiled_task_mass_plant, requested_task_mass, rtol=2e-6, atol=1e-9):
             raise RuntimeError(
-                f"compiled plant box mass {compiled_box_mass_plant:.9g} kg does not match "
-                f"--box-mass {requested_box_mass:.9g} kg"
+                f"compiled plant {object_label} mass {compiled_task_mass_plant:.9g} kg does not match "
+                f"{mass_flag} {requested_task_mass:.9g} kg"
             )
-        if not np.isclose(compiled_box_mass_planner, requested_box_mass, rtol=2e-6, atol=1e-9):
+        if not np.isclose(compiled_task_mass_planner, requested_task_mass, rtol=2e-6, atol=1e-9):
             raise RuntimeError(
-                f"compiled planner box mass {compiled_box_mass_planner:.9g} kg does not match "
-                f"--box-mass {requested_box_mass:.9g} kg"
+                f"compiled planner {object_label} mass {compiled_task_mass_planner:.9g} kg does not match "
+                f"{mass_flag} {requested_task_mass:.9g} kg"
             )
 
     if int(plant.model.nq) != int(planner.model.nq) or int(plant.model.nv) != int(planner.model.nv):
@@ -197,6 +220,22 @@ def run_race(
     if control_dt is None:
         control_dt = float(getattr(policy, "control_dt", 0.02))
 
+    # Reuse the same fast rollout/fused cost ABI for pushing and towing. The task
+    # body is the box/ball or sled respectively. Towing does not need an
+    # approach-to-object term because the cable already couples robot and sled.
+    if environment.task == "tow_sled":
+        task_progress_weight = float(sled_progress_weight)
+        task_robot_progress_weight = float(sled_robot_progress_weight)
+        task_approach_weight = 0.0
+        task_max_lift = float(sled_max_lift)
+        task_min_up = float(sled_min_up)
+    else:
+        task_progress_weight = float(push_box_progress_weight)
+        task_robot_progress_weight = float(push_robot_progress_weight)
+        task_approach_weight = float(push_approach_weight)
+        task_max_lift = float(push_box_max_lift)
+        task_min_up = -1.0 if environment.push_object == "ball" else float(push_box_min_up)
+
     cfg = ControllerConfig(
         control_dt=float(control_dt),
         horizon=int(horizon),
@@ -215,11 +254,11 @@ def run_race(
         warm_start=bool(warm_start),
         spg_jacobian_refresh_interval=int(spg_jacobian_refresh_interval),
         spg_jacobian_refresh_prefix=int(spg_jacobian_refresh_prefix),
-        box_progress_weight=float(push_box_progress_weight),
-        robot_progress_weight=float(push_robot_progress_weight),
-        robot_box_approach_weight=float(push_approach_weight),
-        box_max_lift=float(push_box_max_lift),
-        box_min_up=float(push_box_min_up),
+        box_progress_weight=task_progress_weight,
+        robot_progress_weight=task_robot_progress_weight,
+        robot_box_approach_weight=task_approach_weight,
+        box_max_lift=task_max_lift,
+        box_min_up=task_min_up,
     )
     controller = JointMPPIController(planner, track, prior, policy, cfg, variant=variant, seed=seed)
 
@@ -277,15 +316,29 @@ def run_race(
             f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain}"
         )
         if environment.task == "push_box":
+            shape_desc = (
+                f"diameter={environment.box_size:g}m"
+                if environment.push_object == "ball"
+                else f"footprint={environment.box_size:g}m height={environment.box_height:g}m"
+            )
             print(
                 "push reward: "
                 f"box_progress={cfg.box_progress_weight:g}, "
                 f"robot_progress={cfg.robot_progress_weight:g}, "
                 f"approach={cfg.robot_box_approach_weight:g}; "
-                f"box_distance={environment.box_distance:g}m "
-                f"footprint={environment.box_size:g}m height={environment.box_height:g}m "
-                f"mass={environment.box_mass:g}kg "
-                f"(compiled plant={compiled_box_mass_plant:g}kg, planner={compiled_box_mass_planner:g}kg)"
+                f"object={environment.push_object} box_distance={environment.box_distance:g}m "
+                f"{shape_desc} mass={environment.box_mass:g}kg "
+                f"(compiled plant={compiled_task_mass_plant:g}kg, planner={compiled_task_mass_planner:g}kg)"
+            )
+        elif environment.task == "tow_sled":
+            print(
+                "tow reward: "
+                f"sled_progress={cfg.box_progress_weight:g}, "
+                f"robot_progress={cfg.robot_progress_weight:g}; "
+                f"sled_distance={environment.sled_distance:g}m "
+                f"size={environment.sled_length:g}x{environment.sled_width:g}x{environment.sled_height:g}m "
+                f"mass={environment.sled_mass:g}kg rope={environment.sled_rope_length:g}m "
+                f"(compiled plant={compiled_task_mass_plant:g}kg, planner={compiled_task_mass_planner:g}kg)"
             )
         if controller.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
             print(
@@ -579,25 +632,41 @@ def main() -> None:
     parser.add_argument("--slope-deg", type=float, default=0.0)
 
     parser.add_argument(
-        "--task", choices=["run", "push_box"], default="run",
-        help="run tracks robot progress; push_box uses the same pretrained running policy but MPPI/progress track the box",
+        "--task", choices=["run", "push_box", "tow_sled"], default="run",
+        help="run tracks robot progress; push_box tracks the pushed object; tow_sled tracks a cable-towed sled; all reuse the same pretrained running policy",
+    )
+    parser.add_argument(
+        "--push-object", choices=["box", "ball"], default="box",
+        help="object used by --task push_box; box uses --box-size as footprint edge, ball uses it as diameter",
     )
     parser.add_argument(
         "--terrain", choices=["flat", "ramps", "stairs", "rocky", "mixed"], default="flat",
-        help="known test-time terrain on the upper straight and second turn; PPO stays flat-ground pretrained; push_box requires flat",
+        help="known test-time terrain on the upper straight and second turn; PPO stays flat-ground pretrained; push_box/tow_sled require flat",
     )
     parser.add_argument("--terrain-seed", type=int, default=1, help="deterministic rocky/mixed terrain seed")
     parser.add_argument("--terrain-scale", type=float, default=1.0, help="scale obstacle heights/ramp rise")
     parser.add_argument("--box-distance", type=float, default=1.8, help="initial box center distance ahead of the robot along track [m] (default: 1.8)")
-    parser.add_argument("--box-size", type=float, default=0.90, help="square box footprint edge [m] (default: 0.90)")
+    parser.add_argument("--box-size", type=float, default=0.90, help="box footprint edge or ball diameter [m] (default: 0.90)")
     parser.add_argument("--box-height", type=float, default=0.45, help="box height [m] (default: 0.45; low crate reduces kicking/tipping)")
     parser.add_argument("--box-mass", type=float, default=6.0, help="box mass [kg] (default: 6.0)")
-    parser.add_argument("--box-friction", type=float, default=0.60, help="box sliding friction coefficient (default: 0.60)")
+    parser.add_argument("--box-friction", type=float, default=0.60, help="pushed-object sliding friction coefficient (default: 0.60)")
+    parser.add_argument("--ball-rolling-friction", type=float, default=0.03, help="MuJoCo rolling-friction coefficient for --push-object ball (default: 0.03 m; requires condim=6)")
+    parser.add_argument("--sled-distance", type=float, default=1.8, help="initial sled center distance behind the robot along track [m] (default: 1.8)")
+    parser.add_argument("--sled-length", type=float, default=1.0, help="sled length along the track [m] (default: 1.0)")
+    parser.add_argument("--sled-width", type=float, default=0.80, help="sled width [m] (default: 0.80)")
+    parser.add_argument("--sled-height", type=float, default=0.16, help="sled body height [m] (default: 0.16)")
+    parser.add_argument("--sled-mass", type=float, default=8.0, help="sled mass [kg] (default: 8.0)")
+    parser.add_argument("--sled-friction", type=float, default=0.60, help="sled-ground sliding friction coefficient (default: 0.60)")
+    parser.add_argument("--sled-rope-length", type=float, default=1.25, help="maximum tow-cable length [m] (default: 1.25)")
     parser.add_argument("--push-box-progress-weight", type=float, default=1.0, help="primary box track-progress reward weight")
     parser.add_argument("--push-robot-progress-weight", type=float, default=0.35, help="coupled robot-progress shaping weight; robot cannot earn it by running past a stationary box")
     parser.add_argument("--push-approach-weight", type=float, default=1.00, help="dense reward for reducing/maintaining robot-box distance")
     parser.add_argument("--push-box-max-lift", type=float, default=0.12, help="reject MPPI candidates lifting the box more than this above reset height [m]")
     parser.add_argument("--push-box-min-up", type=float, default=0.75, help="reject MPPI candidates tipping the box below this world-up cosine")
+    parser.add_argument("--sled-progress-weight", type=float, default=1.0, help="primary towed-sled track-progress reward weight")
+    parser.add_argument("--sled-robot-progress-weight", type=float, default=0.25, help="robot-progress shaping while towing; capped by sled progress")
+    parser.add_argument("--sled-max-lift", type=float, default=0.12, help="reject MPPI candidates lifting the sled more than this above reset height [m]")
+    parser.add_argument("--sled-min-up", type=float, default=0.70, help="reject MPPI candidates tipping the sled below this world-up cosine")
 
     parser.add_argument("--adapt-model", action="store_true", help="online system-identification of the SPG-MPPI planning model")
     parser.add_argument("--sysid-history", type=int, default=12)
@@ -649,6 +718,7 @@ def main() -> None:
         motor_scale=args.motor_scale,
         slope_deg=args.slope_deg,
         task=args.task,
+        push_object=args.push_object,
         terrain=args.terrain,
         terrain_seed=args.terrain_seed,
         terrain_scale=args.terrain_scale,
@@ -657,11 +727,23 @@ def main() -> None:
         box_height=args.box_height,
         box_mass=args.box_mass,
         box_friction=args.box_friction,
+        ball_rolling_friction=args.ball_rolling_friction,
+        sled_distance=args.sled_distance,
+        sled_length=args.sled_length,
+        sled_width=args.sled_width,
+        sled_height=args.sled_height,
+        sled_mass=args.sled_mass,
+        sled_friction=args.sled_friction,
+        sled_rope_length=args.sled_rope_length,
         push_box_progress_weight=args.push_box_progress_weight,
         push_robot_progress_weight=args.push_robot_progress_weight,
         push_approach_weight=args.push_approach_weight,
         push_box_max_lift=args.push_box_max_lift,
         push_box_min_up=args.push_box_min_up,
+        sled_progress_weight=args.sled_progress_weight,
+        sled_robot_progress_weight=args.sled_robot_progress_weight,
+        sled_max_lift=args.sled_max_lift,
+        sled_min_up=args.sled_min_up,
         online_adaptation=args.adapt_model,
         sysid_history=args.sysid_history,
         sysid_interval=args.sysid_interval,

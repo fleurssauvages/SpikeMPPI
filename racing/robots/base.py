@@ -73,7 +73,11 @@ class ClassicRobot:
         )
 
     def _load_augmented_model(self, worldbody_fragment: str):
-        """Compile the classic XML with extra worldbody elements.
+        """Compile the classic XML with race task/model additions.
+
+        The historical argument name is retained for compatibility. In addition
+        to worldbody children, the fragment may contain ``race_root_site``
+        markers and model-level grouping sections such as ``tendon``.
 
         Assets are supplied through MuJoCo's in-memory asset mechanism so this
         remains robust for classic XMLs that reference files relative to the
@@ -85,7 +89,39 @@ class ClassicRobot:
         if worldbody is None:
             raise ValueError(f"MuJoCo XML has no <worldbody>: {self.xml_path}")
         wrapper = ET.fromstring(f"<race_extra>{worldbody_fragment}</race_extra>")
+
+        # Most race additions are ordinary worldbody geoms/bodies. Towing also
+        # needs a site on the original robot root and a model-level <tendon>
+        # section. Handle those two cases here while keeping the public
+        # extra_worldbody_xml API backward compatible.
+        model_level_sections = {
+            "tendon", "equality", "contact", "sensor", "actuator",
+            "keyframe", "custom",
+        }
         for child in list(wrapper):
+            if child.tag == "race_root_site":
+                root_body = root.find(f".//body[@name='{self.info.root_body_hint}']")
+                if root_body is None:
+                    raise ValueError(
+                        f"could not attach towing hitch: root body {self.info.root_body_hint!r} not found"
+                    )
+                name = child.attrib.get("name", "")
+                if name and root.find(f".//site[@name='{name}']") is not None:
+                    raise ValueError(f"duplicate injected root site {name!r}")
+                root_body.append(ET.Element("site", dict(child.attrib)))
+                continue
+
+            if child.tag in model_level_sections:
+                existing = root.find(child.tag)
+                if existing is None:
+                    root.append(child)
+                else:
+                    # Merge grouping sections such as <tendon> when the source
+                    # robot XML already contains one.
+                    for grandchild in list(child):
+                        existing.append(grandchild)
+                continue
+
             worldbody.append(child)
         xml = ET.tostring(root, encoding="unicode")
 

@@ -8,30 +8,38 @@ This project uses the MuJoCo locomotion robots, with **Ant** as the primary 2-D 
 ### Same Task Refinement
 | Nominal | SPG |
 |:---:|:---:|
-| <img src="racing/results/nominal.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+| <img src="racing/results/nominal.gif" width="460"> | <img src="racing/results/spg.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
 ### Adaptation to novel terrain
 | Nominal | SPG |
 |:---:|:---:|
-| <img src="racing/results/nominal_ramps.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_ramps.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+| <img src="racing/results/nominal_ramps.gif" width="460"> | <img src="racing/results/spg_ramps.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
 | Nominal | SPG |
 |:---:|:---:|
-| <img src="racing/results/nominal_stairs.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_stairs.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+| <img src="racing/results/nominal_stairs.gif" width="460"> | <img src="racing/results/spg_stairs.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
 | Nominal | SPG |
 |:---:|:---:|
-| <img src="racing/results/nominal_rocky.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_rocky.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+| <img src="racing/results/nominal_rocky.gif" width="460"> | <img src="racing/results/spg_rocky.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
 | Nominal | SPG |
 |:---:|:---:|
-| <img src="racing/results/nominal_mixed.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_mixed.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+| <img src="racing/results/nominal_mixed.gif" width="460"> | <img src="racing/results/spg_mixed.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
 ### Adaptation to new tasks
 
+| Nominal | SPG |
+|:---:|:---:|
+| <img src="racing/results/nominal_sled.gif" width="460"> | <img src="racing/results/spg_sled.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+
 | Nominal | SPG (speed x2) |
 |:---:|:---:|
-| <img src="racing/results/nominal_box.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="racing/results/spg_box.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+| <img src="racing/results/nominal_box.gif" width="460"> | <img src="racing/results/spg_box.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+
+| Nominal | SPG (speed x2) |
+|:---:|:---:|
+| <img src="racing/results/nominal_ball.gif" width="460"> | <img src="racing/results/spg_ball.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
 ## Overview
 
