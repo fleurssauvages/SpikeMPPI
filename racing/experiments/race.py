@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -75,7 +76,13 @@ def run_race(
     controller_overlay: bool = False,
     rollout_workers: int = 0,
     rollout_backend: str = "native",
+    rollout_chunk_size: int = 0,
+    warm_start: bool = False,
+    spg_jacobian_refresh_interval: int = 1,
+    spg_jacobian_refresh_prefix: int = 0,
+    planner_integrator: str = "model",
     profile_controller: bool = False,
+    disable_gc: bool = False,
     verbose: bool = True,
     friction_scale: float = 1.0,
     mass_scale: float = 1.0,
@@ -116,6 +123,19 @@ def run_race(
     plant.apply_model_parameters(plant_params)
     planner.apply_model_parameters(ModelParameterScales())
 
+    # Keep the physical plant on the XML integrator, but optionally use a
+    # lower-latency integrator in the planning copy.
+    planner_integrator = str(planner_integrator).strip().lower()
+    if planner_integrator not in {"model", "euler", "implicitfast"}:
+        raise ValueError("planner_integrator must be model, euler, or implicitfast")
+    if planner_integrator != "model":
+        integrator_map = {
+            "euler": planner.mujoco.mjtIntegrator.mjINT_EULER,
+            "implicitfast": planner.mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
+        }
+        planner.model.opt.integrator = integrator_map[planner_integrator]
+        planner.mujoco.mj_forward(planner.model, planner.data)
+
     origin_xy = tuple(map(float, plant.xy()))
     origin_yaw = float(plant.root_yaw())
     track = StadiumTrack(origin_xy=origin_xy, origin_yaw=origin_yaw)
@@ -140,6 +160,10 @@ def run_race(
         joint_noise_fraction=float(joint_noise_fraction),
         rollout_workers=int(rollout_workers),
         rollout_backend=str(rollout_backend),
+        rollout_chunk_size=int(rollout_chunk_size),
+        warm_start=bool(warm_start),
+        spg_jacobian_refresh_interval=int(spg_jacobian_refresh_interval),
+        spg_jacobian_refresh_prefix=int(spg_jacobian_refresh_prefix),
     )
     controller = JointMPPIController(planner, track, prior, policy, cfg, variant=variant, seed=seed)
 
@@ -192,13 +216,19 @@ def run_race(
         print(
             f"controller={controller.variant.value}  robot={plant.name}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
-            f"backend={controller.rollout_backend_name}"
+            f"backend={controller.rollout_backend_name}  planner_integrator={planner_integrator} "
+            f"warm_start={cfg.warm_start}"
         )
         if controller.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
             print(
                 f"SPG: lookahead={cfg.spg_lookahead_steps}, mix={cfg.spg_mix:g}, "
-                f"null_std={cfg.spg_null_std_scale:g}, damping={cfg.spg_pseudoinverse_damping:g}"
+                f"null_std={cfg.spg_null_std_scale:g}, damping={cfg.spg_pseudoinverse_damping:g}, "
+                f"jac_refresh={cfg.spg_jacobian_refresh_interval}, prefix={cfg.spg_jacobian_refresh_prefix}"
             )
+
+    gc_was_enabled = gc.isenabled()
+    if disable_gc and gc_was_enabled:
+        gc.disable()
 
     t0 = time.perf_counter()
     try:
@@ -222,12 +252,16 @@ def run_race(
                 print(
                     "MPPI timing "
                     f"step={step + 1} nominal={tm.get('nominal', math.nan):.2f}ms "
-                    f"(policy={tm.get('policy', 0.0):.2f} spg_jac={tm.get('sensitivity', 0.0):.2f} "
-                    f"prior={tm.get('prior', 0.0):.2f}) "
+                    f"(policy={tm.get('policy', 0.0):.2f} warm={tm.get('warm_start', 0.0):.2f} "
+                    f"spg_jac={tm.get('sensitivity', 0.0):.2f} prior={tm.get('prior', 0.0):.2f}) "
                     f"sample={tm.get('sampling', 0.0):.2f}ms "
                     f"rollouts={tm.get('rollouts', 0.0):.2f}ms "
-                    f"update={tm.get('update', 0.0):.2f}ms total={total_ms:.2f}ms "
-                    f"deadline={deadline_ms:.2f}ms xRT={rtf:.2f}"
+                    f"(physics={tm.get('rollout_physics', 0.0):.2f} cost={tm.get('rollout_cost', 0.0):.2f}"
+                    + (f" fused={tm.get('rollout_fused', 0.0):.2f}" if tm.get('rollout_fused', 0.0) > 0.0 else "")
+                    + ") "
+                    + f"update={tm.get('update', 0.0):.2f}ms total={total_ms:.2f}ms "
+                    + f"deadline={deadline_ms:.2f}ms xRT={rtf:.2f} "
+                    + f"J={info.get('spg_refresh_mode', 'full')}"
                 )
             plant.step_control(ctrl, substeps=controller.control_substeps, data=plant.data)
             after = plant.snapshot()
@@ -236,6 +270,7 @@ def run_race(
                 identifier.observe(before, ctrl, after, substeps=controller.control_substeps)
                 if identifier.should_update(step):
                     est = identifier.update()
+                    controller.sync_planning_model()
                     estimate_rows.append([est.friction, est.mass, est.motor, est.slope_deg])
                     estimate_steps.append(step + 1)
                     if verbose:
@@ -297,10 +332,12 @@ def run_race(
             close_viewer(handle)
             handle = None
         controller.close()
+        if disable_gc and gc_was_enabled:
+            gc.enable()
 
     runtime = time.perf_counter() - t0
     if profile_controller and profile_rows:
-        keys = ("policy", "sensitivity", "prior", "sampling", "rollouts", "update", "total")
+        keys = ("policy", "warm_start", "sensitivity", "prior", "sampling", "rollouts", "rollout_physics", "rollout_cost", "rollout_fused", "update", "total")
         deadline_ms = 1000.0 * cfg.control_dt
         summary = []
         for key in keys:
@@ -423,12 +460,36 @@ def main() -> None:
         help="native rollout threads; 0=auto (all logical CPU cores)",
     )
     parser.add_argument(
-        "--rollout-backend", choices=["native", "python"], default="native",
-        help="native uses MuJoCo's C++ batched rollout/thread pool; python keeps the legacy evaluator",
+        "--rollout-chunk-size", type=int, default=0,
+        help="native rollout thread-pool chunk size; 0=automatic. For 64 rollouts/16 workers, benchmark 2 and 4",
+    )
+    parser.add_argument(
+        "--rollout-backend", choices=["fused", "native", "python"], default="native",
+        help="fused uses the custom exact C++ rollout+cost evaluator; native uses mujoco.rollout; python keeps the legacy evaluator",
+    )
+    parser.add_argument(
+        "--warm-start", action="store_true",
+        help="shift the previous optimized MPPI sequence instead of rebuilding H policy actions every control tick",
+    )
+    parser.add_argument(
+        "--spg-refresh", type=int, default=1,
+        help="full SPG Jacobian refresh interval: 1=every tick (original), 0=initial only, N>1=every N ticks",
+    )
+    parser.add_argument(
+        "--spg-refresh-prefix", type=int, default=0,
+        help="when reusing a shifted SPG Jacobian, freshly finite-difference this many leading horizon steps",
+    )
+    parser.add_argument(
+        "--planner-integrator", choices=["model", "euler", "implicitfast"], default="model",
+        help="integrator for the planning copy only; the physical plant remains on the XML integrator",
     )
     parser.add_argument(
         "--profile", action="store_true",
         help="print MPPI timing breakdown for the first steps and every 50 updates",
+    )
+    parser.add_argument(
+        "--disable-gc", action="store_true",
+        help="disable Python cyclic GC during the race loop to reduce real-time jitter",
     )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--headless", action="store_true", help="disable the MuJoCo viewer")
@@ -480,7 +541,13 @@ def main() -> None:
         controller_overlay=args.controller_overlay,
         rollout_workers=args.workers,
         rollout_backend=args.rollout_backend,
+        rollout_chunk_size=args.rollout_chunk_size,
+        warm_start=args.warm_start,
+        spg_jacobian_refresh_interval=args.spg_refresh,
+        spg_jacobian_refresh_prefix=args.spg_refresh_prefix,
+        planner_integrator=args.planner_integrator,
         profile_controller=args.profile,
+        disable_gc=args.disable_gc,
         friction_scale=args.friction_scale,
         mass_scale=args.mass_scale,
         motor_scale=args.motor_scale,

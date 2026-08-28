@@ -264,12 +264,20 @@ class StadiumTrack:
         ld2 = (px - lx) ** 2 + (py - ly) ** 2
         ls = 2.0 * straight + math.pi * r + r * (tl - 0.5 * math.pi)
 
-        d2s = np.column_stack((bd2, rd2, td2, ld2))
-        ss = np.column_stack((bs, rs, ts, ls))
-        idx = np.argmin(d2s, axis=1)
-        rows = np.arange(len(p))
-        s_best = np.mod(ss[rows, idx], self.length)
-        d2_best = d2s[rows, idx]
+        # Streaming minimum avoids allocating two (N, 4) temporary matrices.
+        # This path is called on N*H rollout positions every MPPI update.
+        s_best = bs.copy()
+        d2_best = bd2.copy()
+        mask = rd2 < d2_best
+        d2_best[mask] = rd2[mask]
+        s_best[mask] = rs[mask]
+        mask = td2 < d2_best
+        d2_best[mask] = td2[mask]
+        s_best[mask] = ts[mask]
+        mask = ld2 < d2_best
+        d2_best[mask] = ld2[mask]
+        s_best[mask] = ls[mask]
+        s_best = np.mod(s_best, self.length)
         if scalar:
             return np.asarray(s_best[0]), np.asarray(d2_best[0])
         return s_best, d2_best

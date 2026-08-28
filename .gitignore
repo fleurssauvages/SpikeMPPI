@@ -1,3 +1,13 @@
 /mujoco_env
 /mujoco_menagerie
 /mujoco_playground
+.pyc*
+/racing/__pycache__
+/racing/adaption/__pycache__
+/racing/experiments/__pycache__
+/racing/mppi/__pycache__
+/racing/policies/__pycache__
+/racing/priors/__pycache__
+/racing/results/__pycache__
+/racing/robots/__pycache__
+/racing/tracks/__pycache__

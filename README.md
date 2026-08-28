@@ -18,7 +18,7 @@ Released reference code: https://github.com/Improbable-AI/rapid-locomotion-rl
   <img src="racing/results/mppi.gif" alt="SPG" width="100%">
 </p>
 
-<p align="center"><b>Sensitivity Projected Gaussian MPPI (11.30s)</b></p>
+<p align="center"><b>Sensitivity Projected Gaussian MPPI (10.52s)</b></p>
 <p align="center">
-  <img src="racing/results/spg_2.gif" alt="SPG" width="100%">
+  <img src="racing/results/spg_3.gif" alt="SPG" width="100%">
 </p>
