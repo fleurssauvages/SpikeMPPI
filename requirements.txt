@@ -1,0 +1,39 @@
+# Racing project dependencies
+# Python >= 3.10
+#
+# IMPORTANT FOR GPU TRAINING:
+# Install the accelerator-specific JAX wheel BEFORE this file, e.g.
+#   python -m pip install -U "jax[cuda13]"
+# or
+#   python -m pip install -U "jax[cuda12]"
+# CPU-only users can use:
+#   python -m pip install -U jax
+# See: https://docs.jax.dev/en/latest/installation.html
+
+# Core racing / MuJoCo runtime
+numpy>=1.26
+mujoco>=3.3
+gymnasium[mujoco]>=1.1
+numba>=0.60
+imageio>=2.34
+
+# JAX / MJX training stack.
+# A generic `jax` requirement is included for completeness; a previously
+# installed CUDA/ROCm JAX build satisfies it.
+jax
+mujoco-mjx[warp]>=3.3
+
+# PPO / policy training
+# Use current upstream Brax: the project was developed against current Brax
+# rather than pinning an older PyPI release against a newer JAX stack.
+brax @ git+https://github.com/google/brax.git
+flax
+ml-collections
+
+# MuJoCo Playground is distributed on PyPI as `playground` and imported as
+# `mujoco_playground`.
+playground
+
+# Optional fused exact C++ MuJoCo rollout backend build
+pybind11>=2.12
+setuptools>=68

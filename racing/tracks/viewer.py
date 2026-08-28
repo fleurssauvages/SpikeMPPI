@@ -274,8 +274,8 @@ def launch_minimal_viewer(
     *,
     track=None,
     show_ui: bool = False,
-    camera_elevation: float = -50.0,
-    camera_distance_scale: float = 1.0,
+    camera_elevation: float = -20.0,
+    camera_distance_scale: float = 0.6,
     camera_lookat_z: float = 0.35,
 ):
     """Launch the passive viewer with neutral floor and full-track overview."""
