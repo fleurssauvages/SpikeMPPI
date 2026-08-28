@@ -10,6 +10,59 @@ from racing.adaptation.model_params import ModelParameterScales
 from .classic import ClassicModel, classic_xml_path
 
 
+ANT_LEG_ROOTS = (
+    "front_left_leg",
+    "front_right_leg",
+    "back_leg",
+    "right_back_leg",
+)
+
+
+def _scale_xyz_text(text: str, scale: float) -> str:
+    values = [float(x) for x in str(text).split()]
+    if len(values) != 3:
+        raise ValueError(f"expected xyz triplet, got {text!r}")
+    return " ".join(f"{scale * x:.10g}" for x in values)
+
+
+def _scale_fromto_text(text: str, scale: float) -> str:
+    values = [float(x) for x in str(text).split()]
+    if len(values) != 6:
+        raise ValueError(f"expected fromto sextuple, got {text!r}")
+    return " ".join(f"{scale * x:.10g}" for x in values)
+
+
+def apply_ant_leg_length_scales_xml(root: ET.Element, leg_scales: dict[str, float]) -> None:
+    """Scale Ant limb segment lengths without changing its state/action topology.
+
+    Gymnasium's classic Ant encodes each leg as a named root body followed by
+    nested bodies whose local ``pos`` values are the segment attachment offsets,
+    while capsule endpoints are encoded with ``fromto``. Scaling both keeps the
+    joint graph, qpos/qvel layout, actuator mapping, radii, joint axes, and joint
+    limits unchanged; only the physical limb lengths differ.
+    """
+    unknown = sorted(set(leg_scales).difference(ANT_LEG_ROOTS))
+    if unknown:
+        raise ValueError(f"unknown Ant leg roots: {', '.join(unknown)}")
+    for leg_name, raw_scale in leg_scales.items():
+        scale = float(raw_scale)
+        if not np.isfinite(scale) or scale <= 0.05:
+            raise ValueError(f"Ant leg scale for {leg_name} must be finite and > 0.05")
+        leg = root.find(f".//body[@name='{leg_name}']")
+        if leg is None:
+            raise ValueError(f"classic Ant XML does not contain leg body {leg_name!r}")
+        # The named leg-root body itself is attached at torso origin and should
+        # remain there. Descendant body positions are physical segment offsets.
+        for body in leg.iter("body"):
+            if body is leg:
+                continue
+            if "pos" in body.attrib:
+                body.set("pos", _scale_xyz_text(body.attrib["pos"], scale))
+        for geom in leg.iter("geom"):
+            if "fromto" in geom.attrib:
+                geom.set("fromto", _scale_fromto_text(geom.attrib["fromto"], scale))
+
+
 @dataclass
 class RobotSnapshot:
     time: float
@@ -27,7 +80,13 @@ class ClassicRobot:
     intentionally differ for online adaptation experiments.
     """
 
-    def __init__(self, info: ClassicModel, *, extra_worldbody_xml: str = "") -> None:
+    def __init__(
+        self,
+        info: ClassicModel,
+        *,
+        extra_worldbody_xml: str = "",
+        leg_length_scales: dict[str, float] | None = None,
+    ) -> None:
         try:
             import mujoco
         except ImportError as exc:
@@ -43,8 +102,13 @@ class ClassicRobot:
         self.robot_nq = int(base_model.nq)
         self.robot_nv = int(base_model.nv)
         self.robot_nbody = int(base_model.nbody)
-        if str(extra_worldbody_xml).strip():
-            self.model = self._load_augmented_model(str(extra_worldbody_xml))
+        leg_length_scales = dict(leg_length_scales or {})
+        if leg_length_scales and self.info.name != "ant":
+            raise ValueError("leg-length morphology transfer is currently implemented only for Ant")
+        if str(extra_worldbody_xml).strip() or leg_length_scales:
+            self.model = self._load_augmented_model(
+                str(extra_worldbody_xml), leg_length_scales=leg_length_scales
+            )
         else:
             self.model = base_model
         self.data = mujoco.MjData(self.model)
@@ -72,7 +136,12 @@ class ClassicRobot:
             if self._task_qpos_adr is not None else float(self.initial_root_height)
         )
 
-    def _load_augmented_model(self, worldbody_fragment: str):
+    def _load_augmented_model(
+        self,
+        worldbody_fragment: str,
+        *,
+        leg_length_scales: dict[str, float] | None = None,
+    ):
         """Compile the classic XML with race task/model additions.
 
         The historical argument name is retained for compatibility. In addition
@@ -85,6 +154,8 @@ class ClassicRobot:
         modified.
         """
         root = ET.fromstring(Path(self.xml_path).read_text(encoding="utf-8"))
+        if leg_length_scales:
+            apply_ant_leg_length_scales_xml(root, leg_length_scales)
         worldbody = root.find("worldbody")
         if worldbody is None:
             raise ValueError(f"MuJoCo XML has no <worldbody>: {self.xml_path}")

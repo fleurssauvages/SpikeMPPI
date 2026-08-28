@@ -39,6 +39,15 @@ class RaceEnvironmentConfig:
     terrain: str = "flat"  # flat | ramps | stairs | rocky | mixed
     terrain_seed: int = 1
     terrain_scale: float = 1.0
+
+    # Known Ant morphology transfer. The physical plant and MPPI planner use
+    # the same modified Ant geometry, while the pretrained PPO weights remain
+    # those learned on the nominal classic Ant. Exactly two legs are lengthened
+    # and the opposite pair shortened, without changing joints or actuators.
+    leg_mismatch: str = "none"  # none | same_side | diagonal
+    short_leg_scale: float = 0.75
+    long_leg_scale: float = 1.25
+
     box_distance: float = 1.8
     # `box_size` is the square footprint edge.  The pushing crate is deliberately
     # lower than it is wide so Ant can make sustained body contact instead of
@@ -64,12 +73,21 @@ class RaceEnvironmentConfig:
         task = str(self.task).strip().lower()
         push_object = str(self.push_object).strip().lower()
         terrain = str(self.terrain).strip().lower()
+        leg_mismatch = str(self.leg_mismatch).strip().lower()
         if task not in {"run", "push_box", "tow_sled"}:
             raise ValueError("task must be 'run', 'push_box', or 'tow_sled'")
         if push_object not in {"box", "ball"}:
             raise ValueError("push_object must be 'box' or 'ball'")
         if terrain not in {"flat", "ramps", "stairs", "rocky", "mixed"}:
             raise ValueError("terrain must be flat, ramps, stairs, rocky, or mixed")
+        if leg_mismatch not in {"none", "same_side", "diagonal"}:
+            raise ValueError("leg_mismatch must be none, same_side, or diagonal")
+        if not np.isfinite(self.short_leg_scale) or not (0.1 <= float(self.short_leg_scale) < 1.0):
+            raise ValueError("short_leg_scale must be in [0.1, 1.0)")
+        if not np.isfinite(self.long_leg_scale) or float(self.long_leg_scale) <= 1.0:
+            raise ValueError("long_leg_scale must be > 1.0")
+        if leg_mismatch != "none" and (task != "run" or terrain != "flat"):
+            raise ValueError("leg mismatch is an isolated simple-racing experiment; use --task run --terrain flat")
         if task in {"push_box", "tow_sled"} and terrain != "flat":
             raise ValueError(f"{task} is intentionally a flat-ground task; use --terrain flat")
         if not np.isfinite(self.terrain_scale) or self.terrain_scale <= 0.0:
@@ -106,6 +124,9 @@ class RaceEnvironmentConfig:
             terrain=terrain,
             terrain_seed=int(self.terrain_seed),
             terrain_scale=float(self.terrain_scale),
+            leg_mismatch=leg_mismatch,
+            short_leg_scale=float(self.short_leg_scale),
+            long_leg_scale=float(self.long_leg_scale),
             box_distance=float(self.box_distance),
             box_size=float(self.box_size),
             box_height=float(self.box_height),
@@ -120,6 +141,30 @@ class RaceEnvironmentConfig:
             sled_friction=float(self.sled_friction),
             sled_rope_length=float(self.sled_rope_length),
         )
+
+    def leg_length_scales(self, robot_name: str) -> dict[str, float]:
+        """Return the known Ant leg scales used by both plant and MPPI planner."""
+        if self.leg_mismatch == "none":
+            return {}
+        if str(robot_name).strip().lower() != "ant":
+            raise ValueError("--leg-mismatch is currently supported only with --robot ant")
+        short = float(self.short_leg_scale)
+        long = float(self.long_leg_scale)
+        # Classic Ant names: `back_leg` is rear-left and `right_back_leg` is
+        # rear-right. Keep one fixed pair so seeds do not change morphology.
+        if self.leg_mismatch == "same_side":
+            long_legs = {"front_left_leg", "back_leg"}
+        elif self.leg_mismatch == "diagonal":
+            long_legs = {"front_left_leg", "right_back_leg"}
+        else:
+            raise ValueError(f"unsupported leg mismatch {self.leg_mismatch!r}")
+        all_legs = ("front_left_leg", "front_right_leg", "back_leg", "right_back_leg")
+        return {name: (long if name in long_legs else short) for name in all_legs}
+
+    # Backward-compatible alias for Stage-18 callers. The returned scales are no
+    # longer plant-only; race.py applies them to both plant and planner.
+    def plant_leg_length_scales(self, robot_name: str) -> dict[str, float]:
+        return self.leg_length_scales(robot_name)
 
     @property
     def task_body_name(self) -> str | None:

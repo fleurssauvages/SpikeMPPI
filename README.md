@@ -1,4 +1,4 @@
-# Online adaptation of pre-trained policy using MPPI
+# Online refinement of policies using MPPI
 
 This project uses the MuJoCo locomotion robots, with **Ant** as the primary 2-D stadium racer. The default policy trainer is an adaptation of Margolis et al., *Rapid Locomotion via Reinforcement Learning* (RSS 2022 / IJRR), and an MPPI controller refines the learned policy online for racing.
 
@@ -40,6 +40,16 @@ This project uses the MuJoCo locomotion robots, with **Ant** as the primary 2-D 
 | Nominal | SPG (speed x2) |
 |:---:|:---:|
 | <img src="racing/results/nominal_ball.gif" width="460"> | <img src="racing/results/spg_ball.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+
+### Adaptation to new robot models
+
+| Nominal | SPG |
+|:---:|:---:|
+| <img src="racing/results/nominal_sameside.gif" width="460"> | <img src="racing/results/spg_sameside.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
+
+| Nominal | SPG |
+|:---:|:---:|
+| <img src="racing/results/nominal_diagonal.gif" width="460"> | <img src="racing/results/spg_diagonal.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
 ## Overview
 

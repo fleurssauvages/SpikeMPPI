@@ -69,7 +69,11 @@ def _prepare_replay(path: str | Path):
     )
     env_text = _scalar_text(record["environment_json"]) if "environment_json" in record else ""
     environment = RaceEnvironmentConfig.from_json(env_text)
-    robot = make_robot(robot_name, extra_worldbody_xml=environment.plant_worldbody_xml(track))
+    robot = make_robot(
+        robot_name,
+        extra_worldbody_xml=environment.plant_worldbody_xml(track),
+        leg_length_scales=environment.leg_length_scales(robot_name),
+    )
     robot.set_task_target_body(environment.task_body_name)
 
     plant_params = np.asarray(record["plant_parameters"], dtype=np.float64).reshape(-1)

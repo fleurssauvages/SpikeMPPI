@@ -4,8 +4,17 @@ from .base import ClassicRobot
 from .classic import find_classic_model, list_classic_models
 
 
-def make_robot(name: str, *, extra_worldbody_xml: str = "") -> ClassicRobot:
-    return ClassicRobot(find_classic_model(name), extra_worldbody_xml=extra_worldbody_xml)
+def make_robot(
+    name: str,
+    *,
+    extra_worldbody_xml: str = "",
+    leg_length_scales: dict[str, float] | None = None,
+) -> ClassicRobot:
+    return ClassicRobot(
+        find_classic_model(name),
+        extra_worldbody_xml=extra_worldbody_xml,
+        leg_length_scales=leg_length_scales,
+    )
 
 
 def list_racing_candidates() -> list[dict[str, object]]:

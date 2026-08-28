@@ -96,6 +96,9 @@ def run_race(
     terrain: str = "flat",
     terrain_seed: int = 1,
     terrain_scale: float = 1.0,
+    leg_mismatch: str = "none",
+    short_leg_scale: float = 0.75,
+    long_leg_scale: float = 1.25,
     box_distance: float = 1.8,
     box_size: float = 0.90,
     box_height: float = 0.45,
@@ -130,9 +133,10 @@ def run_race(
     estimate J_t = d p_xy(t+L) / d u_t around that nominal, and the 2-D spatial
     prior covariance is projected into the full actuator space before MPPI/LBPS.
 
-    ``plant`` is the rendered/physical environment and may be perturbed. ``planner``
-    starts from nominal model parameters. When online adaptation is enabled, recent
-    plant transitions update the planning model without revealing the true scales.
+    ``plant`` is the rendered/physical environment and may be perturbed. Known
+    test-time task/terrain/morphology changes are also compiled into ``planner``;
+    optional friction/mass/motor/slope perturbations remain plant-only unless online
+    adaptation estimates them from recent transitions.
     """
     # Build the track from the untouched robot reset pose, then compile task/terrain
     # additions into both plant and planner models.  PPO remains a flat-ground
@@ -150,6 +154,7 @@ def run_race(
     track = StadiumTrack(origin_xy=origin_xy, origin_yaw=origin_yaw)
     environment = RaceEnvironmentConfig(
         task=task, push_object=push_object, terrain=terrain, terrain_seed=terrain_seed, terrain_scale=terrain_scale,
+        leg_mismatch=leg_mismatch, short_leg_scale=short_leg_scale, long_leg_scale=long_leg_scale,
         box_distance=box_distance, box_size=box_size, box_height=box_height,
         box_mass=box_mass, box_friction=box_friction, ball_rolling_friction=ball_rolling_friction,
         sled_distance=sled_distance, sled_length=sled_length, sled_width=sled_width,
@@ -157,8 +162,17 @@ def run_race(
         sled_rope_length=sled_rope_length,
     ).validated()
 
-    plant = make_robot(robot_name, extra_worldbody_xml=environment.plant_worldbody_xml(track))
-    planner = make_robot(robot_name, extra_worldbody_xml=environment.planner_worldbody_xml(track))
+    leg_scales = environment.leg_length_scales(robot_name)
+    plant = make_robot(
+        robot_name,
+        extra_worldbody_xml=environment.plant_worldbody_xml(track),
+        leg_length_scales=leg_scales,
+    )
+    planner = make_robot(
+        robot_name,
+        extra_worldbody_xml=environment.planner_worldbody_xml(track),
+        leg_length_scales=leg_scales,
+    )
     plant.set_task_target_body(environment.task_body_name)
     planner.set_task_target_body(environment.task_body_name)
 
@@ -313,8 +327,15 @@ def run_race(
             f"controller={controller.variant.value}  robot={plant.name}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
             f"backend={controller.rollout_backend_name}  planner_integrator={planner_integrator} "
-            f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain}"
+            f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain} "
+            f"leg_mismatch={environment.leg_mismatch}"
         )
+        if environment.leg_mismatch != "none":
+            scale_text = ", ".join(f"{name}={scale:g}x" for name, scale in leg_scales.items())
+            print(
+                f"known Ant leg morphology: pattern={environment.leg_mismatch}  {scale_text}; "
+                "plant/planner geometry=modified, PPO checkpoint=nominal pretrained policy"
+            )
         if environment.task == "push_box":
             shape_desc = (
                 f"diameter={environment.box_size:g}m"
@@ -645,6 +666,18 @@ def main() -> None:
     )
     parser.add_argument("--terrain-seed", type=int, default=1, help="deterministic rocky/mixed terrain seed")
     parser.add_argument("--terrain-scale", type=float, default=1.0, help="scale obstacle heights/ramp rise")
+    parser.add_argument(
+        "--leg-mismatch", choices=["none", "same_side", "diagonal"], default="none",
+        help="known Ant leg-length transfer for simple flat racing; plant/planner use modified geometry while PPO remains nominal-pretrained",
+    )
+    parser.add_argument(
+        "--short-leg-scale", type=float, default=0.75,
+        help="length scale for the two short Ant legs when --leg-mismatch is enabled (default: 0.75)",
+    )
+    parser.add_argument(
+        "--long-leg-scale", type=float, default=1.25,
+        help="length scale for the two long Ant legs when --leg-mismatch is enabled (default: 1.25)",
+    )
     parser.add_argument("--box-distance", type=float, default=1.8, help="initial box center distance ahead of the robot along track [m] (default: 1.8)")
     parser.add_argument("--box-size", type=float, default=0.90, help="box footprint edge or ball diameter [m] (default: 0.90)")
     parser.add_argument("--box-height", type=float, default=0.45, help="box height [m] (default: 0.45; low crate reduces kicking/tipping)")
@@ -722,6 +755,9 @@ def main() -> None:
         terrain=args.terrain,
         terrain_seed=args.terrain_seed,
         terrain_scale=args.terrain_scale,
+        leg_mismatch=args.leg_mismatch,
+        short_leg_scale=args.short_leg_scale,
+        long_leg_scale=args.long_leg_scale,
         box_distance=args.box_distance,
         box_size=args.box_size,
         box_height=args.box_height,
