@@ -11,4 +11,6 @@
 /racing/results/__pycache__
 /racing/robots/__pycache__
 /racing/tracks/__pycache__
+/racing/policies/checkpoints
+/racing/policies/__pycache__
 /build

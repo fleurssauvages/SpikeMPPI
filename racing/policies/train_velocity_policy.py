@@ -4,6 +4,7 @@ import argparse
 import functools
 import json
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -41,6 +42,85 @@ def _build_network_factory(ppo_networks, linen, ppo_cfg: RapidPPOConfig):
         activation=linen.elu,
         init_noise_std=float(ppo_cfg.init_noise_std),
     )
+
+
+def _fixed_command_pool(
+    curriculum: GridAdaptiveCurriculum,
+    *,
+    until_failure: bool,
+    phase_index: int,
+    max_phases: int,
+    max_forward_speed: float | None,
+) -> np.ndarray:
+    """Builds one command table whose shape stays fixed for this process run.
+
+    The published yaw grid is fixed.  ``--until-failure`` can append at most
+    one positive-vx row per curriculum phase, so reserve exactly that maximum
+    remaining capacity (or stop at the explicit speed guard).
+    """
+    cfg = curriculum.config
+    current_max = float(curriculum.vx_values[-1])
+    if until_failure:
+        remaining_phases = max(0, int(max_phases) - int(phase_index))
+        capacity_max = current_max + remaining_phases * float(cfg.grid_step_vx)
+        if max_forward_speed is not None:
+            capacity_max = min(capacity_max, float(max_forward_speed))
+        capacity_max = max(current_max, capacity_max)
+    else:
+        capacity_max = current_max
+
+    n_extra = int(round((capacity_max - float(cfg.vx_min)) / float(cfg.grid_step_vx)))
+    vx_values = (
+        float(cfg.vx_min) + np.arange(n_extra + 1, dtype=np.float64) * float(cfg.grid_step_vx)
+    )
+    wz_values = np.asarray(curriculum.wz_values, dtype=np.float64)
+    return np.asarray([(vx, wz) for vx in vx_values for wz in wz_values], dtype=np.float32)
+
+
+def _command_pool_mask(
+    pool: np.ndarray, curriculum: GridAdaptiveCurriculum
+) -> np.ndarray:
+    """Maps the curriculum's active grid into a fixed command-table mask."""
+    active = curriculum.active_cells()
+    step_vx = float(curriculum.config.grid_step_vx)
+    step_wz = float(curriculum.config.grid_step_wz)
+    vx0 = float(np.min(pool[:, 0]))
+    wz0 = float(np.min(pool[:, 1]))
+    nwz = int(round((float(np.max(pool[:, 1])) - wz0) / step_wz)) + 1
+    mask = np.zeros((len(pool),), dtype=bool)
+    for vx, wz in np.asarray(active, dtype=np.float64):
+        i = int(round((float(vx) - vx0) / step_vx))
+        j = int(round((float(wz) - wz0) / step_wz))
+        idx = i * nwz + j
+        if idx < 0 or idx >= len(mask):
+            raise RuntimeError(
+                f"active curriculum cell ({vx:.3f}, {wz:.3f}) exceeds fixed command pool"
+            )
+        if not np.allclose(pool[idx], [vx, wz], atol=1e-5):
+            raise RuntimeError("fixed curriculum command-pool indexing mismatch")
+        mask[idx] = True
+    if not np.any(mask):
+        raise RuntimeError("curriculum produced an empty active command mask")
+    return mask
+
+
+def _state_checkpoint_for_phase(output: Path, phase_index: int) -> Path | None:
+    """Returns the full-state checkpoint consistent with metadata phase count."""
+    if int(phase_index) > 0:
+        exact = output / "brax_checkpoints" / f"phase_{int(phase_index):03d}" / "training_state.msgpack"
+        if exact.exists():
+            return exact
+    root = output / "ppo_training_state.msgpack"
+    if root.exists():
+        return root
+    return None
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(payload)
+    tmp.replace(path)
 
 
 def _evaluate_frontier_native(
@@ -178,14 +258,15 @@ def train_policy(
     stall_patience: int = 4,
     max_phases: int = 100,
     max_forward_speed: float | None = None,
+    jax_cache_dir: str | Path | None = None,
 ):
     try:
         import jax
         from flax import linen
         from brax.io import model as brax_model
         from brax.training.agents.ppo import networks as ppo_networks
-        from brax.training.agents.ppo import train as ppo
         from mujoco_playground import wrapper
+        from . import ppo_stateful as ppo
     except ImportError as exc:
         raise RuntimeError(
             "Training requires current Brax main, JAX, Flax, mujoco-mjx and mujoco-playground."
@@ -193,6 +274,16 @@ def train_policy(
 
     output = Path(output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+
+    # Phase-based curriculum necessarily re-enters Brax PPO.  Keep a trusted,
+    # local persistent compilation cache so shape-identical XLA executables can
+    # be reused across phases and process restarts.  Respect an explicit CLI
+    # path first, then JAX_COMPILATION_CACHE_DIR, otherwise keep it with the
+    # policy checkpoint.
+    configured_cache = jax_cache_dir or os.environ.get("JAX_COMPILATION_CACHE_DIR")
+    cache_path = Path(configured_cache).expanduser().resolve() if configured_cache else (output / "jax_compilation_cache")
+    cache_path.mkdir(parents=True, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", str(cache_path))
 
     ppo_cfg = RapidPPOConfig(num_envs=int(num_envs), total_timesteps=int(total_steps))
     curriculum_cfg = RapidCurriculumConfig(
@@ -203,6 +294,7 @@ def train_policy(
     domain_cfg = RapidDomainRandomizationConfig()
     curriculum = GridAdaptiveCurriculum(curriculum_cfg)
     params = None
+    full_training_state_bytes: bytes | None = None
     completed_steps = 0
     phase_index = 0
     speed_stall_phases = 0
@@ -210,17 +302,42 @@ def train_policy(
     metadata_path = output / "metadata.json"
     params_path = output / "params.pkl"
     curriculum_path = output / "curriculum.json"
-    if resume and params_path.exists() and metadata_path.exists():
-        params = brax_model.load_params(str(params_path))
+    if resume and metadata_path.exists():
         old_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
         completed_steps = int(old_meta.get("completed_steps", 0))
         phase_index = int(old_meta.get("completed_phases", 0))
         speed_stall_phases = int(old_meta.get("speed_stall_phases", 0))
-        if curriculum_path.exists():
-            curriculum = GridAdaptiveCurriculum.from_dict(
-                json.loads(curriculum_path.read_text(encoding="utf-8"))
-            )
-        print(f"Resuming at {completed_steps:,}/{total_steps:,} steps from {output}")
+        state_path = _state_checkpoint_for_phase(output, phase_index)
+        if state_path is not None:
+            full_training_state_bytes = ppo.read_training_state_bytes(state_path)
+        elif params_path.exists():
+            params = brax_model.load_params(str(params_path))
+
+        if full_training_state_bytes is not None or params is not None:
+            if curriculum_path.exists():
+                curriculum = GridAdaptiveCurriculum.from_dict(
+                    json.loads(curriculum_path.read_text(encoding="utf-8"))
+                )
+            if full_training_state_bytes is not None:
+                print(
+                    f"Resuming full PPO state at {completed_steps:,} requested steps "
+                    f"from {state_path}"
+                )
+            else:
+                print(
+                    f"Resuming legacy parameter-only checkpoint at {completed_steps:,} "
+                    f"requested steps from {output}"
+                )
+                print(
+                    "WARNING: this old checkpoint has no saved Adam state; optimizer "
+                    "moments restart once. New phases will save full PPO state."
+                )
+        else:
+            # Metadata without corresponding learner parameters is not a valid resume.
+            completed_steps = 0
+            phase_index = 0
+            speed_stall_phases = 0
+            print(f"--resume requested but no usable checkpoint was found in {output}; starting fresh")
 
     stall_patience = max(1, int(stall_patience))
     max_phases = max(1, int(max_phases))
@@ -242,6 +359,7 @@ def train_policy(
 
     print("JAX backend:", jax.default_backend())
     print("Devices:", jax.devices())
+    print("JAX compilation cache:", cache_path)
     print(f"Rapid-Locomotion-style training: robot={robot}, envs={num_envs}, impl={impl}")
     if until_failure:
         print(
@@ -253,6 +371,18 @@ def train_policy(
     print(f"PPO: rollout={ppo_cfg.unroll_length}, epochs={ppo_cfg.num_updates_per_batch}, "
           f"minibatches={ppo_cfg.num_minibatches}, lr={ppo_cfg.learning_rate:g}")
     print(f"Warp buffers: naconmax={naconmax} total ({contacts_per_env}/env), njmax={int(njmax)}/env")
+
+    command_pool = _fixed_command_pool(
+        curriculum,
+        until_failure=bool(until_failure),
+        phase_index=int(phase_index),
+        max_phases=int(max_phases),
+        max_forward_speed=max_forward_speed,
+    )
+    print(
+        f"Curriculum command buffer: {len(command_pool)} fixed cells, "
+        f"vx=[{float(command_pool[:,0].min()):.1f}, {float(command_pool[:,0].max()):.1f}] m/s"
+    )
 
     global_started = time.time()
     final_metrics: dict[str, Any] = {}
@@ -273,6 +403,7 @@ def train_policy(
             else min(int(phase_steps), int(total_steps) - completed_steps)
         )
         active_cells = curriculum.active_cells()
+        command_mask = _command_pool_mask(command_pool, curriculum)
         print(
             f"\nphase {phase_index}: active_bins={len(active_cells)}, "
             f"learned_straight_speed={curriculum.learned_forward_speed():.2f} m/s, "
@@ -282,7 +413,8 @@ def train_policy(
         env = make_velocity_env(
             robot,
             impl=impl,
-            command_cells=active_cells,
+            command_cells=command_pool,
+            command_mask=command_mask,
             curriculum_config=curriculum.config,
             reward_config=reward_cfg,
             domain_config=domain_cfg,
@@ -302,7 +434,8 @@ def train_policy(
             yaw = metrics.get("eval/episode_tracking_ang_vel_per_step", float("nan"))
             global_target = "until-stall" if until_failure else f"{total_steps}"
             print(
-                f"phase={phase_index:02d} global~{completed_steps + int(step):>10d}/{global_target} "
+                f"phase={phase_index:02d} brax_env_steps={int(step):>10d} "
+                f"requested_global~{completed_steps + requested_phase_steps:>10d}/{global_target} "
                 f"eval_reward={float(np.asarray(reward)):.3f} "
                 f"lin={float(np.asarray(lin)):.3f} yaw={float(np.asarray(yaw)):.3f} "
                 f"phase_time={(time.time()-phase_started)/60:.1f}m",
@@ -311,7 +444,7 @@ def train_policy(
 
         phase_ckpt = (output / "brax_checkpoints" / f"phase_{phase_index:03d}").resolve()
         phase_ckpt.mkdir(parents=True, exist_ok=True)
-        make_policy, params, final_metrics = ppo.train(
+        make_policy, params, final_metrics, full_training_state = ppo.train(
             environment=env,
             eval_env=env,
             wrap_env_fn=wrapper.wrap_for_brax_training,
@@ -342,9 +475,23 @@ def train_policy(
             policy_params_fn=lambda *args: None,
             seed=int(seed + phase_index - 1),
             save_checkpoint_path=str(phase_ckpt),
-            restore_params=params,
+            restore_params=params if full_training_state_bytes is None else None,
+            restore_training_state_bytes=full_training_state_bytes,
+            return_training_state=True,
         )
         del make_policy
+        # Serialize the complete learner state.  Keep a phase-local copy now,
+        # but only publish the root "latest" state after curriculum/metadata
+        # commit so --resume cannot pair a newer optimizer state with older
+        # curriculum metadata after an interrupted frontier evaluation.
+        full_training_state_bytes = ppo.training_state_to_bytes(full_training_state)
+        _atomic_write_bytes(phase_ckpt / "training_state.msgpack", full_training_state_bytes)
+        params = (
+            full_training_state.normalizer_params,
+            full_training_state.params.policy,
+            full_training_state.params.value,
+        )
+        del full_training_state
 
         # Brax rounds a training phase upward to its rollout/minibatch quantum.
         # Track the requested paper budget so the CLI remains intuitive.
@@ -439,9 +586,14 @@ def train_policy(
             "last_frontier_evaluation": frontier_rows,
             "race_heading_gain": 2.0,
             "race_curvature_lookahead_m": [0.0, 0.25, 0.5, 1.0, 1.5, 2.0],
+            "ppo_full_state_checkpoint": "ppo_training_state.msgpack",
+            "ppo_optimizer_state_persistent": True,
+            "jax_compilation_cache_dir": str(cache_path),
+            "curriculum_command_buffer_cells": int(len(command_pool)),
             "implementation_notes": [
                 "Grid curriculum is shared and updated between PPO phases using native-MuJoCo frontier evaluation.",
-                "Adam optimizer moments restart at phase boundaries because current Brax restore_params restores network/normalizer parameters only.",
+                "Full Brax PPO TrainingState is preserved across phases and --resume, including Adam moments and observation-normalizer statistics.",
+                "Curriculum sampling uses a fixed-size command table plus an active mask so command-array shapes remain stable across phase expansion.",
                 "Mini-Cheetah-specific feet-air-time/collision topology terms are omitted for classic MuJoCo Ant/Humanoid.",
                 "Policy actions are native normalized MuJoCo actuator controls, not PD joint-position targets.",
             ],
@@ -456,6 +608,8 @@ def train_policy(
         (output / f"frontier_phase_{phase_index:03d}.json").write_text(
             json.dumps(frontier_rows, indent=2), encoding="utf-8"
         )
+        if full_training_state_bytes is not None:
+            _atomic_write_bytes(output / "ppo_training_state.msgpack", full_training_state_bytes)
 
         if until_failure:
             learned_speed = curriculum.learned_forward_speed()
@@ -533,6 +687,11 @@ def main() -> None:
         default=None,
         help="optional safety ceiling in m/s for dynamically extended forward curriculum",
     )
+    parser.add_argument(
+        "--jax-cache-dir",
+        default=None,
+        help="persistent JAX/XLA compilation cache (default: <output>/jax_compilation_cache)",
+    )
     args = parser.parse_args()
 
     output = args.output or f"racing/policies/checkpoints/{args.robot}_rapid"
@@ -556,6 +715,7 @@ def main() -> None:
         stall_patience=args.stall_patience,
         max_phases=args.max_phases,
         max_forward_speed=args.max_forward_speed,
+        jax_cache_dir=args.jax_cache_dir,
     )
 
 

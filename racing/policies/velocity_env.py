@@ -62,6 +62,7 @@ def make_velocity_env(
     *,
     impl: str = "warp",
     command_cells: Optional[np.ndarray] = None,
+    command_mask: Optional[np.ndarray] = None,
     curriculum_config: RapidCurriculumConfig | None = None,
     reward_config: RapidRewardConfig | None = None,
     domain_config: RapidDomainRandomizationConfig | None = None,
@@ -75,8 +76,11 @@ def make_velocity_env(
 ):
     """Construct a Rapid-Locomotion-style MJX environment.
 
-    ``command_cells`` is an ``(N,2)`` array of active [v_x, omega_z] grid
-    centers.  The lateral command is sampled separately, as in the paper.
+    ``command_cells`` is an ``(N,2)`` array of [v_x, omega_z] grid centers.
+    When ``command_mask`` is supplied, only mask-true cells are sampled.  A
+    fixed-size cell table plus a changing mask keeps JAX array shapes stable
+    across host-side curriculum phases.  The lateral command is sampled
+    separately, as in the paper.
     """
     try:
         import jax
@@ -114,6 +118,15 @@ def make_velocity_env(
     command_cells = np.asarray(command_cells, dtype=np.float32).reshape(-1, 2)
     if len(command_cells) == 0:
         raise ValueError("command_cells cannot be empty")
+    if command_mask is None:
+        command_mask = np.ones((len(command_cells),), dtype=bool)
+    command_mask = np.asarray(command_mask, dtype=bool).reshape(-1)
+    if command_mask.shape != (len(command_cells),):
+        raise ValueError(
+            f"command_mask must have shape ({len(command_cells)},), got {command_mask.shape}"
+        )
+    if not np.any(command_mask):
+        raise ValueError("command_mask must enable at least one command cell")
 
     class VelocityTrackingEnv(mjx_env.MjxEnv):
         def __init__(self):
@@ -167,6 +180,7 @@ def make_velocity_env(
             self._ctrl_half_range = jp.asarray(0.5 * (high - low))
 
             self._command_cells = jp.asarray(command_cells)
+            self._command_mask = jp.asarray(command_mask)
             self._vy_min = float(curriculum.vy_min)
             self._vy_max = float(curriculum.vy_max)
             self._jitter_vx = 0.5 * float(curriculum.grid_step_vx) if grid_jitter else 0.0
@@ -199,7 +213,11 @@ def make_velocity_env(
 
         def _sample_command(self, rng):
             rng_idx, rng_vy, rng_jitter = jax.random.split(rng, 3)
-            idx = jax.random.randint(rng_idx, (), 0, self._command_cells.shape[0])
+            # Uniform categorical over currently-active cells.  Keeping the
+            # candidate table fixed-size avoids command-array shape changes as
+            # the host curriculum expands.
+            logits = jp.where(self._command_mask, 0.0, -1.0e9)
+            idx = jax.random.categorical(rng_idx, logits)
             cell = self._command_cells[idx]
             vy = jax.random.uniform(rng_vy, (), minval=self._vy_min, maxval=self._vy_max)
             jitter = jax.random.uniform(
