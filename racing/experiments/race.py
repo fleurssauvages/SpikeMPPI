@@ -60,7 +60,7 @@ def run_race(
     prior: Optional[SpatialPrior] = None,
     policy_spec: str | None = None,
     policy_speed: float | None = None,
-    variant: ControllerVariant | str = ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
+    variant: ControllerVariant | str = ControllerVariant.SPG_MPPI,
     num_rollouts: int = 32,
     horizon: int = 50,
     control_dt: float | None = None,
@@ -375,11 +375,18 @@ def run_race(
                 f"mass={environment.sled_mass:g}kg rope={environment.sled_rope_length:g}m "
                 f"(compiled plant={compiled_task_mass_plant:g}kg, planner={compiled_task_mass_planner:g}kg)"
             )
-        if controller.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
+        if controller.variant == ControllerVariant.SPG_MPPI:
             print(
                 f"SPG: lookahead={cfg.spg_lookahead_steps}, mix={cfg.spg_mix:g}, "
                 f"null_std={cfg.spg_null_std_scale:g}, damping={cfg.spg_pseudoinverse_damping:g}, "
                 f"jac_refresh={cfg.spg_jacobian_refresh_interval}, prefix={cfg.spg_jacobian_refresh_prefix}"
+            )
+        elif controller.variant == ControllerVariant.SPG_TIME_MPPI:
+            print(
+                f"SPG time-dependent: future_steps={cfg.spg_lookahead_steps}, "
+                f"mix={cfg.spg_mix:g}, null_std={cfg.spg_null_std_scale:g}, "
+                f"damping={cfg.spg_pseudoinverse_damping:g}, "
+                f"G_refresh={cfg.spg_jacobian_refresh_interval}, prefix={cfg.spg_jacobian_refresh_prefix}"
             )
 
     gc_was_enabled = gc.isenabled()
@@ -605,16 +612,19 @@ def main() -> None:
     )
     parser.add_argument("--lbps-delta", type=float, default=0.9)
     parser.add_argument("--nominal-refine-iters", type=int, default=0)
-    parser.add_argument("--spg-lookahead", type=int, default=3)
+    parser.add_argument(
+        "--spg-lookahead", type=int, default=3,
+        help="classic SPG endpoint lookahead; for spg_time_mppi, number of future task boundaries [y[k+1], ...] retained in G[k]",
+    )
     parser.add_argument("--spg-mix", type=float, default=1.0, help="1.0 = pure SPG task/null-space proposal; lower values blend standard joint noise")
     parser.add_argument("--spg-null-std", type=float, default=0.15, help="uninformed exploration scale restricted to the Jacobian null space")
-    parser.add_argument("--spg-damping", type=float, default=1e-6, help="damping used in J^dagger = J^T (J J^T + lambda I)^-1")
+    parser.add_argument("--spg-damping", type=float, default=1e-6, help="damping used in the classic J pseudoinverse and time-dependent stacked G[k] inverse")
     parser.add_argument("--spg-epsilon", type=float, default=1e-3, help="finite-difference fraction of actuator range for SPG sensitivities")
     parser.add_argument("--joint-noise", type=float, default=0.08, help="actuator-range noise scale; for SPG this sets null-space/default exploration")
     parser.add_argument(
         "--variant",
         choices=[v.value for v in ControllerVariant],
-        default=ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI.value,
+        default=ControllerVariant.SPG_MPPI.value,
         help="SPG is the default; standard_mppi is retained only as an ablation",
     )
     parser.add_argument("--seed", type=int, default=1)

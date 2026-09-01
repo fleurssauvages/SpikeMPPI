@@ -15,15 +15,22 @@ from .rollout import (
     rollout_policy_nominal,
     rollout_control_nominal,
     refine_policy_nominal,
+    estimate_joint_task_time_sensitivities,
 )
-from .spg import build_spg_factors, sample_joint_noise
+from .spg import (
+    build_spg_factors,
+    sample_joint_noise,
+    build_spg_time_dependent_factors,
+    sample_time_dependent_joint_noise,
+)
 from .fast_kernels import NUMBA_AVAILABLE, spg_dense_project_and_smooth, lbps_optimize_fast
 
 
 class ControllerVariant(str, Enum):
     POLICY_NOMINAL = "policy_nominal"
     STANDARD_MPPI = "standard_mppi"
-    SENSITIVITY_PROJECTED_GAUSSIAN_MPPI = "sensitivity_projected_gaussian_prior_mppi"
+    SPG_MPPI = "spg_mppi"
+    SPG_TIME_MPPI = "spg_time_mppi"
 
 
 @dataclass
@@ -144,7 +151,7 @@ class JointMPPIController:
         policy,
         cfg: ControllerConfig,
         *,
-        variant: ControllerVariant | str = ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
+        variant: ControllerVariant | str = ControllerVariant.SPG_MPPI,
         seed: int = 1,
     ) -> None:
         self.robot = robot
@@ -177,6 +184,7 @@ class JointMPPIController:
         self.native_batcher = None
         self._previous_plan: np.ndarray | None = None
         self._previous_jacobian: np.ndarray | None = None
+        self._previous_time_sensitivity: np.ndarray | None = None
         self._spg_updates = 0
         self._last_spg_refresh_mode = "full"
         self._ctrl_low, self._ctrl_high = robot.control_bounds(cfg.unlimited_control_span)
@@ -234,12 +242,17 @@ class JointMPPIController:
             self.native_batcher = None
 
     def _build_nominal(self, data, current_s: float):
-        """Build a policy-seeded nominal, computing sensitivities only when needed.
+        """Build the nominal and only the sensitivity required by the variant.
 
-        Standard MPPI with ``nominal_refine_iterations == 0`` is deliberately
-        cheap: it uses the default policy rollout directly and does *not* finite
-        difference every joint.  Sensitivity construction is reserved for SPG
-        or an explicitly requested nominal refinement.
+        Classic SPG keeps one endpoint Jacobian per control row.  The
+        ``spg_time_mppi`` variant instead retains
+
+            H[k, ell] = d y[k+ell+1] / d z[k]
+
+        over the existing ``spg_lookahead_steps`` window.  Its SPG factor builder
+        then forms the damped local inverse G[k] ~= d z[k] / dY[k] so the spatial
+        covariance at several future points changes actuator variance along the
+        horizon.
         """
         t0 = time.perf_counter()
         start = self.robot.snapshot(data)
@@ -274,26 +287,119 @@ class JointMPPIController:
             )
         t_policy = time.perf_counter()
 
-        need_spg = self.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI
+        classic_spg = self.variant == ControllerVariant.SPG_MPPI
+        time_spg = self.variant == ControllerVariant.SPG_TIME_MPPI
+        need_spg = classic_spg or time_spg
         need_refine = int(self.cfg.nominal_refine_iterations) > 0
 
+        # A policy-generated nominal is produced by the Python policy loop and
+        # therefore has no fused FULLPHYSICS/qacc_warmstart cache.  For the new
+        # time-dependent SPG path, reroll those already-computed controls once
+        # through the native nominal backend so the following perturbations can
+        # reuse the persistent C++ workers.  No policy inference is repeated.
+        refined = policy_rollout
+        if (
+            time_spg
+            and not need_refine
+            and self.native_batcher is not None
+            and self.native_batcher.supports_vectorized_cost
+            and policy_rollout.native_initial_states is None
+        ):
+            refined = rollout_control_nominal(
+                self.robot,
+                start,
+                policy_rollout.controls,
+                self.track,
+                current_s,
+                control_substeps=self.control_substeps,
+                native_batcher=self.native_batcher,
+            )
+
+        sensitivity = None
+        endpoints = refined.positions.copy()
+
         if not need_spg and not need_refine:
-            refined = policy_rollout
-            jac = None
-            endpoints = policy_rollout.positions.copy()
-        elif need_spg and not need_refine and (
+            pass
+
+        elif time_spg and not need_refine:
+            W = max(1, int(self.cfg.spg_lookahead_steps))
+            if (
+                self.native_batcher is not None
+                and self.native_batcher.supports_vectorized_cost
+                and refined.native_initial_states is not None
+                and refined.native_states is not None
+            ):
+                interval = int(self.cfg.spg_jacobian_refresh_interval)
+                expected_shape = (self.cfg.horizon, W, 2, self.robot.nu)
+                can_shift = bool(
+                    used_warm_start
+                    and interval != 1
+                    and self._previous_time_sensitivity is not None
+                    and self._previous_time_sensitivity.shape == expected_shape
+                )
+                full_refresh = (not can_shift) or (
+                    interval > 1 and self._spg_updates % interval == 0
+                )
+                if full_refresh:
+                    sensitivity, endpoints = self.native_batcher.estimate_joint_task_time_sensitivities(
+                        None,
+                        refined.controls,
+                        control_substeps=self.control_substeps,
+                        future_steps=W,
+                        epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
+                        initial_states=refined.native_initial_states,
+                        nominal_states=refined.native_states,
+                    )
+                    self._last_spg_refresh_mode = "time-full"
+                else:
+                    sensitivity = np.empty_like(self._previous_time_sensitivity)
+                    sensitivity[:-1] = self._previous_time_sensitivity[1:]
+                    sensitivity[-1] = self._previous_time_sensitivity[-1]
+                    prefix = min(self.cfg.horizon, int(self.cfg.spg_jacobian_refresh_prefix))
+                    head = np.arange(prefix, dtype=np.int64)
+                    # Shifting H[k+1,:] -> H[k,:] is exact away from the tail,
+                    # but the last W rows gain newly visible far-future lags in
+                    # the receded horizon.  Refresh that complete tail band so
+                    # those new columns never remain zero/stale.
+                    tail_start = max(0, self.cfg.horizon - W)
+                    tail = np.arange(tail_start, self.cfg.horizon, dtype=np.int64)
+                    ids = np.unique(np.concatenate((head, tail)))
+                    fresh, endpoints = self.native_batcher.estimate_joint_task_time_sensitivities(
+                        None,
+                        refined.controls,
+                        control_substeps=self.control_substeps,
+                        future_steps=W,
+                        epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
+                        initial_states=refined.native_initial_states,
+                        nominal_states=refined.native_states,
+                        time_indices=ids,
+                    )
+                    if ids.size:
+                        sensitivity[ids] = fresh[ids]
+                    self._last_spg_refresh_mode = f"time-shift+head{prefix}+tail{len(tail)}"
+                self._previous_time_sensitivity = np.asarray(
+                    sensitivity, dtype=np.float64
+                ).copy()
+            else:
+                sensitivity, endpoints = estimate_joint_task_time_sensitivities(
+                    self.robot,
+                    refined.snapshots,
+                    refined.controls,
+                    control_substeps=self.control_substeps,
+                    future_steps=W,
+                    epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
+                )
+                self._previous_time_sensitivity = np.asarray(
+                    sensitivity, dtype=np.float64
+                ).copy()
+                self._last_spg_refresh_mode = "time-full-python"
+
+        elif classic_spg and not need_refine and (
             self.native_batcher is not None
             and self.native_batcher.supports_vectorized_cost
-            and policy_rollout.native_initial_states is not None
-            and policy_rollout.native_states is not None
+            and refined.native_initial_states is not None
+            and refined.native_states is not None
         ):
-            # Fast exact-dynamics SPG path.  The nominal states already contain
-            # the unperturbed lookahead endpoints, so finite differences only
-            # simulate the perturbed controls.
-            refined = policy_rollout
-            endpoints = self.native_batcher.nominal_lookahead_endpoints(
-                policy_rollout.native_states, self.cfg.spg_lookahead_steps
-            )
             interval = int(self.cfg.spg_jacobian_refresh_interval)
             can_shift = bool(
                 used_warm_start
@@ -301,15 +407,13 @@ class JointMPPIController:
                 and self._previous_jacobian is not None
                 and self._previous_jacobian.shape == (self.cfg.horizon, 2, self.robot.nu)
             )
-            # interval=1: original full refresh every tick.
-            # interval=0: full refresh only on initialization, then incremental.
-            # interval>1: incremental ticks with a periodic full correction.
             full_refresh = (not can_shift) or (
                 interval > 1 and self._spg_updates % interval == 0
             )
             if full_refresh:
-                jac, endpoints = self.native_batcher.estimate_joint_task_jacobians(
-                    None, refined.controls,
+                sensitivity, endpoints = self.native_batcher.estimate_joint_task_jacobians(
+                    None,
+                    refined.controls,
                     control_substeps=self.control_substeps,
                     lookahead_steps=self.cfg.spg_lookahead_steps,
                     epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
@@ -318,25 +422,20 @@ class JointMPPIController:
                 )
                 self._last_spg_refresh_mode = "full"
             else:
-                # Standard receding-horizon reuse: J[t+1] from the previous
-                # solution is the natural seed for J[t] now.  This changes only
-                # the proposal covariance; every candidate is still evaluated
-                # with the configured MuJoCo planning model and integrator.
-                jac = np.empty_like(self._previous_jacobian)
-                jac[:-1] = self._previous_jacobian[1:]
-                jac[-1] = self._previous_jacobian[-1]
+                sensitivity = np.empty_like(self._previous_jacobian)
+                sensitivity[:-1] = self._previous_jacobian[1:]
+                sensitivity[-1] = self._previous_jacobian[-1]
                 prefix = min(self.cfg.horizon, int(self.cfg.spg_jacobian_refresh_prefix))
                 head = np.arange(prefix, dtype=np.int64)
-                # A shifted plan has one genuinely new row at the horizon tail;
-                # refresh that row as well so stale information never accumulates
-                # indefinitely.  The head rows get priority because they shape
-                # the controls that will actually be applied next.
                 if self.cfg.horizon > prefix:
-                    ids = np.concatenate((head, np.asarray([self.cfg.horizon - 1], dtype=np.int64)))
+                    ids = np.concatenate(
+                        (head, np.asarray([self.cfg.horizon - 1], dtype=np.int64))
+                    )
                 else:
                     ids = head
                 fresh, endpoints = self.native_batcher.estimate_joint_task_jacobians(
-                    None, refined.controls,
+                    None,
+                    refined.controls,
                     control_substeps=self.control_substeps,
                     lookahead_steps=self.cfg.spg_lookahead_steps,
                     epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
@@ -345,14 +444,18 @@ class JointMPPIController:
                     time_indices=ids,
                 )
                 if ids.size:
-                    jac[ids] = fresh[ids]
+                    sensitivity[ids] = fresh[ids]
                 self._last_spg_refresh_mode = (
                     f"shift+head{prefix}+tail" if self.cfg.horizon > prefix
                     else f"shift+head{prefix}"
                 )
-            self._previous_jacobian = np.asarray(jac, dtype=np.float64).copy()
+            self._previous_jacobian = np.asarray(sensitivity, dtype=np.float64).copy()
+
         else:
-            refined, jac, endpoints = refine_policy_nominal(
+            # Nominal refinement itself still uses the compact terminal
+            # Jacobian.  If the selected proposal is time-dependent SPG, build
+            # H[k,ell] around the final refined nominal afterwards.
+            refined, terminal_jac, terminal_endpoints = refine_policy_nominal(
                 self.robot,
                 start,
                 policy_rollout,
@@ -367,14 +470,64 @@ class JointMPPIController:
                 epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
                 native_batcher=self.native_batcher,
             )
-            if need_spg and jac is not None:
-                self._previous_jacobian = np.asarray(jac, dtype=np.float64).copy()
-                self._last_spg_refresh_mode = "full"
+            if time_spg:
+                W = max(1, int(self.cfg.spg_lookahead_steps))
+                if (
+                    self.native_batcher is not None
+                    and self.native_batcher.supports_vectorized_cost
+                    and refined.native_initial_states is not None
+                    and refined.native_states is not None
+                ):
+                    sensitivity, endpoints = self.native_batcher.estimate_joint_task_time_sensitivities(
+                        None,
+                        refined.controls,
+                        control_substeps=self.control_substeps,
+                        future_steps=W,
+                        epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
+                        initial_states=refined.native_initial_states,
+                        nominal_states=refined.native_states,
+                    )
+                else:
+                    sensitivity, endpoints = estimate_joint_task_time_sensitivities(
+                        self.robot,
+                        refined.snapshots,
+                        refined.controls,
+                        control_substeps=self.control_substeps,
+                        future_steps=W,
+                        epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
+                    )
+                self._previous_time_sensitivity = np.asarray(
+                    sensitivity, dtype=np.float64
+                ).copy()
+                self._last_spg_refresh_mode = "time-full"
+            else:
+                sensitivity, endpoints = terminal_jac, terminal_endpoints
+                if classic_spg and sensitivity is not None:
+                    self._previous_jacobian = np.asarray(
+                        sensitivity, dtype=np.float64
+                    ).copy()
+                    self._last_spg_refresh_mode = "full"
+
         t_sensitivity = time.perf_counter()
 
-        endpoint_s, _ = self.track.project(endpoints)
-        prior_mean, prior_cov = self.prior.sample(self.track, endpoint_s)
+        if time_spg:
+            flat_endpoints = np.asarray(endpoints, dtype=np.float64).reshape(-1, 2)
+            endpoint_s, _ = self.track.project(flat_endpoints)
+            mean_flat, cov_flat = self.prior.sample(
+                self.track, np.asarray(endpoint_s, dtype=np.float64)
+            )
+            W = int(np.asarray(endpoints).shape[1])
+            prior_mean = np.asarray(mean_flat, dtype=np.float64).reshape(
+                self.cfg.horizon, W, 2
+            )
+            prior_cov = np.asarray(cov_flat, dtype=np.float64).reshape(
+                self.cfg.horizon, W, 2, 2
+            )
+        else:
+            endpoint_s, _ = self.track.project(endpoints)
+            prior_mean, prior_cov = self.prior.sample(self.track, endpoint_s)
         t_prior = time.perf_counter()
+
         nominal_timing_ms = {
             "policy": 0.0 if used_warm_start else 1e3 * (t_policy - t0),
             "warm_start": 1e3 * (t_policy - t0) if used_warm_start else 0.0,
@@ -382,8 +535,14 @@ class JointMPPIController:
             "prior": 1e3 * (t_prior - t_sensitivity),
         }
         return (
-            start, policy_rollout, refined, jac, endpoints,
-            np.asarray(prior_mean), np.asarray(prior_cov), nominal_timing_ms,
+            start,
+            policy_rollout,
+            refined,
+            sensitivity,
+            endpoints,
+            np.asarray(prior_mean),
+            np.asarray(prior_cov),
+            nominal_timing_ms,
         )
 
     def _sample_standard(self, nominal: np.ndarray) -> np.ndarray:
@@ -466,6 +625,36 @@ class JointMPPIController:
         controls[0] = nominal
         return controls, factors
 
+    def _sample_spg_time_dependent(
+        self,
+        nominal,
+        sensitivity,
+        future_positions,
+        prior_mean,
+        prior_cov,
+    ):
+        factors = build_spg_time_dependent_factors(
+            sensitivity,
+            prior_mean,
+            prior_cov,
+            future_positions,
+            damping=self.cfg.spg_pseudoinverse_damping,
+            covariance_jitter=self.cfg.spg_covariance_jitter,
+        )
+        noise = sample_time_dependent_joint_noise(
+            self.rng,
+            factors,
+            n=self.cfg.num_rollouts,
+            default_std=self._joint_std,
+            temporal_smoothing=self.cfg.temporal_noise_smoothing,
+            null_std_scale=self.cfg.spg_null_std_scale,
+            spg_mix=self.cfg.spg_mix,
+        )
+        controls = nominal[None, :, :] + noise
+        np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
+        controls[0] = nominal
+        return controls, factors
+
     def step(self, data, current_s: float) -> tuple[np.ndarray, dict[str, Any]]:
         t_total = time.perf_counter()
 
@@ -497,6 +686,7 @@ class JointMPPIController:
                 "prior_mean": np.empty((0, 2), dtype=np.float64),
                 "spatial_covariance": np.empty((0, 2, 2), dtype=np.float64),
                 "joint_task_jacobians": None,
+                "joint_task_time_sensitivities": None,
                 "temperature": math.nan,
                 "ess": 1.0,
                 "finite_rollouts": 1,
@@ -518,13 +708,19 @@ class JointMPPIController:
                 },
             }
 
-        start, policy_nom, refined, jac, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
+        start, policy_nom, refined, sensitivity, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
         t_nominal = time.perf_counter()
         nominal = refined.controls
 
         factors = None
-        if self.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
-            controls, factors = self._sample_spg(nominal, jac, endpoints, prior_mean, prior_cov)
+        if self.variant == ControllerVariant.SPG_MPPI:
+            controls, factors = self._sample_spg(
+                nominal, sensitivity, endpoints, prior_mean, prior_cov
+            )
+        elif self.variant == ControllerVariant.SPG_TIME_MPPI:
+            controls, factors = self._sample_spg_time_dependent(
+                nominal, sensitivity, endpoints, prior_mean, prior_cov
+            )
         else:
             controls = self._sample_standard(nominal)
         t_sample = time.perf_counter()
@@ -593,7 +789,10 @@ class JointMPPIController:
         np.clip(candidate, self._ctrl_low, self._ctrl_high, out=candidate)
         if self.cfg.warm_start:
             self._previous_plan = np.asarray(candidate, dtype=np.float64).copy()
-        if self.variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
+        if self.variant in (
+            ControllerVariant.SPG_MPPI,
+            ControllerVariant.SPG_TIME_MPPI,
+        ):
             self._spg_updates += 1
         best = int(np.argmin(costs)) if len(costs) else 0
         t_update = time.perf_counter()
@@ -604,7 +803,16 @@ class JointMPPIController:
             "nominal_positions": refined.positions,
             "prior_mean": prior_mean,
             "spatial_covariance": prior_cov,
-            "joint_task_jacobians": jac,
+            "joint_task_jacobians": (
+                sensitivity
+                if self.variant == ControllerVariant.SPG_MPPI
+                else None
+            ),
+            "joint_task_time_sensitivities": (
+                sensitivity
+                if self.variant == ControllerVariant.SPG_TIME_MPPI
+                else None
+            ),
             "spg_factors": factors,
             "temperature": float(temperature),
             "ess": float(ess),

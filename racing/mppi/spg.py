@@ -148,3 +148,182 @@ def sample_joint_noise(
         noise = noise + np.sqrt(max(0.0, 1.0 - mix)) * (z_default * std)
 
     return _temporal_smooth(noise, temporal_smoothing)
+
+
+@dataclass
+class SPGTimeDependentFactors:
+    """SPG proposal factors built from a future task-space sensitivity window.
+
+    For each control row ``k`` we keep the forward sensitivity
+
+        H_k = d [y_{k+1}, ..., y_{k+W}] / d z_k
+
+    and form its damped local inverse
+
+        G_k ~= d z_k / d [y_{k+1}, ..., y_{k+W}].
+
+    ``task_factor[k]`` maps standard-normal task noise over all retained future
+    task points into actuator noise at control row ``k``.  Because every future
+    prior covariance is kept separately before the mapping, the induced
+    actuator variance can change along the MPC horizon instead of being based on
+    a single terminal endpoint.
+    """
+
+    task_factor: np.ndarray          # [H, nu, 2W]
+    null_projector: np.ndarray       # [H, nu, nu]
+    corrected_covariance: np.ndarray # [H, W, 2, 2]
+    displacement: np.ndarray         # [H, W, 2]
+    inverse_sensitivity: np.ndarray  # [H, nu, 2W] ~= dz / dY
+    forward_sensitivity: np.ndarray  # [H, W, 2, nu] = dY / dz
+    valid_lengths: np.ndarray        # [H]
+
+
+def build_spg_time_dependent_factors(
+    sensitivities: np.ndarray,
+    prior_means: np.ndarray,
+    prior_covariances: np.ndarray,
+    nominal_future: np.ndarray,
+    *,
+    damping: float = 1e-6,
+    covariance_jitter: float = 1e-8,
+) -> SPGTimeDependentFactors:
+    """Construct time-dependent SPG factors from future task sensitivities.
+
+    ``sensitivities[k, ell]`` is the finite-difference forward Jacobian
+
+        d y_{k+ell+1} / d z_k,     ell = 0, ..., W-1.
+
+    For the valid future points of each horizon row, the forward Jacobians are
+    stacked into ``H_k``.  Its damped pseudoinverse ``G_k`` maps the block
+    diagonal spatial second moment into actuator space:
+
+        C_k = blockdiag(Sigma_{k,ell} + d_{k,ell} d_{k,ell}^T)
+        delta z_k = G_k C_k^(1/2) xi.
+
+    This preserves the original SPG zero-mean proposal: displacement changes
+    the exploration variance through the second moment, but does not add a
+    deterministic control correction.
+    """
+    forward = np.asarray(sensitivities, dtype=np.float64)
+    means = np.asarray(prior_means, dtype=np.float64)
+    covs = np.asarray(prior_covariances, dtype=np.float64)
+    nominal = np.asarray(nominal_future, dtype=np.float64)
+
+    if forward.ndim != 4 or forward.shape[2] != 2:
+        raise ValueError("sensitivities must have shape [H,W,2,nu]")
+    h, window, _, nu = forward.shape
+    if means.shape != (h, window, 2):
+        raise ValueError(f"prior_means must have shape {(h, window, 2)}")
+    if covs.shape != (h, window, 2, 2):
+        raise ValueError(f"prior_covariances must have shape {(h, window, 2, 2)}")
+    if nominal.shape != (h, window, 2):
+        raise ValueError(f"nominal_future must have shape {(h, window, 2)}")
+
+    damping = max(float(damping), 0.0)
+    jitter = max(float(covariance_jitter), 0.0)
+    eye2 = np.eye(2, dtype=np.float64)
+    eyeu = np.eye(nu, dtype=np.float64)
+
+    displacement = means - nominal
+    corrected = 0.5 * (covs + np.swapaxes(covs, -1, -2))
+    corrected = corrected + np.einsum(
+        "hwi,hwj->hwij", displacement, displacement, optimize=True
+    )
+    corrected = corrected + jitter * eye2[None, None, :, :]
+
+    # Symmetric roots for every future 2-D task covariance.  We keep the roots
+    # separate rather than assembling H large block matrices.
+    eigval, eigvec = np.linalg.eigh(corrected)
+    eigval = np.maximum(eigval, max(jitter, 1e-15))
+    roots = np.matmul(
+        eigvec * np.sqrt(eigval)[..., None, :],
+        np.swapaxes(eigvec, -1, -2),
+    )
+
+    valid_lengths = np.minimum(window, h - np.arange(h, dtype=np.int64))
+    valid_mask = np.arange(window, dtype=np.int64)[None, :] < valid_lengths[:, None]
+    masked_forward = forward * valid_mask[:, :, None, None]
+    Hstack = masked_forward.reshape(h, 2 * window, nu)
+    obs_dim = 2 * window
+
+    # Batched Tikhonov pseudoinverse.  Padding invalid tail observations with
+    # zero Jacobian rows is exact under damping: the corresponding columns of G
+    # stay zero, while all H horizon rows can be solved in one NumPy call.
+    if damping <= 0.0:
+        inverse_sensitivity = np.linalg.pinv(Hstack)
+    elif obs_dim <= nu:
+        gram = np.matmul(Hstack, np.swapaxes(Hstack, -1, -2))
+        gram = gram + damping * np.eye(obs_dim, dtype=np.float64)[None, :, :]
+        solved = np.linalg.solve(gram, Hstack)
+        inverse_sensitivity = np.swapaxes(solved, -1, -2)
+    else:
+        ht = np.swapaxes(Hstack, -1, -2)
+        gram = np.matmul(ht, Hstack) + damping * eyeu[None, :, :]
+        inverse_sensitivity = np.linalg.solve(gram, ht)
+
+    null_projector = (
+        eyeu[None, :, :] - np.matmul(inverse_sensitivity, Hstack)
+    )
+
+    # Apply each 2x2 spatial root to its own two columns of G, equivalent to
+    # G @ blockdiag(root_0, ..., root_W-1) without constructing block matrices.
+    Gblocks = inverse_sensitivity.reshape(h, nu, window, 2)
+    factor_blocks = np.einsum(
+        "huwi,hwij->huwj", Gblocks, roots, optimize=True
+    )
+    task_factor = factor_blocks.reshape(h, nu, 2 * window)
+
+    return SPGTimeDependentFactors(
+        task_factor=task_factor,
+        null_projector=null_projector,
+        corrected_covariance=corrected,
+        displacement=displacement,
+        inverse_sensitivity=inverse_sensitivity,
+        forward_sensitivity=forward.copy(),
+        valid_lengths=valid_lengths,
+    )
+
+
+def sample_time_dependent_joint_noise(
+    rng: np.random.Generator,
+    factors: SPGTimeDependentFactors,
+    *,
+    n: int,
+    default_std: np.ndarray,
+    temporal_smoothing: float,
+    null_std_scale: float = 0.15,
+    spg_mix: float = 0.9,
+) -> np.ndarray:
+    """Sample the time-dependent zero-mean SPG proposal.
+
+    Temporal smoothing is deliberately kept identical to the existing SPG
+    variant: construct the task/null-space actuator perturbation first, then
+    apply the same AR(1) filter.  The only algorithmic change in this variant is
+    therefore the time-dependent G[k] covariance projection.
+    """
+    h, nu, task_dim = factors.task_factor.shape
+    count = int(n)
+    mix = float(np.clip(spg_mix, 0.0, 1.0))
+    std = np.asarray(default_std, dtype=np.float64)[None, None, :]
+
+    if mix > 0.0:
+        z_task = rng.standard_normal((count, h, task_dim))
+        task = np.einsum(
+            "hud,nhd->nhu", factors.task_factor, z_task, optimize=True
+        )
+
+        if float(null_std_scale) > 0.0:
+            z_null = rng.standard_normal((count, h, nu))
+            null = np.einsum(
+                "huv,nhv->nhu", factors.null_projector, z_null, optimize=True
+            )
+            task = task + null * std * float(null_std_scale)
+        noise = np.sqrt(mix) * task
+    else:
+        noise = np.zeros((count, h, nu), dtype=np.float64)
+
+    if mix < 1.0:
+        z_default = rng.standard_normal((count, h, nu))
+        noise = noise + np.sqrt(max(0.0, 1.0 - mix)) * (z_default * std)
+
+    return _temporal_smooth(noise, temporal_smoothing)

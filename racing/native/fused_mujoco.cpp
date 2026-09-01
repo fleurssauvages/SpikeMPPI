@@ -67,6 +67,28 @@ struct Job {
   double start_time = 0.0;
 };
 
+struct SpgJob {
+  const double* nominal = nullptr;
+  const std::int64_t* ids = nullptr;
+  double* jacobian = nullptr;
+  double* time_sensitivity = nullptr;
+
+  int nwork = 0;
+  int m = 0;
+  int h = 0;
+  int nu = 0;
+  int lookahead = 1;
+  int output_steps = 0;
+  int substeps = 1;
+  double epsilon_fraction = 1e-3;
+};
+
+enum class WorkKind {
+  kNone,
+  kEvaluate,
+  kSpg,
+};
+
 inline double PositiveMod(double x, double m) {
   double y = std::fmod(x, m);
   return y < 0.0 ? y + m : y;
@@ -157,6 +179,16 @@ class FusedRolloutEvaluator {
     }
 
     nstate_ = mj_stateSize(model_, mjSTATE_FULLPHYSICS);
+    ctrl_low_.resize(model_->nu, -1.0);
+    ctrl_high_.resize(model_->nu, 1.0);
+    fd_epsilon_scale_.resize(model_->nu, 1.0);
+    for (int k = 0; k < model_->nu; ++k) {
+      if (model_->actuator_ctrllimited[k]) {
+        ctrl_low_[k] = model_->actuator_ctrlrange[2 * k + 0];
+        ctrl_high_[k] = model_->actuator_ctrlrange[2 * k + 1];
+      }
+      fd_epsilon_scale_[k] = std::max(1e-3, ctrl_high_[k] - ctrl_low_[k]);
+    }
     data_.reserve(nthread_);
     for (int i = 0; i < nthread_; ++i) {
       mjData* d = mj_makeData(model_);
@@ -301,6 +333,311 @@ class FusedRolloutEvaluator {
                           std::move(progress), std::move(failed));
   }
 
+  py::tuple RolloutNominal(
+      py::array_t<double, py::array::c_style | py::array::forcecast> initial_state,
+      py::array_t<double, py::array::c_style | py::array::forcecast> controls,
+      int control_substeps) {
+    const auto state_info = initial_state.request();
+    const auto ctrl_info = controls.request();
+    if (state_info.ndim != 1 || state_info.shape[0] != nstate_) {
+      throw std::runtime_error("fused nominal initial_state has incorrect FULLPHYSICS size");
+    }
+    if (ctrl_info.ndim != 2 || ctrl_info.shape[0] <= 0 ||
+        ctrl_info.shape[1] != model_->nu) {
+      throw std::runtime_error("fused nominal controls must have shape [H,nu]");
+    }
+
+    const int h = static_cast<int>(ctrl_info.shape[0]);
+    const int nu = model_->nu;
+    const int substeps = std::max(1, control_substeps);
+    const double* ctrl = static_cast<const double*>(ctrl_info.ptr);
+    const double* state = static_cast<const double*>(state_info.ptr);
+
+    nominal_boundary_states_.resize(
+        static_cast<std::size_t>(h + 1) * static_cast<std::size_t>(nstate_));
+    nominal_warmstart_.resize(
+        static_cast<std::size_t>(h + 1) * static_cast<std::size_t>(model_->nv));
+    nominal_positions_.resize(static_cast<std::size_t>(h) * 2);
+    nominal_controls_.resize(static_cast<std::size_t>(h) * static_cast<std::size_t>(nu));
+
+    for (int t = 0; t < h; ++t) {
+      for (int k = 0; k < nu; ++k) {
+        const double u = ctrl[static_cast<std::size_t>(t) * nu + k];
+        nominal_controls_[static_cast<std::size_t>(t) * nu + k] =
+            std::min(std::max(u, ctrl_low_[k]), ctrl_high_[k]);
+      }
+    }
+
+    {
+      py::gil_scoped_release release;
+      mjData* d = data_[0];
+      mj_setState(model_, d, state, mjSTATE_FULLPHYSICS);
+      mju_zero(d->qacc_warmstart, model_->nv);
+      for (int w = 0; w < mjNWARNING; ++w) {
+        d->warning[w].number = 0;
+      }
+
+      mj_getState(model_, d, nominal_boundary_states_.data(), mjSTATE_FULLPHYSICS);
+      std::copy_n(d->qacc_warmstart, model_->nv, nominal_warmstart_.data());
+
+      bool warning_stalled = false;
+      for (int t = 0; t < h; ++t) {
+        const double* u = nominal_controls_.data() + static_cast<std::size_t>(t) * nu;
+        for (int k = 0; k < nu; ++k) {
+          d->ctrl[k] = static_cast<mjtNum>(u[k]);
+        }
+
+        if (!warning_stalled) {
+          for (int sub = 0; sub < substeps; ++sub) {
+            for (int w = 0; w < mjNWARNING; ++w) {
+              if (d->warning[w].number) {
+                warning_stalled = true;
+                break;
+              }
+            }
+            if (warning_stalled) {
+              break;
+            }
+            mj_step(model_, d);
+          }
+        }
+
+        double* boundary = nominal_boundary_states_.data()
+            + static_cast<std::size_t>(t + 1) * nstate_;
+        mj_getState(model_, d, boundary, mjSTATE_FULLPHYSICS);
+        std::copy_n(
+            d->qacc_warmstart, model_->nv,
+            nominal_warmstart_.data() + static_cast<std::size_t>(t + 1) * model_->nv);
+        nominal_positions_[static_cast<std::size_t>(t) * 2 + 0] = d->qpos[task_qadr_ + 0];
+        nominal_positions_[static_cast<std::size_t>(t) * 2 + 1] = d->qpos[task_qadr_ + 1];
+      }
+    }
+
+    nominal_h_ = h;
+    nominal_substeps_ = substeps;
+    nominal_cache_valid_ = true;
+
+    py::object base = py::cast(this, py::return_value_policy::reference);
+    py::array_t<double> boundaries(
+        {static_cast<py::ssize_t>(h + 1), static_cast<py::ssize_t>(nstate_)},
+        {static_cast<py::ssize_t>(nstate_ * sizeof(double)),
+         static_cast<py::ssize_t>(sizeof(double))},
+        nominal_boundary_states_.data(), base);
+    py::array_t<double> positions(
+        {static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(2)},
+        {static_cast<py::ssize_t>(2 * sizeof(double)),
+         static_cast<py::ssize_t>(sizeof(double))},
+        nominal_positions_.data(), base);
+    return py::make_tuple(std::move(boundaries), std::move(positions));
+  }
+
+  py::tuple EstimateSpgJacobian(
+      py::array_t<double, py::array::c_style | py::array::forcecast> nominal,
+      int lookahead_steps,
+      double epsilon_fraction,
+      int control_substeps,
+      py::object time_indices) {
+    const auto nominal_info = nominal.request();
+    if (!nominal_cache_valid_) {
+      throw std::runtime_error("fused SPG requires a preceding fused nominal rollout");
+    }
+    if (nominal_info.ndim != 2 || nominal_info.shape[0] != nominal_h_ ||
+        nominal_info.shape[1] != model_->nu) {
+      throw std::runtime_error("fused SPG nominal controls do not match cached horizon/model");
+    }
+    const int h = nominal_h_;
+    const int nu = model_->nu;
+    const int substeps = std::max(1, control_substeps);
+    if (substeps != nominal_substeps_) {
+      throw std::runtime_error("fused SPG substeps do not match cached nominal rollout");
+    }
+    if (!(epsilon_fraction >= 0.0) || !std::isfinite(epsilon_fraction)) {
+      throw std::runtime_error("fused SPG epsilon_fraction must be finite and nonnegative");
+    }
+
+    const double* nominal_ptr = static_cast<const double*>(nominal_info.ptr);
+    const std::size_t nctrl = static_cast<std::size_t>(h) * static_cast<std::size_t>(nu);
+    for (std::size_t i = 0; i < nctrl; ++i) {
+      if (nominal_ptr[i] != nominal_controls_[i]) {
+        throw std::runtime_error("fused SPG nominal controls differ from cached nominal rollout");
+      }
+    }
+
+    spg_ids_.clear();
+    if (time_indices.is_none()) {
+      spg_ids_.resize(h);
+      for (int t = 0; t < h; ++t) {
+        spg_ids_[t] = static_cast<std::int64_t>(t);
+      }
+    } else {
+      py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> ids_array(time_indices);
+      const auto ids_info = ids_array.request();
+      if (ids_info.ndim != 1) {
+        throw std::runtime_error("fused SPG time_indices must be one-dimensional");
+      }
+      const auto* ids = static_cast<const std::int64_t*>(ids_info.ptr);
+      for (py::ssize_t i = 0; i < ids_info.shape[0]; ++i) {
+        if (ids[i] >= 0 && ids[i] < h) {
+          spg_ids_.push_back(ids[i]);
+        }
+      }
+      std::sort(spg_ids_.begin(), spg_ids_.end());
+      spg_ids_.erase(std::unique(spg_ids_.begin(), spg_ids_.end()), spg_ids_.end());
+    }
+
+    const int lookahead = std::max(1, lookahead_steps);
+    spg_jacobian_.resize(
+        static_cast<std::size_t>(h) * 2 * static_cast<std::size_t>(nu));
+    std::fill(spg_jacobian_.begin(), spg_jacobian_.end(), 0.0);
+    spg_endpoints_.resize(static_cast<std::size_t>(h) * 2);
+    for (int t = 0; t < h; ++t) {
+      const int end_t = std::min(h - 1, t + lookahead - 1);
+      spg_endpoints_[static_cast<std::size_t>(t) * 2 + 0] =
+          nominal_positions_[static_cast<std::size_t>(end_t) * 2 + 0];
+      spg_endpoints_[static_cast<std::size_t>(t) * 2 + 1] =
+          nominal_positions_[static_cast<std::size_t>(end_t) * 2 + 1];
+    }
+
+    if (!spg_ids_.empty()) {
+      SpgJob job;
+      job.nominal = nominal_controls_.data();
+      job.ids = spg_ids_.data();
+      job.jacobian = spg_jacobian_.data();
+      job.m = static_cast<int>(spg_ids_.size());
+      job.nwork = job.m * nu;
+      job.h = h;
+      job.nu = nu;
+      job.lookahead = lookahead;
+      job.substeps = substeps;
+      job.epsilon_fraction = epsilon_fraction;
+      py::gil_scoped_release release;
+      RunSpgJob(job);
+    }
+
+    py::object base = py::cast(this, py::return_value_policy::reference);
+    py::array_t<double> jacobian(
+        {static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(2),
+         static_cast<py::ssize_t>(nu)},
+        {static_cast<py::ssize_t>(2 * nu * sizeof(double)),
+         static_cast<py::ssize_t>(nu * sizeof(double)),
+         static_cast<py::ssize_t>(sizeof(double))},
+        spg_jacobian_.data(), base);
+    py::array_t<double> endpoints(
+        {static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(2)},
+        {static_cast<py::ssize_t>(2 * sizeof(double)),
+         static_cast<py::ssize_t>(sizeof(double))},
+        spg_endpoints_.data(), base);
+    return py::make_tuple(std::move(jacobian), std::move(endpoints));
+  }
+
+  py::tuple EstimateSpgTimeSensitivity(
+      py::array_t<double, py::array::c_style | py::array::forcecast> nominal,
+      int future_steps,
+      double epsilon_fraction,
+      int control_substeps,
+      py::object time_indices) {
+    const auto nominal_info = nominal.request();
+    if (!nominal_cache_valid_) {
+      throw std::runtime_error("fused time-dependent SPG requires a preceding fused nominal rollout");
+    }
+    if (nominal_info.ndim != 2 || nominal_info.shape[0] != nominal_h_ ||
+        nominal_info.shape[1] != model_->nu) {
+      throw std::runtime_error("fused time-dependent SPG nominal controls do not match cached horizon/model");
+    }
+    const int h = nominal_h_;
+    const int nu = model_->nu;
+    const int substeps = std::max(1, control_substeps);
+    if (substeps != nominal_substeps_) {
+      throw std::runtime_error("fused time-dependent SPG substeps do not match cached nominal rollout");
+    }
+    if (!(epsilon_fraction >= 0.0) || !std::isfinite(epsilon_fraction)) {
+      throw std::runtime_error("fused time-dependent SPG epsilon_fraction must be finite and nonnegative");
+    }
+
+    const double* nominal_ptr = static_cast<const double*>(nominal_info.ptr);
+    const std::size_t nctrl = static_cast<std::size_t>(h) * static_cast<std::size_t>(nu);
+    for (std::size_t i = 0; i < nctrl; ++i) {
+      if (nominal_ptr[i] != nominal_controls_[i]) {
+        throw std::runtime_error("fused time-dependent SPG nominal controls differ from cached nominal rollout");
+      }
+    }
+
+    spg_ids_.clear();
+    if (time_indices.is_none()) {
+      spg_ids_.resize(h);
+      for (int t = 0; t < h; ++t) {
+        spg_ids_[t] = static_cast<std::int64_t>(t);
+      }
+    } else {
+      py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> ids_array(time_indices);
+      const auto ids_info = ids_array.request();
+      if (ids_info.ndim != 1) {
+        throw std::runtime_error("fused time-dependent SPG time_indices must be one-dimensional");
+      }
+      const auto* ids = static_cast<const std::int64_t*>(ids_info.ptr);
+      for (py::ssize_t i = 0; i < ids_info.shape[0]; ++i) {
+        if (ids[i] >= 0 && ids[i] < h) {
+          spg_ids_.push_back(ids[i]);
+        }
+      }
+      std::sort(spg_ids_.begin(), spg_ids_.end());
+      spg_ids_.erase(std::unique(spg_ids_.begin(), spg_ids_.end()), spg_ids_.end());
+    }
+
+    const int window = std::max(1, future_steps);
+    spg_time_sensitivity_.resize(
+        static_cast<std::size_t>(h) * static_cast<std::size_t>(window) *
+        2 * static_cast<std::size_t>(nu));
+    std::fill(spg_time_sensitivity_.begin(), spg_time_sensitivity_.end(), 0.0);
+    spg_future_positions_.resize(
+        static_cast<std::size_t>(h) * static_cast<std::size_t>(window) * 2);
+    for (int t = 0; t < h; ++t) {
+      for (int ell = 0; ell < window; ++ell) {
+        const int end_t = std::min(h - 1, t + ell);
+        const std::size_t dst = (static_cast<std::size_t>(t) * window + ell) * 2;
+        spg_future_positions_[dst + 0] =
+            nominal_positions_[static_cast<std::size_t>(end_t) * 2 + 0];
+        spg_future_positions_[dst + 1] =
+            nominal_positions_[static_cast<std::size_t>(end_t) * 2 + 1];
+      }
+    }
+
+    if (!spg_ids_.empty()) {
+      SpgJob job;
+      job.nominal = nominal_controls_.data();
+      job.ids = spg_ids_.data();
+      job.time_sensitivity = spg_time_sensitivity_.data();
+      job.m = static_cast<int>(spg_ids_.size());
+      job.nwork = job.m * nu;
+      job.h = h;
+      job.nu = nu;
+      job.lookahead = window;
+      job.output_steps = window;
+      job.substeps = substeps;
+      job.epsilon_fraction = epsilon_fraction;
+      py::gil_scoped_release release;
+      RunSpgJob(job);
+    }
+
+    py::object base = py::cast(this, py::return_value_policy::reference);
+    py::array_t<double> sensitivity(
+        {static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(window),
+         static_cast<py::ssize_t>(2), static_cast<py::ssize_t>(nu)},
+        {static_cast<py::ssize_t>(window * 2 * nu * sizeof(double)),
+         static_cast<py::ssize_t>(2 * nu * sizeof(double)),
+         static_cast<py::ssize_t>(nu * sizeof(double)),
+         static_cast<py::ssize_t>(sizeof(double))},
+        spg_time_sensitivity_.data(), base);
+    py::array_t<double> future_positions(
+        {static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(window),
+         static_cast<py::ssize_t>(2)},
+        {static_cast<py::ssize_t>(window * 2 * sizeof(double)),
+         static_cast<py::ssize_t>(2 * sizeof(double)),
+         static_cast<py::ssize_t>(sizeof(double))},
+        spg_future_positions_.data(), base);
+    return py::make_tuple(std::move(sensitivity), std::move(future_positions));
+  }
+
   int nthread() const { return nthread_; }
   int nstate() const { return nstate_; }
   int chunk_size() const { return chunk_size_; }
@@ -318,15 +655,20 @@ class FusedRolloutEvaluator {
   void RunJob(const Job& job) {
     if (nthread_ == 1) {
       current_job_ = &job;
+      current_spg_job_ = nullptr;
+      current_kind_ = WorkKind::kEvaluate;
       next_.store(0, std::memory_order_relaxed);
       ProcessAvailable(0);
       current_job_ = nullptr;
+      current_kind_ = WorkKind::kNone;
       return;
     }
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
       current_job_ = &job;
+      current_spg_job_ = nullptr;
+      current_kind_ = WorkKind::kEvaluate;
       next_.store(0, std::memory_order_relaxed);
       finished_workers_ = 0;
       ++generation_;
@@ -342,6 +684,42 @@ class FusedRolloutEvaluator {
         return finished_workers_ == static_cast<int>(workers_.size());
       });
       current_job_ = nullptr;
+      current_kind_ = WorkKind::kNone;
+    }
+  }
+
+  void RunSpgJob(const SpgJob& job) {
+    if (nthread_ == 1) {
+      current_job_ = nullptr;
+      current_spg_job_ = &job;
+      current_kind_ = WorkKind::kSpg;
+      next_.store(0, std::memory_order_relaxed);
+      ProcessAvailable(0);
+      current_spg_job_ = nullptr;
+      current_kind_ = WorkKind::kNone;
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      current_job_ = nullptr;
+      current_spg_job_ = &job;
+      current_kind_ = WorkKind::kSpg;
+      next_.store(0, std::memory_order_relaxed);
+      finished_workers_ = 0;
+      ++generation_;
+    }
+    work_cv_.notify_all();
+
+    ProcessAvailable(0);
+
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      done_cv_.wait(lock, [this]() {
+        return finished_workers_ == static_cast<int>(workers_.size());
+      });
+      current_spg_job_ = nullptr;
+      current_kind_ = WorkKind::kNone;
     }
   }
 
@@ -372,20 +750,104 @@ class FusedRolloutEvaluator {
   }
 
   void ProcessAvailable(int tid) {
+    const WorkKind kind = current_kind_;
     const Job* job = current_job_;
-    if (!job) {
-      return;
-    }
+    const SpgJob* spg_job = current_spg_job_;
+    const int n = kind == WorkKind::kEvaluate
+        ? (job ? job->n : 0)
+        : (kind == WorkKind::kSpg && spg_job ? spg_job->nwork : 0);
+    if (n <= 0) return;
     for (;;) {
       const int begin = next_.fetch_add(chunk_size_, std::memory_order_relaxed);
-      if (begin >= job->n) {
+      if (begin >= n) {
         break;
       }
-      const int end = std::min(job->n, begin + chunk_size_);
+      const int end = std::min(n, begin + chunk_size_);
       for (int i = begin; i < end; ++i) {
-        EvaluateOne(*job, i, data_[tid]);
+        if (kind == WorkKind::kEvaluate) {
+          EvaluateOne(*job, i, data_[tid]);
+        } else if (kind == WorkKind::kSpg) {
+          EvaluateSpgOne(*spg_job, i, data_[tid]);
+        }
       }
     }
+  }
+
+  void EvaluateSpgOne(const SpgJob& j, int i, mjData* d) const {
+    const int row = i / j.nu;
+    const int actuator = i - row * j.nu;
+    const int t0 = static_cast<int>(j.ids[row]);
+    const int ell = std::min(j.lookahead, j.h - t0);
+
+    const double* state = nominal_boundary_states_.data()
+        + static_cast<std::size_t>(t0) * nstate_;
+    mj_setState(model_, d, state, mjSTATE_FULLPHYSICS);
+    std::copy_n(
+        nominal_warmstart_.data() + static_cast<std::size_t>(t0) * model_->nv,
+        model_->nv, d->qacc_warmstart);
+    for (int w = 0; w < mjNWARNING; ++w) {
+      d->warning[w].number = 0;
+    }
+
+    const double eps = std::max(
+        1e-7, j.epsilon_fraction * fd_epsilon_scale_[actuator]);
+    const double u0 = j.nominal[static_cast<std::size_t>(t0) * j.nu + actuator];
+    const double perturbed0 = std::min(
+        std::max(u0 + eps, ctrl_low_[actuator]), ctrl_high_[actuator]);
+    const double denom = perturbed0 - u0;
+
+    bool warning_stalled = false;
+    for (int r = 0; r < ell; ++r) {
+      const double* u = j.nominal + static_cast<std::size_t>(t0 + r) * j.nu;
+      for (int k = 0; k < j.nu; ++k) {
+        d->ctrl[k] = static_cast<mjtNum>(
+            (r == 0 && k == actuator) ? perturbed0 : u[k]);
+      }
+      if (!warning_stalled) {
+        for (int sub = 0; sub < j.substeps; ++sub) {
+          for (int w = 0; w < mjNWARNING; ++w) {
+            if (d->warning[w].number) {
+              warning_stalled = true;
+              break;
+            }
+          }
+          if (warning_stalled) break;
+          mj_step(model_, d);
+        }
+      }
+
+      if (j.time_sensitivity != nullptr && r < j.output_steps) {
+        const int end_t = std::min(j.h - 1, t0 + r);
+        const double base_x = nominal_positions_[static_cast<std::size_t>(end_t) * 2 + 0];
+        const double base_y = nominal_positions_[static_cast<std::size_t>(end_t) * 2 + 1];
+        const std::size_t base =
+            ((static_cast<std::size_t>(t0) * j.output_steps + r) * 2) * j.nu;
+        if (std::abs(denom) <= 1e-12) {
+          j.time_sensitivity[base + actuator] = 0.0;
+          j.time_sensitivity[base + j.nu + actuator] = 0.0;
+        } else {
+          j.time_sensitivity[base + actuator] =
+              (d->qpos[task_qadr_ + 0] - base_x) / denom;
+          j.time_sensitivity[base + j.nu + actuator] =
+              (d->qpos[task_qadr_ + 1] - base_y) / denom;
+        }
+      }
+    }
+
+    if (j.jacobian == nullptr) {
+      return;
+    }
+    double* out = j.jacobian + static_cast<std::size_t>(t0) * 2 * j.nu;
+    if (std::abs(denom) <= 1e-12) {
+      out[actuator] = 0.0;
+      out[j.nu + actuator] = 0.0;
+      return;
+    }
+    const int end_t = std::min(j.h - 1, t0 + j.lookahead - 1);
+    const double base_x = nominal_positions_[static_cast<std::size_t>(end_t) * 2 + 0];
+    const double base_y = nominal_positions_[static_cast<std::size_t>(end_t) * 2 + 1];
+    out[actuator] = (d->qpos[task_qadr_ + 0] - base_x) / denom;
+    out[j.nu + actuator] = (d->qpos[task_qadr_ + 1] - base_y) / denom;
   }
 
   void EvaluateOne(const Job& j, int i, mjData* d) const {
@@ -558,6 +1020,22 @@ class FusedRolloutEvaluator {
   int task_qadr_ = 0;
   int chunk_size_ = 1;
   int nstate_ = 0;
+  std::vector<double> ctrl_low_;
+  std::vector<double> ctrl_high_;
+  std::vector<double> fd_epsilon_scale_;
+
+  bool nominal_cache_valid_ = false;
+  int nominal_h_ = 0;
+  int nominal_substeps_ = 1;
+  std::vector<double> nominal_boundary_states_;
+  std::vector<double> nominal_warmstart_;
+  std::vector<double> nominal_positions_;
+  std::vector<double> nominal_controls_;
+  std::vector<std::int64_t> spg_ids_;
+  std::vector<double> spg_jacobian_;
+  std::vector<double> spg_endpoints_;
+  std::vector<double> spg_time_sensitivity_;
+  std::vector<double> spg_future_positions_;
 
   std::vector<std::thread> workers_;
   std::mutex mutex_;
@@ -567,6 +1045,8 @@ class FusedRolloutEvaluator {
   std::uint64_t generation_ = 0;
   int finished_workers_ = 0;
   const Job* current_job_ = nullptr;
+  const SpgJob* current_spg_job_ = nullptr;
+  WorkKind current_kind_ = WorkKind::kNone;
   std::atomic<int> next_{0};
 };
 
@@ -581,6 +1061,18 @@ PYBIND11_MODULE(_fused_mujoco, m) {
            py::arg("initial_state"), py::arg("controls"),
            py::arg("nominal_controls"), py::arg("ctrl_scale"),
            py::arg("params"), py::arg("control_substeps"))
+      .def("rollout_nominal", &FusedRolloutEvaluator::RolloutNominal,
+           py::arg("initial_state"), py::arg("controls"),
+           py::arg("control_substeps"))
+      .def("estimate_spg_jacobian", &FusedRolloutEvaluator::EstimateSpgJacobian,
+           py::arg("nominal_controls"), py::arg("lookahead_steps"),
+           py::arg("epsilon_fraction"), py::arg("control_substeps"),
+           py::arg("time_indices") = py::none())
+      .def("estimate_spg_time_sensitivity",
+           &FusedRolloutEvaluator::EstimateSpgTimeSensitivity,
+           py::arg("nominal_controls"), py::arg("future_steps"),
+           py::arg("epsilon_fraction"), py::arg("control_substeps"),
+           py::arg("time_indices") = py::none())
       .def_property_readonly("nthread", &FusedRolloutEvaluator::nthread)
       .def_property_readonly("nstate", &FusedRolloutEvaluator::nstate)
       .def_property_readonly("chunk_size", &FusedRolloutEvaluator::chunk_size);

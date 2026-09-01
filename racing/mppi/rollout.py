@@ -132,6 +132,13 @@ class NativeRolloutBatcher:
                     "fused rollout extension has an old ABI. Rebuild it with: "
                     "python racing/setup_native.py build_ext --inplace"
                 ) from exc
+            required_methods = ('evaluate', 'rollout_nominal', 'estimate_spg_jacobian')
+            if not all(hasattr(self.fused_evaluator, name) for name in required_methods):
+                self.fused_evaluator = None
+                raise RuntimeError(
+                    "fused rollout extension has an old ABI. Rebuild it with: "
+                    "python racing/setup_native.py build_ext --inplace"
+                )
         finally:
             Path(model_path).unlink(missing_ok=True)
 
@@ -352,8 +359,30 @@ class NativeRolloutBatcher:
         clipped = np.clip(u, self._ctrl_low, self._ctrl_high)
         h = int(clipped.shape[0])
         substeps = max(1, int(control_substeps))
+        start_state = self.snapshot_to_state(start_snapshot, out=self._state_pack)
+
+        if self.fused_evaluator is not None:
+            boundaries, positions = self.fused_evaluator.rollout_nominal(
+                start_state, np.ascontiguousarray(clipped, dtype=np.float64), substeps
+            )
+            boundaries = np.asarray(boundaries, dtype=np.float64)
+            # Keep the public diagnostic trajectory stable across subsequent
+            # control ticks even though the C++ evaluator reuses its XY buffer.
+            positions = np.asarray(positions, dtype=np.float64).copy()
+            progress_s, _ = track.project(positions)
+            progress_s = np.asarray(progress_s, dtype=np.float64)
+            cumulative = self._progress_from_s(track, progress_s, current_s)
+            return NominalRollout(
+                clipped,
+                [],
+                positions,
+                progress_s.copy(),
+                cumulative,
+                native_initial_states=boundaries[:-1],
+                native_states=boundaries[1:],
+            )
+
         expanded = self._expand_controls(clipped, substeps)
-        start_state = self.snapshot_to_state(start_snapshot)
         states = self.rollout_states(start_state[None, :], expanded)
         sampled = states[0, substeps - 1::substeps, :]
         positions = self._task_xy_from_state(sampled)
@@ -684,14 +713,13 @@ class NativeRolloutBatcher:
         nominal_states: np.ndarray | None = None,
         time_indices: np.ndarray | Sequence[int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Finite-difference J using one vectorized native rollout dispatch.
+        """Finite-difference task Jacobians using the fastest available backend.
 
-        Full-horizon refresh preserves the previous numerical semantics: each
-        finite-difference row includes a restarted unperturbed base trajectory.
-
-        For a *subset* of time indices (used by shifted-Jacobian refresh), the
-        continuous nominal trajectory supplies endpoints for untouched rows, so
-        only the requested restarted bases and actuator perturbations are simulated.
+        The fused backend restores the nominal control-boundary FULLPHYSICS
+        state together with ``qacc_warmstart`` and therefore needs only the
+        actuator perturbations.  The stock ``mujoco.rollout`` fallback retains
+        the historical restarted-baseline trajectories because FULLPHYSICS by
+        itself does not contain solver warm-start state.
         """
         if not self.supports_vectorized_cost:
             raise RuntimeError('vectorized Jacobians are unsupported for this root layout')
@@ -699,6 +727,35 @@ class NativeRolloutBatcher:
         h, nu = u_nom.shape
         L = max(1, int(lookahead_steps))
         substeps = max(1, int(control_substeps))
+
+        if time_indices is None:
+            ids = None
+            fused_ids = None
+        else:
+            ids = np.asarray(time_indices, dtype=np.int64).reshape(-1)
+            ids = ids[(ids >= 0) & (ids < h)]
+            ids = np.unique(ids)
+            fused_ids = np.ascontiguousarray(ids, dtype=np.int64)
+
+        # Fused nominal rollouts cache both FULLPHYSICS control-boundary states
+        # and qacc_warmstart.  Restoring both for each actuator perturbation
+        # makes the continuous nominal endpoint the exact FD baseline, removing
+        # one redundant restarted baseline rollout per refreshed horizon row.
+        if self.fused_evaluator is not None and nominal_states is not None:
+            jac, endpoints = self.fused_evaluator.estimate_spg_jacobian(
+                np.ascontiguousarray(u_nom, dtype=np.float64),
+                L,
+                float(epsilon_fraction),
+                substeps,
+                fused_ids,
+            )
+            return (
+                np.asarray(jac, dtype=np.float64),
+                np.asarray(endpoints, dtype=np.float64),
+            )
+
+        if ids is None:
+            ids = np.arange(h, dtype=np.int64)
 
         if initial_states is None:
             if snapshots is None:
@@ -708,13 +765,6 @@ class NativeRolloutBatcher:
             initial_all = np.asarray(initial_states, dtype=np.float64)
         if initial_all.shape != (h, self.nstate):
             raise ValueError(f'initial_states must have shape {(h, self.nstate)}, got {initial_all.shape}')
-
-        if time_indices is None:
-            ids = np.arange(h, dtype=np.int64)
-        else:
-            ids = np.asarray(time_indices, dtype=np.int64).reshape(-1)
-            ids = ids[(ids >= 0) & (ids < h)]
-            ids = np.unique(ids)
 
         all_ids = np.arange(h, dtype=np.int64)
         ell_all = np.minimum(L, h - all_ids)
@@ -802,6 +852,144 @@ class NativeRolloutBatcher:
             jac_local[valid] = delta[valid] / denom[valid, None]
             jac[ids] = np.swapaxes(jac_local, 1, 2)
         return jac, endpoints
+
+    def estimate_joint_task_time_sensitivities(
+        self,
+        snapshots: Sequence | None,
+        nominal_controls: np.ndarray,
+        *,
+        control_substeps: int,
+        future_steps: int,
+        epsilon_fraction: float = 1e-3,
+        initial_states: np.ndarray | None = None,
+        nominal_states: np.ndarray | None = None,
+        time_indices: np.ndarray | Sequence[int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Finite-difference future task sensitivity for time-dependent SPG.
+
+        Returns the forward tensor
+
+            H[k, ell] = d y[k+ell+1] / d z[k]
+
+        with shape ``[H, W, 2, nu]`` together with the matching nominal future
+        task positions ``[H, W, 2]``.  One actuator perturbation is propagated
+        once and every control-boundary XY value in the requested future window
+        is retained.  The SPG layer subsequently forms the damped local inverse
+        ``G[k] ~= d z[k] / d [y[k+1], ...]`` used to move spatial variance into
+        actuator space.
+        """
+        if not self.supports_vectorized_cost:
+            raise RuntimeError('vectorized time sensitivities are unsupported for this root layout')
+        u_nom = np.asarray(nominal_controls, dtype=np.float64)
+        h, nu = u_nom.shape
+        W = max(1, int(future_steps))
+        substeps = max(1, int(control_substeps))
+
+        if time_indices is None:
+            ids = np.arange(h, dtype=np.int64)
+            fused_ids = None
+        else:
+            ids = np.asarray(time_indices, dtype=np.int64).reshape(-1)
+            ids = ids[(ids >= 0) & (ids < h)]
+            ids = np.unique(ids)
+            fused_ids = np.ascontiguousarray(ids, dtype=np.int64)
+
+        # New fused builds retain every future XY endpoint produced by the same
+        # persistent worker perturbation used for classic SPG.  Older fused
+        # builds simply fall through to the stock persistent rollout path, so
+        # adding this controller variant does not invalidate the classic ABI.
+        if (
+            self.fused_evaluator is not None
+            and nominal_states is not None
+            and hasattr(self.fused_evaluator, 'estimate_spg_time_sensitivity')
+        ):
+            sensitivity, future_positions = self.fused_evaluator.estimate_spg_time_sensitivity(
+                np.ascontiguousarray(u_nom, dtype=np.float64),
+                W,
+                float(epsilon_fraction),
+                substeps,
+                fused_ids,
+            )
+            return (
+                np.asarray(sensitivity, dtype=np.float64),
+                np.asarray(future_positions, dtype=np.float64),
+            )
+
+        if initial_states is None:
+            if snapshots is None:
+                raise ValueError('snapshots or initial_states are required')
+            initial_all = self.snapshots_to_states(snapshots)
+        else:
+            initial_all = np.asarray(initial_states, dtype=np.float64)
+        if initial_all.shape != (h, self.nstate):
+            raise ValueError(f'initial_states must have shape {(h, self.nstate)}, got {initial_all.shape}')
+
+        # Matching nominal points y[k+1], ..., y[k+W].  Nominal states from the
+        # fused nominal path already contain these exact control-boundary states.
+        future_idx = np.minimum(
+            np.arange(h, dtype=np.int64)[:, None]
+            + np.arange(W, dtype=np.int64)[None, :],
+            h - 1,
+        )
+        future_positions = np.empty((h, W, 2), dtype=np.float64)
+        if nominal_states is not None:
+            states = np.asarray(nominal_states, dtype=np.float64)
+            if states.shape[0] != h:
+                raise ValueError(f'nominal_states must have first dimension {h}')
+            future_positions[:] = self._task_xy_from_state(states[future_idx])
+        else:
+            future_positions.fill(np.nan)
+
+        sensitivity = np.zeros((h, W, 2, nu), dtype=np.float64)
+        if ids.size == 0:
+            return sensitivity, future_positions
+
+        # Fixed-width sequences keep mujoco.rollout rectangular.  Tail controls
+        # are repeated only outside the valid MPC range; the SPG factor builder
+        # ignores those padded lags via valid_lengths[k] = min(W, H-k).
+        ctrl_idx = np.minimum(
+            ids[:, None] + np.arange(W, dtype=np.int64)[None, :], h - 1
+        )
+        base_controls = u_nom[ctrl_idx]
+        m = int(ids.size)
+        actuator = np.arange(nu, dtype=np.int64)
+        eps = np.maximum(1e-7, float(epsilon_fraction) * self._fd_scale)
+
+        perturbed = np.repeat(base_controls[:, None, :, :], nu, axis=1)
+        perturbed[:, actuator, 0, actuator] += eps[None, :]
+        np.clip(
+            perturbed[:, :, 0, :], self._ctrl_low, self._ctrl_high,
+            out=perturbed[:, :, 0, :],
+        )
+        denom = perturbed[:, actuator, 0, actuator] - base_controls[:, 0, :]
+
+        controls = np.concatenate(
+            (base_controls, perturbed.reshape(m * nu, W, nu)), axis=0
+        )
+        init_batch = np.concatenate(
+            (initial_all[ids], np.repeat(initial_all[ids], nu, axis=0)), axis=0
+        )
+        expanded = self._expand_controls(controls, substeps)
+        out = self.rollout_states(init_batch, expanded)
+        sampled = out[:, substeps - 1::substeps, :]
+        base_xy = np.asarray(self._task_xy_from_state(sampled[:m]), dtype=np.float64)
+        pert_xy = np.asarray(
+            self._task_xy_from_state(sampled[m:]), dtype=np.float64
+        ).reshape(m, nu, W, 2)
+
+        if nominal_states is None:
+            future_positions[ids] = base_xy
+
+        for row, t in enumerate(ids):
+            valid_len = min(W, h - int(t))
+            delta = pert_xy[row, :, :valid_len, :] - base_xy[row, None, :valid_len, :]
+            valid = np.abs(denom[row]) > 1e-12
+            if np.any(valid):
+                local = np.zeros((nu, valid_len, 2), dtype=np.float64)
+                local[valid] = delta[valid] / denom[row, valid, None, None]
+                sensitivity[t, :valid_len] = np.transpose(local, (1, 2, 0))
+
+        return sensitivity, future_positions
 
 
 @dataclass
@@ -1095,6 +1283,59 @@ def estimate_joint_task_jacobians(
                 if abs(denom) > 1e-12:
                     jac[t, :, j] = (p_plus - base) / denom
     return jac, endpoints
+
+
+def estimate_joint_task_time_sensitivities(
+    robot,
+    snapshots: Sequence,
+    nominal_controls: np.ndarray,
+    *,
+    control_substeps: int,
+    future_steps: int,
+    epsilon_fraction: float = 1e-3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Python compatibility path for ``d y[k+ell+1] / d z[k]``.
+
+    The expensive path is intentionally simple and exact: each actuator is
+    perturbed only at row ``k`` and the perturbation is propagated through the
+    same nominal future controls while every intermediate task XY is recorded.
+    """
+    u_nom = np.asarray(nominal_controls, dtype=np.float64)
+    h, nu = u_nom.shape
+    W = max(1, int(future_steps))
+    sensitivity = np.zeros((h, W, 2, nu), dtype=np.float64)
+    future_positions = np.empty((h, W, 2), dtype=np.float64)
+    scale = np.maximum(robot.control_scale(fraction=1.0), 1e-6)
+
+    for k in range(h):
+        valid_len = min(W, h - k)
+        future = u_nom[k:k + valid_len]
+
+        d_base = robot.new_data(snapshots[k])
+        for ell, u in enumerate(future):
+            robot.step_control(u, substeps=control_substeps, data=d_base)
+            future_positions[k, ell] = robot.task_xy(d_base)
+        if valid_len < W:
+            future_positions[k, valid_len:] = future_positions[k, valid_len - 1]
+
+        for actuator in range(nu):
+            eps = max(1e-7, float(epsilon_fraction) * float(scale[actuator]))
+            plus = future.copy()
+            plus[0, actuator] += eps
+            plus[0] = robot.clip_ctrl(plus[0])
+            denom = float(plus[0, actuator] - future[0, actuator])
+            if abs(denom) <= 1e-12:
+                continue
+
+            d_plus = robot.new_data(snapshots[k])
+            for ell, u in enumerate(plus):
+                robot.step_control(u, substeps=control_substeps, data=d_plus)
+                sensitivity[k, ell, :, actuator] = (
+                    np.asarray(robot.task_xy(d_plus), dtype=np.float64)
+                    - future_positions[k, ell]
+                ) / denom
+
+    return sensitivity, future_positions
 
 
 def refine_policy_nominal(

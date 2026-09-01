@@ -70,7 +70,7 @@ def main() -> None:
     print("2/3 SPG-MPPI, fixed nominal model")
     fixed = run_race(
         **common,
-        variant=ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
+        variant=ControllerVariant.SPG_MPPI,
         num_rollouts=args.rollouts,
         horizon=args.horizon,
         online_adaptation=False,
@@ -78,7 +78,7 @@ def main() -> None:
     print("3/3 SPG-MPPI, online model adaptation")
     adaptive = run_race(
         **common,
-        variant=ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
+        variant=ControllerVariant.SPG_MPPI,
         num_rollouts=args.rollouts,
         horizon=args.horizon,
         online_adaptation=True,
