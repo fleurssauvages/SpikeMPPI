@@ -78,12 +78,13 @@ def run_race(
     viewer_ui: bool = False,
     controller_overlay: bool = False,
     rollout_workers: int = 0,
-    rollout_backend: str = "native",
+    rollout_backend: str = "auto",
     rollout_chunk_size: int = 0,
-    warm_start: bool = False,
-    spg_jacobian_refresh_interval: int = 1,
-    spg_jacobian_refresh_prefix: int = 0,
-    planner_integrator: str = "model",
+    warm_start: bool = True,
+    spg_jacobian_refresh_interval: int = 4,
+    spg_jacobian_refresh_prefix: int = 2,
+    planner_integrator: str = "implicitfast",
+    planner_contact_mode: str = "fast",
     profile_controller: bool = False,
     disable_gc: bool = False,
     verbose: bool = True,
@@ -226,7 +227,19 @@ def run_race(
             "implicitfast": planner.mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
         }
         planner.model.opt.integrator = integrator_map[planner_integrator]
-        planner.mujoco.mj_forward(planner.model, planner.data)
+    planner_contact_mode = str(planner_contact_mode).strip().lower()
+    if planner_contact_mode not in {"model", "fast"}:
+        raise ValueError("planner_contact_mode must be model or fast")
+    if planner_contact_mode == "fast":
+        # MPC only needs candidates ranked consistently over a short horizon.
+        # Capping the contact solve is especially valuable once terrain or
+        # dynamic objects create many simultaneous constraints. The rendered
+        # plant keeps the original, higher-fidelity settings.
+        planner.model.opt.iterations = min(int(planner.model.opt.iterations), 20)
+        planner.model.opt.ls_iterations = min(int(planner.model.opt.ls_iterations), 10)
+        planner.model.opt.tolerance = max(float(planner.model.opt.tolerance), 1e-6)
+        planner.model.opt.noslip_iterations = 0
+    planner.mujoco.mj_forward(planner.model, planner.data)
     prior = prior or GeometricPrior()
     policy = make_policy(policy_spec, race_speed=policy_speed, robot_name=robot_name)
     policy.reset(planner, planner.data)
@@ -327,6 +340,7 @@ def run_race(
             f"controller={controller.variant.value}  robot={plant.name}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
             f"backend={controller.rollout_backend_name}  planner_integrator={planner_integrator} "
+            f"planner_contacts={planner_contact_mode} "
             f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain} "
             f"leg_mismatch={environment.leg_mismatch}"
         )
@@ -613,24 +627,28 @@ def main() -> None:
         help="native rollout thread-pool chunk size; 0=automatic. For 64 rollouts/16 workers, benchmark 2 and 4",
     )
     parser.add_argument(
-        "--rollout-backend", choices=["fused", "native", "python"], default="native",
-        help="fused uses the custom exact C++ rollout+cost evaluator; native uses mujoco.rollout; python keeps the legacy evaluator",
+        "--rollout-backend", choices=["auto", "fused", "native", "python"], default="auto",
+        help="auto prefers the fused C++ evaluator and falls back to mujoco.rollout; python keeps the legacy evaluator",
     )
     parser.add_argument(
-        "--warm-start", action="store_true",
-        help="shift the previous optimized MPPI sequence instead of rebuilding H policy actions every control tick",
+        "--warm-start", action=argparse.BooleanOptionalAction, default=True,
+        help="shift the optimized sequence between updates (default: enabled; use --no-warm-start for the original behavior)",
     )
     parser.add_argument(
-        "--spg-refresh", type=int, default=1,
+        "--spg-refresh", type=int, default=4,
         help="full SPG Jacobian refresh interval: 1=every tick (original), 0=initial only, N>1=every N ticks",
     )
     parser.add_argument(
-        "--spg-refresh-prefix", type=int, default=0,
+        "--spg-refresh-prefix", type=int, default=2,
         help="when reusing a shifted SPG Jacobian, freshly finite-difference this many leading horizon steps",
     )
     parser.add_argument(
-        "--planner-integrator", choices=["model", "euler", "implicitfast"], default="model",
+        "--planner-integrator", choices=["model", "euler", "implicitfast"], default="implicitfast",
         help="integrator for the planning copy only; the physical plant remains on the XML integrator",
+    )
+    parser.add_argument(
+        "--planner-contact-mode", choices=["model", "fast"], default="fast",
+        help="fast caps short-horizon planner contact-solver work; model preserves the source model settings",
     )
     parser.add_argument(
         "--profile", action="store_true",
@@ -744,6 +762,7 @@ def main() -> None:
         spg_jacobian_refresh_interval=args.spg_refresh,
         spg_jacobian_refresh_prefix=args.spg_refresh_prefix,
         planner_integrator=args.planner_integrator,
+        planner_contact_mode=args.planner_contact_mode,
         profile_controller=args.profile,
         disable_gc=args.disable_gc,
         friction_scale=args.friction_scale,

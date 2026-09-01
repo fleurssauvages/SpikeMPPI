@@ -67,6 +67,8 @@ class NativeRolloutBatcher:
         self._state_pack = np.empty(self.nstate, dtype=np.float64)
         self._state_buffers: dict[tuple[int, int], np.ndarray] = {}
         self._sensor_buffers: dict[tuple[int, int], np.ndarray] = {}
+        self._initial_buffers: dict[int, np.ndarray] = {}
+        self._expanded_control_buffers: dict[tuple[int, int, int, int], np.ndarray] = {}
         self._model_batches: dict[int, list] = {}
         self._root_qadr = self._find_world_free_root_qadr()
         self._task_qadr = getattr(robot, "task_qpos_adr", self._root_qadr)
@@ -81,6 +83,7 @@ class NativeRolloutBatcher:
         self.fused_evaluator = None
         self.fused_requested = bool(fused)
         self._fused_verified = False
+        self._fused_params: np.ndarray | None = None
         self._verify_fused = os.environ.get('RACING_FUSED_VERIFY', '1').strip().lower() not in {'0', 'false', 'no'}
 
         # ``skip_checks`` and caller-provided output arrays are supported by
@@ -243,6 +246,33 @@ class NativeRolloutBatcher:
             self._model_batches[n] = models
         return models
 
+    def _broadcast_initial(self, initial: np.ndarray, nbatch: int) -> np.ndarray:
+        """Expand a singleton state into a persistent native-rollout buffer."""
+        n = int(nbatch)
+        buf = self._initial_buffers.get(n)
+        if buf is None:
+            buf = np.empty((n, self.nstate), dtype=np.float64)
+            self._initial_buffers[n] = buf
+        buf[:] = initial[0]
+        return buf
+
+    def _expand_controls(self, controls: np.ndarray, substeps: int) -> np.ndarray:
+        """Repeat controls in time without allocating on every MPPI update."""
+        ctrl = np.ascontiguousarray(controls, dtype=np.float64)
+        if ctrl.ndim == 2:
+            ctrl = ctrl[None, :, :]
+        sub = max(1, int(substeps))
+        if sub == 1:
+            return ctrl
+        n, h, nu = ctrl.shape
+        key = (int(n), int(h), sub, int(nu))
+        buf = self._expanded_control_buffers.get(key)
+        if buf is None:
+            buf = np.empty((n, h * sub, nu), dtype=np.float64)
+            self._expanded_control_buffers[key] = buf
+        buf.reshape(n, h, sub, nu)[:] = ctrl[:, :, None, :]
+        return buf
+
     def rollout_states(self, initial_state: np.ndarray, controls: np.ndarray) -> np.ndarray:
         initial = np.ascontiguousarray(initial_state, dtype=np.float64)
         if initial.ndim == 1:
@@ -265,7 +295,7 @@ class NativeRolloutBatcher:
         # allocation.  The low-level rollout requires exact batch dimensions.
         if self._supports_skip_checks and self._supports_state_output:
             if initial.shape[0] == 1 and nbatch > 1:
-                initial = np.repeat(initial, nbatch, axis=0)
+                initial = self._broadcast_initial(initial, nbatch)
             if ctrl.shape[0] == 1 and nbatch > 1:
                 ctrl = np.repeat(ctrl, nbatch, axis=0)
             state_buf = self._state_buffer(nbatch, nstep)
@@ -322,7 +352,7 @@ class NativeRolloutBatcher:
         clipped = np.clip(u, self._ctrl_low, self._ctrl_high)
         h = int(clipped.shape[0])
         substeps = max(1, int(control_substeps))
-        expanded = np.repeat(clipped[None, :, :], substeps, axis=1)
+        expanded = self._expand_controls(clipped, substeps)
         start_state = self.snapshot_to_state(start_snapshot)
         states = self.rollout_states(start_state[None, :], expanded)
         sampled = states[0, substeps - 1::substeps, :]
@@ -396,7 +426,10 @@ class NativeRolloutBatcher:
             allowed = max(
                 0.0, 0.5 * float(track.road_width) - float(cost_cfg.hard_collision_clearance)
             )
-            params = np.asarray([
+            if self._fused_params is None:
+                self._fused_params = np.empty(29, dtype=np.float64)
+            params = self._fused_params
+            params[:] = [
                 float(track._origin[0]), float(track._origin[1]),
                 float(track._rot[0, 0]), float(track._rot[0, 1]),
                 float(track._rot[1, 0]), float(track._rot[1, 1]),
@@ -415,7 +448,7 @@ class NativeRolloutBatcher:
                 float(current_s), float(current_root_s),
                 float(initial_task_root_distance), float(initial_task_height),
                 float(start_snapshot.time),
-            ], dtype=np.float64)
+            ]
             t_fused = time.perf_counter()
             positions, costs, terminal_progress, failed = self.fused_evaluator.evaluate(
                 initial, batch, nominal, self._ctrl_scale, params, substeps
@@ -464,7 +497,7 @@ class NativeRolloutBatcher:
             self.last_rollout_physics_ms = elapsed_ms
             self.last_rollout_cost_ms = 0.0
             return positions, costs, terminal_progress, failed
-        expanded = np.repeat(batch, substeps, axis=1)
+        expanded = self._expand_controls(batch, substeps)
         initial = self.snapshot_to_state(start_snapshot)[None, :]
 
         self.last_rollout_fused_ms = 0.0
@@ -740,7 +773,7 @@ class NativeRolloutBatcher:
 
         controls = np.concatenate(controls_parts, axis=0)
         init_batch = np.concatenate(init_parts, axis=0)
-        expanded = np.repeat(controls, substeps, axis=1)
+        expanded = self._expand_controls(controls, substeps)
         out = self.rollout_states(init_batch, expanded)
 
         if b:

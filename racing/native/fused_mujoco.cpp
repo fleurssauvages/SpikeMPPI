@@ -166,6 +166,11 @@ class FusedRolloutEvaluator {
         model_ = nullptr;
         throw std::runtime_error("mj_makeData failed for fused rollout worker");
       }
+      // These user-input arrays are not part of FULLPHYSICS.  They are fixed
+      // at zero for this evaluator and mj_step never mutates them, so initialize
+      // them once instead of clearing O(nv + nbody) memory for every rollout.
+      mju_zero(d->qfrc_applied, model_->nv);
+      mju_zero(d->xfrc_applied, 6 * model_->nbody);
       data_.push_back(d);
     }
 
@@ -384,21 +389,11 @@ class FusedRolloutEvaluator {
   }
 
   void EvaluateOne(const Job& j, int i, mjData* d) const {
-    // Mirror mujoco.rollout's per-trajectory initialization rather than calling
-    // mj_resetData.  This preserves the same FULLPHYSICS + zero-warmstart
-    // semantics while avoiding a more expensive full MjData reset.
-    mju_zero(d->qfrc_applied, model_->nv);
-    mju_zero(d->xfrc_applied, 6 * model_->nbody);
-    for (int body = 0; body < model_->nbody; ++body) {
-      const int mocap_id = model_->body_mocapid[body];
-      if (mocap_id >= 0) {
-        mju_copy3(d->mocap_pos + 3 * mocap_id, model_->body_pos + 3 * body);
-        mju_copy4(d->mocap_quat + 4 * mocap_id, model_->body_quat + 4 * body);
-      }
-    }
-    for (int eq = 0; eq < model_->neq; ++eq) {
-      d->eq_active[eq] = model_->eq_active0[eq];
-    }
+    // Mirror mujoco.rollout's per-trajectory FULLPHYSICS + zero-warmstart
+    // semantics without mj_resetData. Applied forces, mocap inputs and equality
+    // activation are immutable inside this evaluator and were initialized by
+    // mj_makeData, so repeating those O(nbody) resets made obstacle-rich models
+    // slower even before the first collision query.
     mj_setState(model_, d, j.initial_state, mjSTATE_FULLPHYSICS);
     mju_zero(d->qacc_warmstart, model_->nv);
     for (int w = 0; w < mjNWARNING; ++w) {
@@ -531,7 +526,7 @@ class FusedRolloutEvaluator {
     }
 
     // Only best_rollout is used for visualization/diagnostics. For a failed
-    // rollout, avoid wasting exact RK4 work after failure and hold its last XY.
+    // rollout, avoid wasting configured-integrator work after failure and hold its last XY.
     if (failed && last_t >= 0) {
       const double x = positions_i[2 * last_t + 0];
       const double y = positions_i[2 * last_t + 1];
@@ -576,7 +571,7 @@ class FusedRolloutEvaluator {
 };
 
 PYBIND11_MODULE(_fused_mujoco, m) {
-  m.doc() = "Exact RK4 fused MuJoCo rollout + stadium cost evaluator";
+  m.doc() = "Fused MuJoCo rollout + stadium cost evaluator";
   py::class_<FusedRolloutEvaluator>(m, "FusedRolloutEvaluator")
       .def(py::init<const std::string&, int, int, int, int>(),
            py::arg("model_path"), py::arg("nthread"),

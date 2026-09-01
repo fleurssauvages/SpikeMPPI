@@ -58,8 +58,8 @@ class ControllerConfig:
     # of 1 preserves the original full finite-difference refresh every tick.
     # Values >1 reuse the shifted Jacobian between full refreshes; an optional
     # prefix can still be refreshed every tick for near-term accuracy.
-    spg_jacobian_refresh_interval: int = 1
-    spg_jacobian_refresh_prefix: int = 0
+    spg_jacobian_refresh_interval: int = 4
+    spg_jacobian_refresh_prefix: int = 2
 
     # Racing rollout constraints/cost.
     hard_collision_clearance: float = 0.02
@@ -79,12 +79,14 @@ class ControllerConfig:
     box_max_lift: float = 0.12
     box_min_up: float = 0.75
     rollout_workers: int = 0
-    rollout_backend: str = "native"
+    # Prefer the allocation-light fused evaluator when it has been built, while
+    # remaining runnable on installations that only provide mujoco.rollout.
+    rollout_backend: str = "auto"
     rollout_chunk_size: int = 0
 
     # Standard receding-horizon warm start. After the first update, shift the
     # previous optimized sequence instead of doing H synchronous policy calls.
-    warm_start: bool = False
+    warm_start: bool = True
 
     def __post_init__(self) -> None:
         self.horizon = max(1, int(self.horizon))
@@ -117,8 +119,8 @@ class ControllerConfig:
             raise ValueError("box_min_up must lie in [-1, 1]")
         self.rollout_chunk_size = max(0, int(self.rollout_chunk_size))
         self.rollout_backend = str(self.rollout_backend).strip().lower()
-        if self.rollout_backend not in {"fused", "native", "python"}:
-            raise ValueError("rollout_backend must be 'fused', 'native' or 'python'")
+        if self.rollout_backend not in {"auto", "fused", "native", "python"}:
+            raise ValueError("rollout_backend must be 'auto', 'fused', 'native' or 'python'")
 
 
 class JointMPPIController:
@@ -183,21 +185,34 @@ class JointMPPIController:
             unlimited_span=cfg.unlimited_control_span,
         )
         self._spg_fast_workspace: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
-        if cfg.rollout_backend in {"native", "fused"}:
+        self._standard_workspace: tuple[np.ndarray, np.ndarray] | None = None
+        if cfg.rollout_backend in {"auto", "native", "fused"}:
             try:
                 self.native_batcher = NativeRolloutBatcher(
                     robot, workers=cfg.rollout_workers, batch_hint=cfg.num_rollouts,
                     chunk_size=cfg.rollout_chunk_size,
-                    fused=(cfg.rollout_backend == "fused"),
+                    fused=(cfg.rollout_backend in {"auto", "fused"}),
                 )
             except Exception:
                 if cfg.rollout_backend == "fused":
                     # Fused mode is explicit: never silently benchmark the slower
                     # stock path when the extension is missing or incompatible.
                     raise
-                # Keep the old evaluator as a compatibility fallback for older
-                # MuJoCo builds or uncommon robot root layouts.
-                self.native_batcher = None
+                # Auto mode prefers fused but falls back to the stock persistent
+                # native pool. Native mode keeps the legacy Python evaluator as
+                # its compatibility fallback.
+                if cfg.rollout_backend == "auto":
+                    try:
+                        self.native_batcher = NativeRolloutBatcher(
+                            robot, workers=cfg.rollout_workers,
+                            batch_hint=cfg.num_rollouts,
+                            chunk_size=cfg.rollout_chunk_size,
+                            fused=False,
+                        )
+                    except Exception:
+                        self.native_batcher = None
+                else:
+                    self.native_batcher = None
 
     @property
     def rollout_backend_name(self) -> str:
@@ -306,7 +321,7 @@ class JointMPPIController:
                 # Standard receding-horizon reuse: J[t+1] from the previous
                 # solution is the natural seed for J[t] now.  This changes only
                 # the proposal covariance; every candidate is still evaluated
-                # with the exact RK4 planning model.
+                # with the configured MuJoCo planning model and integrator.
                 jac = np.empty_like(self._previous_jacobian)
                 jac[:-1] = self._previous_jacobian[1:]
                 jac[-1] = self._previous_jacobian[-1]
@@ -374,12 +389,22 @@ class JointMPPIController:
     def _sample_standard(self, nominal: np.ndarray) -> np.ndarray:
         n, h, nu = self.cfg.num_rollouts, self.cfg.horizon, self.robot.nu
         std = self._joint_std
-        noise = self.rng.standard_normal((n, h, nu)) * std[None, None, :]
+        if (
+            self._standard_workspace is None
+            or self._standard_workspace[0].shape != (n, h, nu)
+        ):
+            self._standard_workspace = (
+                np.empty((n, h, nu), dtype=np.float64),
+                np.empty((n, h, nu), dtype=np.float64),
+            )
+        noise, controls = self._standard_workspace
+        self.rng.standard_normal(noise.shape, out=noise)
+        np.multiply(noise, std[None, None, :], out=noise)
         rho = float(self.cfg.temporal_noise_smoothing)
         beta = math.sqrt(max(0.0, 1.0 - rho * rho))
         for t in range(1, h):
             noise[:, t] = rho * noise[:, t - 1] + beta * noise[:, t]
-        controls = nominal[None, :, :] + noise
+        np.add(nominal[None, :, :], noise, out=controls)
         np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
         controls[0] = nominal
         return controls

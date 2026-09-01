@@ -33,11 +33,11 @@ This project uses the MuJoCo locomotion robots, with **Ant** as the primary 2-D 
 |:---:|:---:|
 | <img src="racing/results/nominal_sled.gif" width="460"> | <img src="racing/results/spg_sled.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
-| Nominal | SPG (speed x2) |
+| Nominal | SPG |
 |:---:|:---:|
 | <img src="racing/results/nominal_box.gif" width="460"> | <img src="racing/results/spg_box.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
-| Nominal | SPG (speed x2) |
+| Nominal | SPG |
 |:---:|:---:|
 | <img src="racing/results/nominal_ball.gif" width="460"> | <img src="racing/results/spg_ball.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
