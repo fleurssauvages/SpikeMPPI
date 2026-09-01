@@ -1,1 +1,0 @@
-Checkpoint commit was successful to /home/alexis/Desktop/Transfer/racing/policies/checkpoints/ant_rapid/brax_checkpoints/phase_001/000020041728
