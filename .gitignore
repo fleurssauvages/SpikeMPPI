@@ -14,3 +14,4 @@
 /racing/policies/checkpoints
 /racing/policies/__pycache__
 /build
+/results/last_run.npz
