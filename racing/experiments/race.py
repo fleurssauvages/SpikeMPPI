@@ -61,8 +61,8 @@ def run_race(
     policy_spec: str | None = None,
     policy_speed: float | None = None,
     variant: ControllerVariant | str = ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
-    num_rollouts: int = 128,
-    horizon: int = 15,
+    num_rollouts: int = 32,
+    horizon: int = 50,
     control_dt: float | None = None,
     lbps_delta: float = 0.9,
     nominal_refine_iterations: int = 0,
@@ -77,14 +77,14 @@ def run_race(
     viewer: bool = True,
     viewer_ui: bool = False,
     controller_overlay: bool = False,
-    rollout_workers: int = 0,
+    rollout_workers: int = 16,
     rollout_backend: str = "auto",
     rollout_chunk_size: int = 0,
     warm_start: bool = True,
     spg_jacobian_refresh_interval: int = 4,
     spg_jacobian_refresh_prefix: int = 2,
-    planner_integrator: str = "implicitfast",
-    planner_contact_mode: str = "fast",
+    planner_integrator: str = "model",
+    planner_contact_mode: str = "model",
     profile_controller: bool = False,
     disable_gc: bool = False,
     verbose: bool = True,
@@ -595,8 +595,8 @@ def main() -> None:
     parser.add_argument("--policy-speed", type=float, default=None, help="optional cap on the learned maximum racing speed; omitted uses the curriculum envelope")
     parser.add_argument("--prior", default=None, help="Empirical prior .npz; geometric when omitted")
     parser.add_argument("--laps", type=int, default=1)
-    parser.add_argument("--rollouts", type=int, default=128)
-    parser.add_argument("--horizon", type=int, default=15)
+    parser.add_argument("--rollouts", type=int, default=32)
+    parser.add_argument("--horizon", type=int, default=50)
     parser.add_argument(
         "--dt",
         type=float,
@@ -619,8 +619,8 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
-        "--workers", type=int, default=0,
-        help="native rollout threads; 0=auto (all logical CPU cores)",
+        "--workers", type=int, default=16,
+        help="native rollout threads (default: 16; use 0 for automatic)",
     )
     parser.add_argument(
         "--rollout-chunk-size", type=int, default=0,
@@ -643,11 +643,11 @@ def main() -> None:
         help="when reusing a shifted SPG Jacobian, freshly finite-difference this many leading horizon steps",
     )
     parser.add_argument(
-        "--planner-integrator", choices=["model", "euler", "implicitfast"], default="implicitfast",
+        "--planner-integrator", choices=["model", "euler", "implicitfast"], default="model",
         help="integrator for the planning copy only; the physical plant remains on the XML integrator",
     )
     parser.add_argument(
-        "--planner-contact-mode", choices=["model", "fast"], default="fast",
+        "--planner-contact-mode", choices=["model", "fast"], default="model",
         help="fast caps short-horizon planner contact-solver work; model preserves the source model settings",
     )
     parser.add_argument(

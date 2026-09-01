@@ -41,7 +41,7 @@ class NativeRolloutBatcher:
     loops and repeated state packing.
     """
 
-    def __init__(self, robot, *, workers: int = 0, batch_hint: int = 128, chunk_size: int = 0, fused: bool = False) -> None:
+    def __init__(self, robot, *, workers: int = 16, batch_hint: int = 32, chunk_size: int = 0, fused: bool = False) -> None:
         from mujoco import rollout as mj_rollout
         import inspect
 

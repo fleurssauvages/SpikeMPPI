@@ -2,7 +2,7 @@
 
 Run from the directory containing ``racing/``::
 
-    python -m racing.experiments.benchmark_rollouts --scene all --rollouts 32 --horizon 30
+    python -m racing.experiments.benchmark_rollouts --scene all --rollouts 32 --horizon 50
 
 The first fused call performs the semantic cross-check and is excluded from the
 measurements. Results therefore represent steady-state controller updates.
@@ -133,12 +133,12 @@ def main() -> None:
     parser.add_argument("--scene", choices=["all", *SCENES], default="all")
     parser.add_argument("--backend", choices=["all", "native", "fused"], default="all")
     parser.add_argument("--rollouts", type=int, default=32)
-    parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument("--horizon", type=int, default=50)
     parser.add_argument("--dt", type=float, default=0.02)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--chunk-size", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=25)
-    parser.add_argument("--integrator", choices=["model", "euler", "implicitfast"], default="implicitfast")
+    parser.add_argument("--integrator", choices=["model", "euler", "implicitfast"], default="model")
     parser.add_argument("--contact-mode", choices=["model", "fast"], default="fast")
     args = parser.parse_args()
 

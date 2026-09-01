@@ -14,6 +14,7 @@ TOW_ROBOT_SITE_NAME = "race_tow_robot_hitch"
 TOW_SLED_SITE_NAME = "race_tow_sled_hitch"
 TOW_TENDON_NAME = "race_tow_rope"
 TERRAIN_PREFIX = "race_terrain_"
+TASK_COLLISION_TYPE = 2
 
 
 @dataclass(frozen=True)
@@ -445,8 +446,14 @@ def _rock_patch(
     return out
 
 
-def build_terrain_worldbody_xml(track, *, kind: str, seed: int = 1, scale: float = 1.0) -> str:
-    """Create collidable terrain only on the top straight and second (left) turn."""
+def build_terrain_worldbody_xml(
+    track,
+    *,
+    kind: str,
+    seed: int = 1,
+    scale: float = 1.0,
+) -> str:
+    """Create the original static primitive terrain used by plant and planner."""
     kind = str(kind).strip().lower()
     if kind == "flat":
         return ""
@@ -550,7 +557,10 @@ def build_push_object_worldbody_xml(
             "density": f"{density:.12g}",
             "friction": _fmt([float(friction), 0.01, float(ball_rolling_friction)]),
             "rgba": _fmt([0.20, 0.55, 0.95, 1.0]),
-            "contype": "1",
+            # A distinct type prevents movable task objects from being paired
+            # with one another while preserving robot/object and ground/object
+            # contacts through conaffinity=1.
+            "contype": str(TASK_COLLISION_TYPE),
             "conaffinity": "1",
             "condim": "6",
             "group": "0",
@@ -573,7 +583,7 @@ def build_push_object_worldbody_xml(
         "density": f"{density:.12g}",
         "friction": _fmt([float(friction), 0.01, 0.001]),
         "rgba": _fmt([0.92, 0.48, 0.08, 1.0]),
-        "contype": "1",
+        "contype": str(TASK_COLLISION_TYPE),
         "conaffinity": "1",
         "condim": "4",
         "group": "0",
@@ -631,7 +641,7 @@ def build_sled_model_xml(
         "density": f"{density:.12g}",
         "friction": _fmt([float(friction), 0.01, 0.001]),
         "rgba": _fmt([0.18, 0.22, 0.26, 1.0]),
-        "contype": "1",
+        "contype": str(TASK_COLLISION_TYPE),
         "conaffinity": "1",
         "condim": "4",
         "group": "0",

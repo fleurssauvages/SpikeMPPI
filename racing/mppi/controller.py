@@ -29,8 +29,8 @@ class ControllerVariant(str, Enum):
 @dataclass
 class ControllerConfig:
     control_dt: float = 0.02
-    horizon: int = 15
-    num_rollouts: int = 128
+    horizon: int = 50
+    num_rollouts: int = 32
     lambda_temperature: float = 1.0
     adaptive_temperature_lbps: bool = True
     lbps_delta: float = 0.9
@@ -78,7 +78,7 @@ class ControllerConfig:
     # are not useful solutions to a ground-pushing task.
     box_max_lift: float = 0.12
     box_min_up: float = 0.75
-    rollout_workers: int = 0
+    rollout_workers: int = 16
     # Prefer the allocation-light fused evaluator when it has been built, while
     # remaining runnable on installations that only provide mujoco.rollout.
     rollout_backend: str = "auto"
