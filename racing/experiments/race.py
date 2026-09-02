@@ -9,7 +9,7 @@ import time
 from typing import Optional
 import numpy as np
 
-from racing.adaptation import ModelParameterScales, OnlineSystemIdentifier, SystemIDConfig
+from racing.robots.model_params import ModelParameterScales
 from racing.environments import RaceEnvironmentConfig
 from racing.mppi import ControllerConfig, ControllerVariant, JointMPPIController
 from racing.policies import make_policy
@@ -29,6 +29,8 @@ class RaceResult:
     robot_name: str
     controller_variant: str
     control_dt: float
+    plant_integrator: str
+    planner_integrator: str
     xy: np.ndarray
     target_xy: np.ndarray
     qpos: np.ndarray
@@ -49,8 +51,6 @@ class RaceResult:
     track: StadiumTrack
     environment: RaceEnvironmentConfig
     plant_parameters: ModelParameterScales
-    model_estimates: np.ndarray
-    model_estimate_steps: np.ndarray
 
 
 def run_race(
@@ -76,6 +76,7 @@ def run_race(
     rollout_backend: str = "auto",
     rollout_chunk_size: int = 0,
     warm_start: bool = True,
+    plant_integrator: str = "model",
     planner_integrator: str = "model",
     planner_contact_mode: str = "model",
     profile_controller: bool = False,
@@ -113,20 +114,16 @@ def run_race(
     sled_robot_progress_weight: float = 0.25,
     sled_max_lift: float = 0.12,
     sled_min_up: float = 0.70,
-    online_adaptation: bool = False,
-    sysid_history: int = 12,
-    sysid_interval: int = 8,
-    sysid_estimate_slope: bool = False,
 ) -> RaceResult:
     """Race a classic MuJoCo robot using a policy-seeded joint-space controller.
 
     The locomotion policy provides either the closed-loop nominal controller or
     the warm-start nominal sequence used by standard joint-space MPPI.
 
-    ``plant`` is the rendered/physical environment and may be perturbed. Known
-    test-time task/terrain/morphology changes are also compiled into ``planner``;
-    optional friction/mass/motor/slope perturbations remain plant-only unless online
-    adaptation estimates them from recent transitions.
+    ``plant`` is the rendered/physical environment and may be configured with
+    fixed test-time perturbations. Known task/terrain/morphology changes are also
+    compiled into ``planner``. Plant and planner integrators are selectable
+    independently; both remain fixed for the duration of a run.
     """
     # Build the track from the untouched robot reset pose, then compile task/terrain
     # additions into both plant and planner models.  PPO remains a flat-ground
@@ -205,16 +202,23 @@ def run_race(
     plant.apply_model_parameters(plant_params)
     planner.apply_model_parameters(ModelParameterScales())
 
-    # Keep the physical plant on the XML integrator, but optionally use a
-    # lower-latency integrator in the planning copy.
+    # Plant and planner integrators can be selected independently. ``model``
+    # preserves the integrator compiled from the source XML.
+    integrator_names = {"model", "euler", "implicitfast"}
+    plant_integrator = str(plant_integrator).strip().lower()
     planner_integrator = str(planner_integrator).strip().lower()
-    if planner_integrator not in {"model", "euler", "implicitfast"}:
+    if plant_integrator not in integrator_names:
+        raise ValueError("plant_integrator must be model, euler, or implicitfast")
+    if planner_integrator not in integrator_names:
         raise ValueError("planner_integrator must be model, euler, or implicitfast")
+    integrator_map = {
+        "euler": plant.mujoco.mjtIntegrator.mjINT_EULER,
+        "implicitfast": plant.mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
+    }
+    if plant_integrator != "model":
+        plant.model.opt.integrator = integrator_map[plant_integrator]
+        plant.mujoco.mj_forward(plant.model, plant.data)
     if planner_integrator != "model":
-        integrator_map = {
-            "euler": planner.mujoco.mjtIntegrator.mjINT_EULER,
-            "implicitfast": planner.mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
-        }
         planner.model.opt.integrator = integrator_map[planner_integrator]
     planner_contact_mode = str(planner_contact_mode).strip().lower()
     if planner_contact_mode not in {"model", "fast"}:
@@ -271,17 +275,6 @@ def run_race(
     )
     controller = JointMPPIController(planner, track, prior, policy, cfg, variant=variant, seed=seed)
 
-    identifier = None
-    if online_adaptation:
-        identifier = OnlineSystemIdentifier(
-            planner,
-            SystemIDConfig(
-                history=int(sysid_history),
-                update_interval=int(sysid_interval),
-                estimate_slope=bool(sysid_estimate_slope),
-            ),
-        )
-
     current_s, _ = track.project(plant.task_xy())
     current_s = float(current_s)
     cumulative = 0.0
@@ -303,8 +296,6 @@ def run_race(
     completed = 0
     off_track = False
     fell = False
-    estimate_rows: list[list[float]] = [[1.0, 1.0, 1.0, 0.0]]
-    estimate_steps: list[int] = [0]
     profile_rows: list[dict[str, float]] = []
 
     handle = None
@@ -321,7 +312,8 @@ def run_race(
         print(
             f"controller={controller.variant.value}  robot={plant.name}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
-            f"backend={controller.rollout_backend_name}  planner_integrator={planner_integrator} "
+            f"backend={controller.rollout_backend_name}  plant_integrator={plant_integrator} "
+            f"planner_integrator={planner_integrator} "
             f"planner_contacts={planner_contact_mode} "
             f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain} "
             f"leg_mismatch={environment.leg_mismatch}"
@@ -364,8 +356,7 @@ def run_race(
             if handle is not None and not handle.is_running():
                 break
 
-            before = plant.snapshot()
-            # The controller reads the physical qpos/qvel through the snapshot,
+            # The controller reads the physical qpos/qvel through the current data,
             # but all candidate rollouts use the separate planning MuJoCo model.
             ctrl, info = controller.step(plant.data, current_s)
             if profile_controller:
@@ -393,21 +384,6 @@ def run_race(
                 )
             plant.step_control(ctrl, substeps=controller.control_substeps, data=plant.data)
             after = plant.snapshot()
-
-            if identifier is not None:
-                identifier.observe(before, ctrl, after, substeps=controller.control_substeps)
-                if identifier.should_update(step):
-                    est = identifier.update()
-                    controller.sync_planning_model()
-                    estimate_rows.append([est.friction, est.mass, est.motor, est.slope_deg])
-                    estimate_steps.append(step + 1)
-                    if verbose:
-                        print(
-                            "sysid "
-                            f"step={step+1} friction={est.friction:.3f} mass={est.mass:.3f} "
-                            f"motor={est.motor:.3f} slope={est.slope_deg:.2f}deg "
-                            f"loss={identifier.last_loss:.3g}"
-                        )
 
             p = plant.xy()
             task_p = plant.task_xy()
@@ -482,6 +458,8 @@ def run_race(
         robot_name=plant.name,
         controller_variant=controller.variant.value,
         control_dt=float(cfg.control_dt),
+        plant_integrator=plant_integrator,
+        planner_integrator=planner_integrator,
         xy=np.asarray(xy_hist, dtype=np.float64),
         target_xy=np.asarray(target_xy_hist, dtype=np.float64),
         qpos=np.asarray(qpos_hist, dtype=np.float64),
@@ -502,8 +480,6 @@ def run_race(
         track=track,
         environment=environment,
         plant_parameters=plant_params,
-        model_estimates=np.asarray(estimate_rows, dtype=np.float64),
-        model_estimate_steps=np.asarray(estimate_steps, dtype=np.int64),
     )
 
 
@@ -517,6 +493,8 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
         robot_name=result.robot_name,
         controller_variant=result.controller_variant,
         control_dt=result.control_dt,
+        plant_integrator=np.asarray(result.plant_integrator),
+        planner_integrator=np.asarray(result.planner_integrator),
         xy=result.xy,
         target_xy=result.target_xy,
         environment_json=np.asarray(result.environment.to_json()),
@@ -549,8 +527,6 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
             result.plant_parameters.motor,
             result.plant_parameters.slope_deg,
         ]),
-        model_estimates=result.model_estimates,
-        model_estimate_steps=result.model_estimate_steps,
     )
     return path
 
@@ -601,8 +577,12 @@ def main() -> None:
         help="shift the optimized sequence between updates (default: enabled; use --no-warm-start for the original behavior)",
     )
     parser.add_argument(
+        "--plant-integrator", choices=["model", "euler", "implicitfast"], default="model",
+        help="integrator for the rendered/physical plant; model preserves the source XML setting",
+    )
+    parser.add_argument(
         "--planner-integrator", choices=["model", "euler", "implicitfast"], default="model",
-        help="integrator for the planning copy only; the physical plant remains on the XML integrator",
+        help="integrator for the MPPI planning copy; model preserves the source XML setting",
     )
     parser.add_argument(
         "--planner-contact-mode", choices=["model", "fast"], default="model",
@@ -672,10 +652,6 @@ def main() -> None:
     parser.add_argument("--sled-max-lift", type=float, default=0.12, help="reject MPPI candidates lifting the sled more than this above reset height [m]")
     parser.add_argument("--sled-min-up", type=float, default=0.70, help="reject MPPI candidates tipping the sled below this world-up cosine")
 
-    parser.add_argument("--adapt-model", action="store_true", help="online system-identification of the MPPI planning model")
-    parser.add_argument("--sysid-history", type=int, default=12)
-    parser.add_argument("--sysid-interval", type=int, default=8)
-    parser.add_argument("--sysid-estimate-slope", action="store_true")
     parser.add_argument(
         "--save",
         default="racing/results/last_run.npz",
@@ -707,6 +683,7 @@ def main() -> None:
         rollout_backend=args.rollout_backend,
         rollout_chunk_size=args.rollout_chunk_size,
         warm_start=args.warm_start,
+        plant_integrator=args.plant_integrator,
         planner_integrator=args.planner_integrator,
         planner_contact_mode=args.planner_contact_mode,
         profile_controller=args.profile,
@@ -743,10 +720,6 @@ def main() -> None:
         sled_robot_progress_weight=args.sled_robot_progress_weight,
         sled_max_lift=args.sled_max_lift,
         sled_min_up=args.sled_min_up,
-        online_adaptation=args.adapt_model,
-        sysid_history=args.sysid_history,
-        sysid_interval=args.sysid_interval,
-        sysid_estimate_slope=args.sysid_estimate_slope,
     )
     realtime_factor = (
         result.simulated_time_s / result.runtime_s if result.runtime_s > 0.0 else math.inf
@@ -758,9 +731,6 @@ def main() -> None:
         f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s, "
         f"xRT={realtime_factor:.2f}"
     )
-    if len(result.model_estimates) > 1:
-        f, m, a, slope = result.model_estimates[-1]
-        print(f"final model estimate: friction={f:.3f}, mass={m:.3f}, motor={a:.3f}, slope={slope:.2f}deg")
     if not args.no_save and args.save:
         saved = save_result(result, args.save)
         print(f"saved replay: {saved}")

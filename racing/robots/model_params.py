@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ModelParameterScales:
-    """Small set of environment/dynamics parameters adapted online."""
+    """Fixed plant/model parameter scales used to configure a MuJoCo model."""
 
     friction: float = 1.0
     mass: float = 1.0

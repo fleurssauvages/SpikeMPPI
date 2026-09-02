@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 import numpy as np
 
-from racing.adaptation import ModelParameterScales
+from racing.robots.model_params import ModelParameterScales
 from racing.environments import RaceEnvironmentConfig
 from racing.robots import make_robot
 from racing.tracks import (

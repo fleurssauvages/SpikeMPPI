@@ -6,7 +6,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import numpy as np
 
-from racing.adaptation.model_params import ModelParameterScales
+from .model_params import ModelParameterScales
 from .classic import ClassicModel, classic_xml_path
 
 
@@ -75,9 +75,9 @@ class RobotSnapshot:
 class ClassicRobot:
     """Raw-MuJoCo adapter for the classic RL locomotion models.
 
-    MPPI acts directly on ``MjData.ctrl``.  The class also supports applying a
-    small set of parameter scales, which lets the physical plant and MPPI model
-    intentionally differ for online adaptation experiments.
+    MPPI acts directly on ``MjData.ctrl``. The class also supports fixed
+    parameter scales so the physical plant can be configured independently from
+    the planning model for controlled mismatch experiments.
     """
 
     def __init__(
