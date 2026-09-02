@@ -131,6 +131,17 @@ def make_velocity_env(
     class VelocityTrackingEnv(mjx_env.MjxEnv):
         def __init__(self):
             mj_model = mujoco.MjModel.from_xml_path(str(xml_path))
+
+            # MuJoCo-Warp does not support PGS.
+            # Humanoid uses PGS, so switch the in-memory training model to Newton.
+            if (
+                str(impl).strip().lower() == "warp"
+                and int(mj_model.opt.solver)
+                == int(mujoco.mjtSolver.mjSOL_PGS)
+            ):
+                print("Warp does not support PGS; switching solver to Newton.")
+                mj_model.opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
+
             sim_dt = float(mj_model.opt.timestep)
             use_ctrl_dt = float(ctrl_dt if ctrl_dt is not None else spec.ctrl_dt)
             n_substeps = max(1, int(round(use_ctrl_dt / sim_dt)))
