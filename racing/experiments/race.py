@@ -60,17 +60,12 @@ def run_race(
     prior: Optional[SpatialPrior] = None,
     policy_spec: str | None = None,
     policy_speed: float | None = None,
-    variant: ControllerVariant | str = ControllerVariant.SPG_MPPI,
+    variant: ControllerVariant | str = ControllerVariant.MPPI,
     num_rollouts: int = 32,
     horizon: int = 50,
     control_dt: float | None = None,
     lbps_delta: float = 0.9,
     nominal_refine_iterations: int = 0,
-    spg_lookahead_steps: int = 3,
-    spg_mix: float = 1.0,
-    spg_null_std_scale: float = 0.15,
-    spg_pseudoinverse_damping: float = 1e-6,
-    sensitivity_epsilon_fraction: float = 1e-3,
     joint_noise_fraction: float = 0.08,
     seed: int = 1,
     max_steps: int | None = None,
@@ -81,8 +76,6 @@ def run_race(
     rollout_backend: str = "auto",
     rollout_chunk_size: int = 0,
     warm_start: bool = True,
-    spg_jacobian_refresh_interval: int = 4,
-    spg_jacobian_refresh_prefix: int = 2,
     planner_integrator: str = "model",
     planner_contact_mode: str = "model",
     profile_controller: bool = False,
@@ -93,7 +86,6 @@ def run_race(
     motor_scale: float = 1.0,
     slope_deg: float = 0.0,
     task: str = "run",
-    push_object: str = "box",
     terrain: str = "flat",
     terrain_seed: int = 1,
     terrain_scale: float = 1.0,
@@ -105,7 +97,6 @@ def run_race(
     box_height: float = 0.45,
     box_mass: float = 6.0,
     box_friction: float = 0.60,
-    ball_rolling_friction: float = 0.03,
     sled_distance: float = 1.8,
     sled_length: float = 1.0,
     sled_width: float = 0.80,
@@ -129,10 +120,8 @@ def run_race(
 ) -> RaceResult:
     """Race a classic MuJoCo robot using a policy-seeded joint-space controller.
 
-    SPG is the default proposal.  At each receding-horizon update the locomotion
-    policy generates a feasible joint-control nominal. MuJoCo finite differences
-    estimate J_t = d p_xy(t+L) / d u_t around that nominal, and the 2-D spatial
-    prior covariance is projected into the full actuator space before MPPI/LBPS.
+    The locomotion policy provides either the closed-loop nominal controller or
+    the warm-start nominal sequence used by standard joint-space MPPI.
 
     ``plant`` is the rendered/physical environment and may be perturbed. Known
     test-time task/terrain/morphology changes are also compiled into ``planner``;
@@ -148,16 +137,16 @@ def run_race(
     if not probe.supports_stadium:
         raise ValueError(
             f"{probe.display_name} is constrained to 1-D forward locomotion and cannot turn on the stadium track. "
-            "Use ant, humanoid, or swimmer for the 2-D race."
+            "Only Ant is supported for the 2-D race."
         )
     origin_xy = tuple(map(float, probe.xy()))
     origin_yaw = float(probe.root_yaw())
     track = StadiumTrack(origin_xy=origin_xy, origin_yaw=origin_yaw)
     environment = RaceEnvironmentConfig(
-        task=task, push_object=push_object, terrain=terrain, terrain_seed=terrain_seed, terrain_scale=terrain_scale,
+        task=task, terrain=terrain, terrain_seed=terrain_seed, terrain_scale=terrain_scale,
         leg_mismatch=leg_mismatch, short_leg_scale=short_leg_scale, long_leg_scale=long_leg_scale,
         box_distance=box_distance, box_size=box_size, box_height=box_height,
-        box_mass=box_mass, box_friction=box_friction, ball_rolling_friction=ball_rolling_friction,
+        box_mass=box_mass, box_friction=box_friction,
         sled_distance=sled_distance, sled_length=sled_length, sled_width=sled_width,
         sled_height=sled_height, sled_mass=sled_mass, sled_friction=sled_friction,
         sled_rope_length=sled_rope_length,
@@ -178,7 +167,7 @@ def run_race(
     planner.set_task_target_body(environment.task_body_name)
 
     # Fail loudly if the source MJCF compiler changes/overrides the requested
-    # free task-body mass. Classic Ant/Humanoid use inertiafromgeom=true, so the
+    # free task-body mass. Ant uses inertiafromgeom=true, so the
     # environment builders impose mass through explicit geom density.
     compiled_task_mass_plant = None
     compiled_task_mass_planner = None
@@ -188,7 +177,7 @@ def run_race(
         if environment.task == "push_box":
             requested_task_mass = float(environment.box_mass)
             mass_flag = "--box-mass"
-            object_label = environment.push_object
+            object_label = "box"
         else:
             requested_task_mass = float(environment.sled_mass)
             mass_flag = "--sled-mass"
@@ -248,7 +237,7 @@ def run_race(
         control_dt = float(getattr(policy, "control_dt", 0.02))
 
     # Reuse the same fast rollout/fused cost ABI for pushing and towing. The task
-    # body is the box/ball or sled respectively. Towing does not need an
+    # body is the box or sled respectively. Towing does not need an
     # approach-to-object term because the cable already couples robot and sled.
     if environment.task == "tow_sled":
         task_progress_weight = float(sled_progress_weight)
@@ -261,7 +250,7 @@ def run_race(
         task_robot_progress_weight = float(push_robot_progress_weight)
         task_approach_weight = float(push_approach_weight)
         task_max_lift = float(push_box_max_lift)
-        task_min_up = -1.0 if environment.push_object == "ball" else float(push_box_min_up)
+        task_min_up = float(push_box_min_up)
 
     cfg = ControllerConfig(
         control_dt=float(control_dt),
@@ -269,18 +258,11 @@ def run_race(
         num_rollouts=int(num_rollouts),
         lbps_delta=float(lbps_delta),
         nominal_refine_iterations=int(nominal_refine_iterations),
-        spg_lookahead_steps=int(spg_lookahead_steps),
-        spg_mix=float(spg_mix),
-        spg_null_std_scale=float(spg_null_std_scale),
-        spg_pseudoinverse_damping=float(spg_pseudoinverse_damping),
-        sensitivity_epsilon_fraction=float(sensitivity_epsilon_fraction),
         joint_noise_fraction=float(joint_noise_fraction),
         rollout_workers=int(rollout_workers),
         rollout_backend=str(rollout_backend),
         rollout_chunk_size=int(rollout_chunk_size),
         warm_start=bool(warm_start),
-        spg_jacobian_refresh_interval=int(spg_jacobian_refresh_interval),
-        spg_jacobian_refresh_prefix=int(spg_jacobian_refresh_prefix),
         box_progress_weight=task_progress_weight,
         robot_progress_weight=task_robot_progress_weight,
         robot_box_approach_weight=task_approach_weight,
@@ -351,17 +333,13 @@ def run_race(
                 "plant/planner geometry=modified, PPO checkpoint=nominal pretrained policy"
             )
         if environment.task == "push_box":
-            shape_desc = (
-                f"diameter={environment.box_size:g}m"
-                if environment.push_object == "ball"
-                else f"footprint={environment.box_size:g}m height={environment.box_height:g}m"
-            )
+            shape_desc = f"footprint={environment.box_size:g}m height={environment.box_height:g}m"
             print(
                 "push reward: "
                 f"box_progress={cfg.box_progress_weight:g}, "
                 f"robot_progress={cfg.robot_progress_weight:g}, "
                 f"approach={cfg.robot_box_approach_weight:g}; "
-                f"object={environment.push_object} box_distance={environment.box_distance:g}m "
+                f"object=box box_distance={environment.box_distance:g}m "
                 f"{shape_desc} mass={environment.box_mass:g}kg "
                 f"(compiled plant={compiled_task_mass_plant:g}kg, planner={compiled_task_mass_planner:g}kg)"
             )
@@ -374,19 +352,6 @@ def run_race(
                 f"size={environment.sled_length:g}x{environment.sled_width:g}x{environment.sled_height:g}m "
                 f"mass={environment.sled_mass:g}kg rope={environment.sled_rope_length:g}m "
                 f"(compiled plant={compiled_task_mass_plant:g}kg, planner={compiled_task_mass_planner:g}kg)"
-            )
-        if controller.variant == ControllerVariant.SPG_MPPI:
-            print(
-                f"SPG: lookahead={cfg.spg_lookahead_steps}, mix={cfg.spg_mix:g}, "
-                f"null_std={cfg.spg_null_std_scale:g}, damping={cfg.spg_pseudoinverse_damping:g}, "
-                f"jac_refresh={cfg.spg_jacobian_refresh_interval}, prefix={cfg.spg_jacobian_refresh_prefix}"
-            )
-        elif controller.variant == ControllerVariant.SPG_TIME_MPPI:
-            print(
-                f"SPG time-dependent: future_steps={cfg.spg_lookahead_steps}, "
-                f"mix={cfg.spg_mix:g}, null_std={cfg.spg_null_std_scale:g}, "
-                f"damping={cfg.spg_pseudoinverse_damping:g}, "
-                f"G_refresh={cfg.spg_jacobian_refresh_interval}, prefix={cfg.spg_jacobian_refresh_prefix}"
             )
 
     gc_was_enabled = gc.isenabled()
@@ -416,7 +381,7 @@ def run_race(
                     "MPPI timing "
                     f"step={step + 1} nominal={tm.get('nominal', math.nan):.2f}ms "
                     f"(policy={tm.get('policy', 0.0):.2f} warm={tm.get('warm_start', 0.0):.2f} "
-                    f"spg_jac={tm.get('sensitivity', 0.0):.2f} prior={tm.get('prior', 0.0):.2f}) "
+                    f"refine={tm.get('sensitivity', 0.0):.2f} prior={tm.get('prior', 0.0):.2f}) "
                     f"sample={tm.get('sampling', 0.0):.2f}ms "
                     f"rollouts={tm.get('rollouts', 0.0):.2f}ms "
                     f"(physics={tm.get('rollout_physics', 0.0):.2f} cost={tm.get('rollout_cost', 0.0):.2f}"
@@ -424,7 +389,7 @@ def run_race(
                     + ") "
                     + f"update={tm.get('update', 0.0):.2f}ms total={total_ms:.2f}ms "
                     + f"deadline={deadline_ms:.2f}ms xRT={rtf:.2f} "
-                    + f"J={info.get('spg_refresh_mode', 'full')}"
+                   
                 )
             plant.step_control(ctrl, substeps=controller.control_substeps, data=plant.data)
             after = plant.snapshot()
@@ -475,10 +440,9 @@ def run_race(
 
             allowed = max(0.0, 0.5 * track.road_width - cfg.hard_collision_clearance)
             off_track = float(d2) > allowed * allowed or float(robot_d2) > allowed * allowed
-            fell = (
-                plant.root_height() < cfg.fall_height_fraction * max(plant.initial_root_height, 1e-6)
-                or plant.root_up() < cfg.min_root_up
-            )
+            # A low or tilted Ant is not necessarily fallen: terminate only
+            # when the torso is actually inverted and in contact with ground.
+            fell = plant.has_fallen(flipped_threshold=cfg.min_root_up)
             finished = cumulative >= target
 
             if off_track or fell or finished:
@@ -592,8 +556,8 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Policy-seeded direct-joint MuJoCo SPG-MPPI racing")
-    parser.add_argument("--robot", default="ant", help="ant or humanoid for stadium racing")
+    parser = argparse.ArgumentParser(description="Policy-seeded direct-joint MuJoCo racing")
+    parser.add_argument("--robot", default="ant", choices=["ant"], help="Ant stadium racing")
     parser.add_argument(
         "--policy",
         default="auto",
@@ -610,22 +574,14 @@ def main() -> None:
         default=None,
         help="MPPI/policy control dt; defaults to trained policy dt when available",
     )
-    parser.add_argument("--lbps-delta", type=float, default=0.9)
+    parser.add_argument("--lbps-delta", type=float, default=0.95)
     parser.add_argument("--nominal-refine-iters", type=int, default=0)
-    parser.add_argument(
-        "--spg-lookahead", type=int, default=3,
-        help="classic SPG endpoint lookahead; for spg_time_mppi, number of future task boundaries [y[k+1], ...] retained in G[k]",
-    )
-    parser.add_argument("--spg-mix", type=float, default=1.0, help="1.0 = pure SPG task/null-space proposal; lower values blend standard joint noise")
-    parser.add_argument("--spg-null-std", type=float, default=0.15, help="uninformed exploration scale restricted to the Jacobian null space")
-    parser.add_argument("--spg-damping", type=float, default=1e-6, help="damping used in the classic J pseudoinverse and time-dependent stacked G[k] inverse")
-    parser.add_argument("--spg-epsilon", type=float, default=1e-3, help="finite-difference fraction of actuator range for SPG sensitivities")
-    parser.add_argument("--joint-noise", type=float, default=0.08, help="actuator-range noise scale; for SPG this sets null-space/default exploration")
+    parser.add_argument("--joint-noise", type=float, default=0.5, help="actuator-range exploration-noise scale for MPPI")
     parser.add_argument(
         "--variant",
         choices=[v.value for v in ControllerVariant],
-        default=ControllerVariant.SPG_MPPI.value,
-        help="SPG is the default; standard_mppi is retained only as an ablation",
+        default=ControllerVariant.MPPI.value,
+        help="nominal executes the pretrained policy directly; mppi runs standard policy-seeded MPPI",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -643,14 +599,6 @@ def main() -> None:
     parser.add_argument(
         "--warm-start", action=argparse.BooleanOptionalAction, default=True,
         help="shift the optimized sequence between updates (default: enabled; use --no-warm-start for the original behavior)",
-    )
-    parser.add_argument(
-        "--spg-refresh", type=int, default=4,
-        help="full SPG Jacobian refresh interval: 1=every tick (original), 0=initial only, N>1=every N ticks",
-    )
-    parser.add_argument(
-        "--spg-refresh-prefix", type=int, default=2,
-        help="when reusing a shifted SPG Jacobian, freshly finite-difference this many leading horizon steps",
     )
     parser.add_argument(
         "--planner-integrator", choices=["model", "euler", "implicitfast"], default="model",
@@ -685,10 +633,6 @@ def main() -> None:
         help="run tracks robot progress; push_box tracks the pushed object; tow_sled tracks a cable-towed sled; all reuse the same pretrained running policy",
     )
     parser.add_argument(
-        "--push-object", choices=["box", "ball"], default="box",
-        help="object used by --task push_box; box uses --box-size as footprint edge, ball uses it as diameter",
-    )
-    parser.add_argument(
         "--terrain", choices=["flat", "ramps", "stairs", "rocky", "mixed"], default="flat",
         help="known test-time terrain on the upper straight and second turn; PPO stays flat-ground pretrained; push_box/tow_sled require flat",
     )
@@ -707,29 +651,28 @@ def main() -> None:
         help="length scale for the two long Ant legs when --leg-mismatch is enabled (default: 1.25)",
     )
     parser.add_argument("--box-distance", type=float, default=1.8, help="initial box center distance ahead of the robot along track [m] (default: 1.8)")
-    parser.add_argument("--box-size", type=float, default=0.90, help="box footprint edge or ball diameter [m] (default: 0.90)")
+    parser.add_argument("--box-size", type=float, default=0.90, help="box footprint edge [m] (default: 0.90)")
     parser.add_argument("--box-height", type=float, default=0.45, help="box height [m] (default: 0.45; low crate reduces kicking/tipping)")
-    parser.add_argument("--box-mass", type=float, default=6.0, help="box mass [kg] (default: 6.0)")
-    parser.add_argument("--box-friction", type=float, default=0.60, help="pushed-object sliding friction coefficient (default: 0.60)")
-    parser.add_argument("--ball-rolling-friction", type=float, default=0.03, help="MuJoCo rolling-friction coefficient for --push-object ball (default: 0.03 m; requires condim=6)")
+    parser.add_argument("--box-mass", type=float, default=0.25, help="box mass [kg] (default: 6.0)")
+    parser.add_argument("--box-friction", type=float, default=0.60, help="box-ground sliding friction coefficient (default: 0.60)")
     parser.add_argument("--sled-distance", type=float, default=1.8, help="initial sled center distance behind the robot along track [m] (default: 1.8)")
     parser.add_argument("--sled-length", type=float, default=1.0, help="sled length along the track [m] (default: 1.0)")
     parser.add_argument("--sled-width", type=float, default=0.80, help="sled width [m] (default: 0.80)")
     parser.add_argument("--sled-height", type=float, default=0.16, help="sled body height [m] (default: 0.16)")
-    parser.add_argument("--sled-mass", type=float, default=8.0, help="sled mass [kg] (default: 8.0)")
+    parser.add_argument("--sled-mass", type=float, default=0.25, help="sled mass [kg] (default: 8.0)")
     parser.add_argument("--sled-friction", type=float, default=0.60, help="sled-ground sliding friction coefficient (default: 0.60)")
-    parser.add_argument("--sled-rope-length", type=float, default=1.25, help="maximum tow-cable length [m] (default: 1.25)")
+    parser.add_argument("--sled-rope-length", type=float, default=3.0, help="maximum tow-cable length [m] (default: 1.25)")
     parser.add_argument("--push-box-progress-weight", type=float, default=1.0, help="primary box track-progress reward weight")
     parser.add_argument("--push-robot-progress-weight", type=float, default=0.35, help="coupled robot-progress shaping weight; robot cannot earn it by running past a stationary box")
     parser.add_argument("--push-approach-weight", type=float, default=1.00, help="dense reward for reducing/maintaining robot-box distance")
     parser.add_argument("--push-box-max-lift", type=float, default=0.12, help="reject MPPI candidates lifting the box more than this above reset height [m]")
     parser.add_argument("--push-box-min-up", type=float, default=0.75, help="reject MPPI candidates tipping the box below this world-up cosine")
     parser.add_argument("--sled-progress-weight", type=float, default=1.0, help="primary towed-sled track-progress reward weight")
-    parser.add_argument("--sled-robot-progress-weight", type=float, default=0.25, help="robot-progress shaping while towing; capped by sled progress")
+    parser.add_argument("--sled-robot-progress-weight", type=float, default=10.0, help="robot-progress shaping while towing; capped by sled progress")
     parser.add_argument("--sled-max-lift", type=float, default=0.12, help="reject MPPI candidates lifting the sled more than this above reset height [m]")
     parser.add_argument("--sled-min-up", type=float, default=0.70, help="reject MPPI candidates tipping the sled below this world-up cosine")
 
-    parser.add_argument("--adapt-model", action="store_true", help="online system-identification of the SPG-MPPI planning model")
+    parser.add_argument("--adapt-model", action="store_true", help="online system-identification of the MPPI planning model")
     parser.add_argument("--sysid-history", type=int, default=12)
     parser.add_argument("--sysid-interval", type=int, default=8)
     parser.add_argument("--sysid-estimate-slope", action="store_true")
@@ -754,11 +697,6 @@ def main() -> None:
         control_dt=args.dt,
         lbps_delta=args.lbps_delta,
         nominal_refine_iterations=args.nominal_refine_iters,
-        spg_lookahead_steps=args.spg_lookahead,
-        spg_mix=args.spg_mix,
-        spg_null_std_scale=args.spg_null_std,
-        spg_pseudoinverse_damping=args.spg_damping,
-        sensitivity_epsilon_fraction=args.spg_epsilon,
         joint_noise_fraction=args.joint_noise,
         seed=args.seed,
         max_steps=args.max_steps,
@@ -769,8 +707,6 @@ def main() -> None:
         rollout_backend=args.rollout_backend,
         rollout_chunk_size=args.rollout_chunk_size,
         warm_start=args.warm_start,
-        spg_jacobian_refresh_interval=args.spg_refresh,
-        spg_jacobian_refresh_prefix=args.spg_refresh_prefix,
         planner_integrator=args.planner_integrator,
         planner_contact_mode=args.planner_contact_mode,
         profile_controller=args.profile,
@@ -780,7 +716,6 @@ def main() -> None:
         motor_scale=args.motor_scale,
         slope_deg=args.slope_deg,
         task=args.task,
-        push_object=args.push_object,
         terrain=args.terrain,
         terrain_seed=args.terrain_seed,
         terrain_scale=args.terrain_scale,
@@ -792,7 +727,6 @@ def main() -> None:
         box_height=args.box_height,
         box_mass=args.box_mass,
         box_friction=args.box_friction,
-        ball_rolling_friction=args.ball_rolling_friction,
         sled_distance=args.sled_distance,
         sled_length=args.sled_length,
         sled_width=args.sled_width,

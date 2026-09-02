@@ -19,6 +19,12 @@ from .rapid_locomotion import (
     RapidRewardConfig,
 )
 from .velocity_env import make_domain_randomizer, make_velocity_env, training_spec
+from .morphology_rewards import (
+    curriculum_config_for_robot,
+    domain_config_for_robot,
+    morphology_reward_profile,
+    reward_config_for_robot,
+)
 
 
 def _scalar_metrics(metrics: dict[str, Any]) -> dict[str, float]:
@@ -286,12 +292,14 @@ def train_policy(
     jax.config.update("jax_compilation_cache_dir", str(cache_path))
 
     ppo_cfg = RapidPPOConfig(num_envs=int(num_envs), total_timesteps=int(total_steps))
-    curriculum_cfg = RapidCurriculumConfig(
+    curriculum_cfg = curriculum_config_for_robot(
+        robot,
         phase_timesteps=max(1, int(phase_steps)),
         frontier_eval_seconds=float(frontier_eval_seconds),
     )
-    reward_cfg = RapidRewardConfig()
-    domain_cfg = RapidDomainRandomizationConfig()
+    reward_cfg = reward_config_for_robot(robot)
+    reward_profile = morphology_reward_profile(robot)
+    domain_cfg = domain_config_for_robot(robot)
     curriculum = GridAdaptiveCurriculum(curriculum_cfg)
     params = None
     full_training_state_bytes: bytes | None = None
@@ -304,6 +312,24 @@ def train_policy(
     curriculum_path = output / "curriculum.json"
     if resume and metadata_path.exists():
         old_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+        old_robot = str(old_meta.get("robot", "")).strip().lower().replace("-", "_")
+        requested_robot = str(robot).strip().lower().replace("-", "_")
+        if old_robot and old_robot != requested_robot:
+            raise ValueError(
+                f"Refusing to resume {requested_robot!r} from a {old_robot!r} checkpoint: {output}. "
+                "Use a separate output directory for each morphology."
+            )
+        old_profile = str(old_meta.get("reward_profile", {}).get("name", ""))
+        if requested_robot != "ant" and not old_profile:
+            raise ValueError(
+                f"Refusing to resume legacy {requested_robot!r} checkpoint {output}: "
+                "synthetic morphology/reward semantics changed. Start from a fresh output directory."
+            )
+        if old_profile and old_profile != reward_profile.name:
+            raise ValueError(
+                f"Checkpoint reward profile {old_profile!r} does not match current "
+                f"profile {reward_profile.name!r}; start a fresh checkpoint."
+            )
         completed_steps = int(old_meta.get("completed_steps", 0))
         phase_index = int(old_meta.get("completed_phases", 0))
         speed_stall_phases = int(old_meta.get("speed_stall_phases", 0))
@@ -360,7 +386,8 @@ def train_policy(
     print("JAX backend:", jax.default_backend())
     print("Devices:", jax.devices())
     print("JAX compilation cache:", cache_path)
-    print(f"Rapid-Locomotion-style training: robot={robot}, envs={num_envs}, impl={impl}")
+    print(f"Shared-PPO locomotion training: robot={robot}, envs={num_envs}, impl={impl}")
+    print(f"Reward profile: {reward_profile.name}")
     if until_failure:
         print(
             f"target=until straight-speed stall, curriculum phase={phase_steps:,} steps, "
@@ -535,9 +562,24 @@ def train_policy(
             print("curriculum: grid has no uncertified frontier left")
 
         metadata = {
-            "format": "racing_rapid_locomotion_policy_v2",
-            "paper": "Margolis et al., Rapid Locomotion via Reinforcement Learning",
+            "format": "racing_morphology_policy_v3",
+            "paper": (
+                "Margolis et al., Rapid Locomotion via Reinforcement Learning"
+                if str(robot) == "ant" else reward_profile.source
+            ),
             "robot": str(robot),
+            "reward_profile": {
+                "name": reward_profile.name,
+                "source": reward_profile.source,
+                "extra_terms": {
+                    "spin_progress": reward_profile.spin_progress,
+                    "spin_speed_limit": reward_profile.spin_speed_limit,
+                    "spin_speed_penalty": reward_profile.spin_speed_penalty,
+                    "lateral_slip": reward_profile.lateral_slip,
+                    "mechanical_power": reward_profile.mechanical_power,
+                    "spatial_curvature": reward_profile.spatial_curvature,
+                },
+            },
             "impl": str(impl),
             "observation_version": "rapid_v2",
             "observation_size": int(env.observation_size),
@@ -594,7 +636,8 @@ def train_policy(
                 "Grid curriculum is shared and updated between PPO phases using native-MuJoCo frontier evaluation.",
                 "Full Brax PPO TrainingState is preserved across phases and --resume, including Adam moments and observation-normalizer statistics.",
                 "Curriculum sampling uses a fixed-size command table plus an active mask so command-array shapes remain stable across phase expansion.",
-                "Mini-Cheetah-specific feet-air-time/collision topology terms are omitted for classic MuJoCo Ant/Humanoid.",
+                "Ant retains the Margolis reward scales; synthetic morphologies use published morphology-specific shaping while sharing the identical Brax PPO learner.",
+                "Spinner, snake, crawler, and biped each expose exactly eight learned actuator controls, matching Ant action dimension.",
                 "Policy actions are native normalized MuJoCo actuator controls, not PD joint-position targets.",
             ],
         }
@@ -639,9 +682,9 @@ def main() -> None:
     paper = RapidPPOConfig()
     curriculum = RapidCurriculumConfig()
     parser = argparse.ArgumentParser(
-        description="Train a Rapid-Locomotion-style high-speed Ant/Humanoid policy with MJX/Brax PPO"
+        description="Train Ant or an 8-action synthetic morphology with the same MJX/Brax PPO learner"
     )
-    parser.add_argument("--robot", choices=["ant", "humanoid"], default="ant")
+    parser.add_argument("--robot", choices=["ant", "spinner", "snake", "crawler", "biped"], default="ant")
     parser.add_argument("--output", default=None)
     parser.add_argument("--impl", choices=["warp", "jax"], default="warp")
     parser.add_argument("--num-envs", type=int, default=paper.num_envs)

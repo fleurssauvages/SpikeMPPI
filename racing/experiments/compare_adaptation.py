@@ -27,9 +27,9 @@ def _row(label, result):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare policy-only, fixed-model SPG-MPPI, and adaptive-model SPG-MPPI on the same perturbed MuJoCo plant"
+        description="Compare nominal policy, fixed-model MPPI, and adaptive-model MPPI on the same perturbed MuJoCo plant"
     )
-    parser.add_argument("--robot", choices=["ant", "humanoid"], default="ant")
+    parser.add_argument("--robot", choices=["ant"], default="ant")
     parser.add_argument("--policy", default="auto")
     parser.add_argument("--policy-speed", type=float, default=None)
     parser.add_argument("--rollouts", type=int, default=32)
@@ -60,25 +60,25 @@ def main() -> None:
         verbose=False,
     )
 
-    print("1/3 policy-only")
+    print("1/3 nominal policy")
     policy_only = run_race(
         **common,
-        variant=ControllerVariant.POLICY_NOMINAL,
+        variant=ControllerVariant.NOMINAL,
         num_rollouts=1,
         horizon=args.horizon,
     )
-    print("2/3 SPG-MPPI, fixed nominal model")
+    print("2/3 MPPI, fixed nominal model")
     fixed = run_race(
         **common,
-        variant=ControllerVariant.SPG_MPPI,
+        variant=ControllerVariant.MPPI,
         num_rollouts=args.rollouts,
         horizon=args.horizon,
         online_adaptation=False,
     )
-    print("3/3 SPG-MPPI, online model adaptation")
+    print("3/3 MPPI, online model adaptation")
     adaptive = run_race(
         **common,
-        variant=ControllerVariant.SPG_MPPI,
+        variant=ControllerVariant.MPPI,
         num_rollouts=args.rollouts,
         horizon=args.horizon,
         online_adaptation=True,
@@ -86,9 +86,9 @@ def main() -> None:
     )
 
     rows = [
-        _row("policy_only", policy_only),
-        _row("spg_fixed_model", fixed),
-        _row("spg_adaptive_model", adaptive),
+        _row("nominal", policy_only),
+        _row("mppi_fixed_model", fixed),
+        _row("mppi_adaptive_model", adaptive),
     ]
     fields = list(rows[0])
     out = Path(args.csv)

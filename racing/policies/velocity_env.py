@@ -6,10 +6,9 @@ The reward, 50 Hz control loop, 10 s command hold, push disturbances and
 (v_x, yaw-rate) curriculum follow the morphology-independent parts of
 Margolis et al., *Rapid Locomotion via Reinforcement Learning*.
 
-The classic MuJoCo Ant/Humanoid use direct actuator controls rather than the
-Mini Cheetah's joint-position/PD interface, so foot-air-time and collision
-terms that depend on the Mini-Cheetah contact topology are intentionally not
-copied verbatim.
+Ant keeps the Margolis-style reward.  Spinner, snake, crawler and biped keep the same
+PPO learner and command curriculum but add morphology-specific reward shaping
+adapted from published locomotion objectives; see morphology_rewards.py.
 """
 
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ from .rapid_locomotion import (
     RapidDomainRandomizationConfig,
     RapidRewardConfig,
 )
+from .morphology_rewards import morphology_reward_profile
 
 
 @dataclass(frozen=True)
@@ -39,10 +39,29 @@ SPECS: dict[str, VelocityTrainingSpec] = {
         min_root_up=0.15,
         ctrl_dt=0.02,  # 50 Hz, matching the paper controller rate.
     ),
-    "humanoid": VelocityTrainingSpec(
-        robot="humanoid",
-        healthy_height_fraction=0.55,
-        min_root_up=0.25,
+    "spinner": VelocityTrainingSpec(
+        robot="spinner",
+        healthy_height_fraction=0.30,
+        min_root_up=0.00,
+        ctrl_dt=0.02,
+    ),
+    "snake": VelocityTrainingSpec(
+        robot="snake",
+        healthy_height_fraction=0.20,
+        min_root_up=-0.20,
+        ctrl_dt=0.02,
+    ),
+    "crawler": VelocityTrainingSpec(
+        robot="crawler",
+        healthy_height_fraction=0.25,
+        min_root_up=0.00,
+        ctrl_dt=0.02,
+    ),
+    "biped": VelocityTrainingSpec(
+        robot="biped",
+        healthy_height_fraction=0.50,
+        # Koseki et al. terminate after about 80 degrees of body tilt; cos(80deg) ~= 0.17.
+        min_root_up=0.17,
         ctrl_dt=0.02,
     ),
 }
@@ -99,6 +118,7 @@ def make_velocity_env(
     curriculum = curriculum_config or RapidCurriculumConfig()
     rewards = reward_config or RapidRewardConfig()
     domain = domain_config or RapidDomainRandomizationConfig()
+    reward_profile = morphology_reward_profile(info.name)
     xml_path = classic_xml_path(info)
 
     if command_cells is None:
@@ -132,8 +152,8 @@ def make_velocity_env(
         def __init__(self):
             mj_model = mujoco.MjModel.from_xml_path(str(xml_path))
 
-            # MuJoCo-Warp does not support PGS.
-            # Humanoid uses PGS, so switch the in-memory training model to Newton.
+            # MuJoCo-Warp does not support PGS.  Keep source XMLs portable by
+            # switching any PGS model to Newton only for Warp training.
             if (
                 str(impl).strip().lower() == "warp"
                 and int(mj_model.opt.solver)
@@ -175,10 +195,34 @@ def make_velocity_env(
 
             qpos0 = np.asarray(self._mj_model.qpos0, dtype=np.float32)
             self._qpos0 = jp.asarray(qpos0)
-            self._initial_root_height = float(qpos0[2])
-            # Classic Ant/Humanoid both use a leading free joint.
-            self._joint_qpos_start = 7
-            self._joint_qvel_start = 6
+            root_free_joint = -1
+            for j in range(self._mj_model.njnt):
+                if (
+                    int(self._mj_model.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE)
+                    and int(self._mj_model.jnt_bodyid[j]) == self._root_body_id
+                ):
+                    root_free_joint = int(j)
+                    break
+            if root_free_joint < 0:
+                raise ValueError(f"{robot_name} root body does not own a free joint")
+            self._root_qpos_start = int(self._mj_model.jnt_qposadr[root_free_joint])
+            self._root_qvel_start = int(self._mj_model.jnt_dofadr[root_free_joint])
+            self._joint_qpos_start = self._root_qpos_start + 7
+            self._joint_qvel_start = self._root_qvel_start + 6
+            self._initial_root_height = float(qpos0[self._root_qpos_start + 2])
+
+            # Map actuator order to joint coordinates.  Snake includes passive
+            # wheel axles; regularizers should operate only on the eight learned
+            # actuator DoFs, not on those passive coordinates.
+            actuator_joint_ids = np.asarray(self._mj_model.actuator_trnid[:, 0], dtype=np.int32)
+            if np.any(actuator_joint_ids < 0):
+                raise ValueError(f"{robot_name} requires joint-transmission actuators")
+            self._actuated_qpos_indices = jp.asarray(
+                np.asarray([self._mj_model.jnt_qposadr[j] for j in actuator_joint_ids], dtype=np.int32)
+            )
+            self._actuated_qvel_indices = jp.asarray(
+                np.asarray([self._mj_model.jnt_dofadr[j] for j in actuator_joint_ids], dtype=np.int32)
+            )
 
             limited = np.asarray(self._mj_model.actuator_ctrllimited, dtype=bool)
             ranges = np.asarray(self._mj_model.actuator_ctrlrange, dtype=np.float32)
@@ -248,8 +292,9 @@ def make_velocity_env(
 
         def _body_motion(self, data):
             rot = self._root_rotation(data)
-            body_linear = rot.T @ data.qvel[:3]
-            body_angular = rot.T @ data.qvel[3:6]
+            root_vel = data.qvel[self._root_qvel_start:self._root_qvel_start + 6]
+            body_linear = rot.T @ root_vel[:3]
+            body_angular = rot.T @ root_vel[3:6]
             return body_linear, body_angular
 
         def _projected_gravity(self, data):
@@ -291,7 +336,7 @@ def make_velocity_env(
                         maxval=1.0,
                     )
                 )
-            qpos = qpos.at[2].add(0.01 * jax.random.normal(rng_q))
+            qpos = qpos.at[self._root_qpos_start + 2].add(0.01 * jax.random.normal(rng_q))
             # The released rapid-locomotion code initializes base velocity in
             # roughly [-0.5, 0.5]; use the same scale for all generalized vels.
             qvel = jax.random.uniform(
@@ -323,9 +368,17 @@ def make_velocity_env(
                 "tracking_ang_vel_per_step": jp.zeros(()),
                 "lin_vel_z_penalty_per_step": jp.zeros(()),
                 "ang_vel_xy_penalty_per_step": jp.zeros(()),
+                "orientation_penalty_per_step": jp.zeros(()),
                 "torque_penalty_per_step": jp.zeros(()),
                 "dof_acc_penalty_per_step": jp.zeros(()),
                 "action_rate_penalty_per_step": jp.zeros(()),
+                "morph_spin_progress_per_step": jp.zeros(()),
+                "morph_spin_speed_excess_per_step": jp.zeros(()),
+                "morph_lateral_slip_per_step": jp.zeros(()),
+                "morph_mechanical_power_per_step": jp.zeros(()),
+                "morph_spatial_curvature_per_step": jp.zeros(()),
+                "morph_upright_support_per_step": jp.zeros(()),
+                "morph_height_deviation_per_step": jp.zeros(()),
             }
             obs = self._get_obs(data, command, previous_action)
             return mjx_env.State(data, obs, jp.zeros(()), jp.zeros(()), metrics, info_dict)
@@ -357,7 +410,9 @@ def make_velocity_env(
 
             lin_vel_z_cost = body_linear[2] ** 2
             ang_vel_xy_cost = jp.sum(body_angular[:2] ** 2)
-            # Classic Ant/Humanoid motor actuators expose actuator_force.  This
+            projected_gravity = self._projected_gravity(data)
+            orientation_cost = jp.sum(projected_gravity[:2] ** 2)
+            # MuJoCo motor actuators expose actuator_force.  This
             # is the closest native-MuJoCo counterpart to the paper's torque term.
             torque_cost = jp.sum(data.actuator_force ** 2)
             joint_vel = data.qvel[self._joint_qvel_start:]
@@ -365,14 +420,68 @@ def make_velocity_env(
             dof_acc_cost = jp.sum(dof_acc ** 2)
             action_rate_cost = jp.sum((action - state.info["previous_action"]) ** 2)
 
+            # Morphology-specific terms.  The branch is static at trace time, so
+            # it adds no dynamic Python control flow inside the JIT.
+            actuated_pos = data.qpos[self._actuated_qpos_indices]
+            actuated_vel = data.qvel[self._actuated_qvel_indices]
+            spin_progress = jp.zeros(())
+            spin_speed_excess = jp.zeros(())
+            lateral_slip_cost = body_linear[1] ** 2
+            mechanical_power_cost = jp.mean(jp.abs(data.actuator_force * actuated_vel))
+            spatial_curvature_cost = jp.zeros(())
+            upright_support = jp.zeros(())
+            height_deviation_cost = jp.zeros(())
+            if spec.robot == "spinner":
+                spin_vel = actuated_vel[jp.asarray([0, 2, 4, 6])]
+                spin_activity = jp.tanh(jp.mean(jp.abs(spin_vel)) / 4.0)
+                spin_progress = r_lin * spin_activity
+                excess = jp.maximum(jp.abs(spin_vel) - float(reward_profile.spin_speed_limit), 0.0)
+                spin_speed_excess = jp.mean(excess ** 2)
+            elif spec.robot == "snake":
+                # Baysal & Altas explicitly combine reference-speed accuracy
+                # with mechanical power.  The passive wheel axles make lateral
+                # undulation physically useful without forcing a hand-coded gait.
+                pass
+            elif spec.robot == "crawler":
+                # Mishra et al. regularize strain gradients along a crawler.
+                # Apply the same discrete second-difference idea to each row of
+                # four paddles, encouraging a propagating rather than jerky gait.
+                left = actuated_pos[:4]
+                right = actuated_pos[4:]
+                left_second = left[2:] - 2.0 * left[1:-1] + left[:-2]
+                right_second = right[2:] - 2.0 * right[1:-1] + right[:-2]
+                spatial_curvature_cost = 0.5 * (
+                    jp.mean(left_second ** 2) + jp.mean(right_second ** 2)
+                )
+            elif spec.robot == "biped":
+                # Koseki et al. use alive/support terms to keep a passive-dynamic
+                # biped upright while rewarding forward locomotion.  Modern biped
+                # RL also regularizes base height/orientation and joint power.
+                root_up = data.xmat[self._root_body_id, 2, 2]
+                root_height = data.xpos[self._root_body_id, 2]
+                height_error = root_height - float(self._initial_root_height)
+                height_deviation_cost = height_error ** 2
+                upright_support = (
+                    jp.clip(root_up, 0.0, 1.0)
+                    * jp.exp(-(height_error / 0.12) ** 2)
+                )
+
             reward = self.dt * (
                 float(rewards.tracking_lin_vel) * r_lin
                 + float(rewards.tracking_ang_vel) * r_yaw
                 + float(rewards.lin_vel_z) * lin_vel_z_cost
                 + float(rewards.ang_vel_xy) * ang_vel_xy_cost
+                + float(rewards.orientation) * orientation_cost
                 + float(rewards.torques) * torque_cost
                 + float(rewards.dof_acc) * dof_acc_cost
                 + float(rewards.action_rate) * action_rate_cost
+                + float(reward_profile.spin_progress) * spin_progress
+                + float(reward_profile.spin_speed_penalty) * spin_speed_excess
+                + float(reward_profile.lateral_slip) * lateral_slip_cost
+                + float(reward_profile.mechanical_power) * mechanical_power_cost
+                + float(reward_profile.spatial_curvature) * spatial_curvature_cost
+                + float(reward_profile.upright_support) * upright_support
+                + float(reward_profile.height_deviation) * height_deviation_cost
             )
             if rewards.only_positive_rewards:
                 reward = jp.maximum(reward, 0.0)
@@ -405,9 +514,17 @@ def make_velocity_env(
                 "tracking_ang_vel_per_step": r_yaw,
                 "lin_vel_z_penalty_per_step": lin_vel_z_cost,
                 "ang_vel_xy_penalty_per_step": ang_vel_xy_cost,
+                "orientation_penalty_per_step": orientation_cost,
                 "torque_penalty_per_step": torque_cost,
                 "dof_acc_penalty_per_step": dof_acc_cost,
                 "action_rate_penalty_per_step": action_rate_cost,
+                "morph_spin_progress_per_step": spin_progress,
+                "morph_spin_speed_excess_per_step": spin_speed_excess,
+                "morph_lateral_slip_per_step": lateral_slip_cost,
+                "morph_mechanical_power_per_step": mechanical_power_cost,
+                "morph_spatial_curvature_per_step": spatial_curvature_cost,
+                "morph_upright_support_per_step": upright_support,
+                "morph_height_deviation_per_step": height_deviation_cost,
             })
             obs = self._get_obs(data, next_command, action)
             return mjx_env.State(data, obs, reward, done, metrics, info_dict)

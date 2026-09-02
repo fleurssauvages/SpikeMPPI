@@ -127,6 +127,12 @@ class ClassicRobot:
             mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, self.root_body_id)
             or f"body_{self.root_body_id}"
         )
+        self._root_geom_mask = np.asarray(
+            self.model.geom_bodyid == int(self.root_body_id), dtype=bool
+        )
+        self._ground_geom_mask = np.zeros(int(self.model.ngeom), dtype=bool)
+        if len(self._ground_geom_ids):
+            self._ground_geom_mask[self._ground_geom_ids] = True
         self.initial_root_height = float(self.data.xpos[self.root_body_id, 2])
         self.default_ctrl = self._default_ctrl()
         self._task_body_id = int(self.root_body_id)
@@ -410,6 +416,33 @@ class ClassicRobot:
         d = self.data if data is None else data
         mat = np.asarray(d.xmat[self.root_body_id], dtype=np.float64).reshape(3, 3)
         return float(mat[2, 2])
+
+    def torso_touching_ground(self, data=None) -> bool:
+        """Return True only for an actual torso-ground MuJoCo contact.
+
+        The torso is defined as any geom attached directly to the free root body.
+        Ground includes the model floor plane and injected race terrain geoms.
+        Contacts with obstacles or other robot limbs do not count as ground contact.
+        """
+        d = self.data if data is None else data
+        if int(d.ncon) <= 0 or not np.any(self._root_geom_mask) or not np.any(self._ground_geom_mask):
+            return False
+        for i in range(int(d.ncon)):
+            contact = d.contact[i]
+            g1 = int(contact.geom1)
+            g2 = int(contact.geom2)
+            if g1 < 0 or g2 < 0:
+                continue
+            if (self._root_geom_mask[g1] and self._ground_geom_mask[g2]) or (
+                self._root_geom_mask[g2] and self._ground_geom_mask[g1]
+            ):
+                return True
+        return False
+
+    def has_fallen(self, data=None, *, flipped_threshold: float = 0.0) -> bool:
+        """Ant is fallen only when flipped *and* its torso contacts ground."""
+        d = self.data if data is None else data
+        return self.root_up(d) < float(flipped_threshold) and self.torso_touching_ground(d)
 
     def root_yaw(self, data=None) -> float:
         d = self.data if data is None else data

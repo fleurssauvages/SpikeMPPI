@@ -572,7 +572,7 @@ def build_push_object_worldbody_xml(
     body.set("pos", _fmt([p[0], p[1], half_z + 0.004]))
     body.set("quat", _fmt(_quat_ypr(yaw)))
 
-    # Classic Ant/Humanoid models compile body inertia from geoms.  Override
+    # Ant compiles body inertia from geoms.  Override
     # density explicitly so --box-mass remains exact under inertiafromgeom=true.
     volume = float(size) * float(size) * float(height)
     density = float(mass) / max(volume, 1e-12)

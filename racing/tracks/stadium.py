@@ -11,7 +11,7 @@ class StadiumTrack:
 
     The canonical track is transformed so that ``start_s`` is exactly at
     ``origin_xy`` and its tangent is aligned with ``origin_yaw``. This lets
-    every classic robot keep its own native reset pose while racing on the
+    Ant keep its native reset pose while racing on the
     same geometric track.
     """
 

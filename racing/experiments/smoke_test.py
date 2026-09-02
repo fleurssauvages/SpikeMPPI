@@ -10,7 +10,7 @@ from racing.policies import make_policy
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--robot", default="ant")
+    parser.add_argument("--robot", default="ant", choices=["ant"])
     parser.add_argument("--policy", default="default")
     args = parser.parse_args()
     robot = make_robot(args.robot)

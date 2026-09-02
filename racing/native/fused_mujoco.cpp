@@ -179,6 +179,39 @@ class FusedRolloutEvaluator {
     }
 
     nstate_ = mj_stateSize(model_, mjSTATE_FULLPHYSICS);
+
+    // Cache the torso (free-root-body) geoms and all ground/terrain geoms so
+    // the fused evaluator can use the same exact fall rule as the real race:
+    // inverted torso AND an actual torso-ground contact pair.
+    root_body_id_ = -1;
+    for (int j = 0; j < model_->njnt; ++j) {
+      if (model_->jnt_type[j] == mjJNT_FREE &&
+          model_->jnt_qposadr[j] == root_qadr_) {
+        root_body_id_ = model_->jnt_bodyid[j];
+        break;
+      }
+    }
+    if (root_body_id_ < 0) {
+      throw std::runtime_error("could not identify free-root body for fall contact test");
+    }
+    root_geom_mask_.assign(model_->ngeom, 0);
+    ground_geom_mask_.assign(model_->ngeom, 0);
+    for (int g = 0; g < model_->ngeom; ++g) {
+      if (model_->geom_bodyid[g] == root_body_id_) {
+        root_geom_mask_[g] = 1;
+      }
+      bool is_ground = model_->geom_type[g] == mjGEOM_PLANE;
+      const char* geom_name = mj_id2name(model_, mjOBJ_GEOM, g);
+      if (geom_name) {
+        const std::string name(geom_name);
+        is_ground = is_ground || name == "floor" ||
+                    name.rfind("race_terrain_", 0) == 0;
+      }
+      if (is_ground) {
+        ground_geom_mask_[g] = 1;
+      }
+    }
+
     ctrl_low_.resize(model_->nu, -1.0);
     ctrl_high_.resize(model_->nu, 1.0);
     fd_epsilon_scale_.resize(model_->nu, 1.0);
@@ -643,6 +676,22 @@ class FusedRolloutEvaluator {
   int chunk_size() const { return chunk_size_; }
 
  private:
+  bool TorsoTouchingGround(const mjData* d) const {
+    for (int i = 0; i < d->ncon; ++i) {
+      const mjContact& c = d->contact[i];
+      const int g1 = c.geom1;
+      const int g2 = c.geom2;
+      if (g1 < 0 || g2 < 0 || g1 >= model_->ngeom || g2 >= model_->ngeom) {
+        continue;
+      }
+      if ((root_geom_mask_[g1] && ground_geom_mask_[g2]) ||
+          (root_geom_mask_[g2] && ground_geom_mask_[g1])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void CleanupData() {
     for (mjData* d : data_) {
       if (d) {
@@ -939,9 +988,9 @@ class FusedRolloutEvaluator {
         }
       }
 
+      const bool fell = (up < j.min_up) && TorsoTouchingGround(d);
       if (best_d2 > j.allowed_sq || root_d2 > j.allowed_sq ||
-          z < j.min_height || up < j.min_up ||
-          d->time <= prev_time + 1e-15) {
+          fell || d->time <= prev_time + 1e-15) {
         failed = true;
         break;
       }
@@ -1020,6 +1069,9 @@ class FusedRolloutEvaluator {
   int task_qadr_ = 0;
   int chunk_size_ = 1;
   int nstate_ = 0;
+  int root_body_id_ = -1;
+  std::vector<unsigned char> root_geom_mask_;
+  std::vector<unsigned char> ground_geom_mask_;
   std::vector<double> ctrl_low_;
   std::vector<double> ctrl_high_;
   std::vector<double> fd_epsilon_scale_;

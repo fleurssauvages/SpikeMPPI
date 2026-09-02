@@ -298,11 +298,14 @@ def stadium_rollout_cost_from_states(
                 task_z = initial_task_height
                 task_up = 1.0
 
+            # Packed FULLPHYSICS state does not contain MuJoCo contact pairs.
+            # The stock/Numba fallback therefore uses low root height only as a
+            # contact proxy, but still requires the torso to be inverted too.
+            fell_proxy = (up < min_up) and (z < min_height)
             if (
                 best_d2 > allowed_sq
                 or root_d2 > allowed_sq
-                or z < min_height
-                or up < min_up
+                or fell_proxy
                 or (rq != tq and task_z > initial_task_height + box_max_lift)
                 or (rq != tq and task_up < box_min_up)
                 or sim_time <= prev_time + 1e-15

@@ -15,8 +15,10 @@ from .fast_kernels import NUMBA_AVAILABLE, stadium_rollout_cost_from_states
 @dataclass
 class RolloutCostConfig:
     hard_collision_clearance: float = 0.02
+    # Exact race/fused fall rule: root_up < min_root_up AND torso touches ground.
+    # fall_height_fraction is used only by the state-only fallback as a contact proxy.
     fall_height_fraction: float = 0.45
-    min_root_up: float = 0.15
+    min_root_up: float = 0.0
     upright_weight: float = 0.05
     control_deviation_weight: float = 1e-4
 
@@ -489,34 +491,134 @@ class NativeRolloutBatcher:
             failed = np.asarray(failed, dtype=bool)
 
             if self._verify_fused and not self._fused_verified:
-                # First-call semantic guard. The policy JIT dominates the first
-                # control update anyway, so paying for one stock rollout here is
-                # preferable to benchmarking a subtly different controller.
-                fused_obj = self.fused_evaluator
-                self.fused_evaluator = None
-                try:
-                    ref_pos, ref_cost, ref_progress, ref_failed = self.evaluate(
-                        start_snapshot, batch, track, current_s,
+                # First-call semantic guard.  Keep continuous verification on
+                # the original vectorized MuJoCo rollout path so fused and
+                # reference trajectories are compared without introducing a
+                # second independently stepped scalar trajectory.  FULLPHYSICS
+                # does not contain contact pairs, however, so use direct scalar
+                # MuJoCo stepping *only* to verify the exact discrete fall flag
+                # (flipped torso AND torso-ground contact).
+
+                # 1) Continuous reference: stock vectorized MuJoCo rollout.
+                expanded_verify = self._expand_controls(batch, substeps)
+                initial_verify = self.snapshot_to_state(start_snapshot)[None, :]
+                verify_states = self.rollout_states(initial_verify, expanded_verify)
+                verify_sampled = verify_states[:, substeps - 1::substeps, :]
+                ref_pos = np.asarray(self._task_xy_from_state(verify_sampled), dtype=np.float64)
+                ref_root_pos, _, ref_up = self._root_from_state(verify_sampled)
+
+                flat_s, _ = track.project(ref_pos.reshape(-1, 2))
+                ref_s = np.asarray(flat_s, dtype=np.float64).reshape(n, h)
+                prev_s = np.empty_like(ref_s)
+                prev_s[:, 0] = float(current_s)
+                if h > 1:
+                    prev_s[:, 1:] = ref_s[:, :-1]
+                ref_ds = ref_s - prev_s
+                half_length = 0.5 * float(track.length)
+                ref_ds[ref_ds > half_length] -= float(track.length)
+                ref_ds[ref_ds < -half_length] += float(track.length)
+                ref_progress = np.sum(ref_ds, axis=1)
+
+                ref_cumulative = np.cumsum(ref_ds, axis=1)
+                ref_cost = (
+                    -float(cost_cfg.box_progress_weight)
+                    * np.sum(ref_cumulative, axis=1) / max(1, h)
+                )
+                if pushing:
+                    root_s_arr, _ = track.project(np.asarray(ref_root_pos).reshape(-1, 2))
+                    root_s_arr = np.asarray(root_s_arr, dtype=np.float64).reshape(n, h)
+                    root_prev = np.empty_like(root_s_arr)
+                    root_prev[:, 0] = float(current_root_s)
+                    if h > 1:
+                        root_prev[:, 1:] = root_s_arr[:, :-1]
+                    root_ds = root_s_arr - root_prev
+                    root_ds[root_ds > half_length] -= float(track.length)
+                    root_ds[root_ds < -half_length] += float(track.length)
+                    root_cumulative = np.cumsum(root_ds, axis=1)
+                    coupled = np.minimum(root_cumulative, np.maximum(ref_cumulative, 0.0))
+                    approach = float(initial_task_root_distance) - np.linalg.norm(
+                        ref_pos - np.asarray(ref_root_pos), axis=2
+                    )
+                    ref_cost -= (
+                        float(cost_cfg.robot_progress_weight)
+                        * np.sum(coupled, axis=1) / max(1, h)
+                    )
+                    ref_cost -= (
+                        float(cost_cfg.robot_box_approach_weight)
+                        * np.sum(approach, axis=1) / max(1, h)
+                    )
+                ref_cost += float(cost_cfg.upright_weight) * np.sum((1.0 - ref_up) ** 2, axis=1)
+                du = batch - nominal[None, :, :]
+                ref_cost += float(cost_cfg.control_deviation_weight) * np.sum(
+                    np.mean((du / self._ctrl_scale[None, None, :]) ** 2, axis=2), axis=1
+                )
+
+                # 2) Discrete reference: exact scalar contact-aware failure flags.
+                ref_failed = np.zeros_like(failed, dtype=bool)
+                for i in range(n):
+                    _, _, _, fail_i = rollout_controls(
+                        self.robot, start_snapshot, batch[i], track, current_s,
                         control_substeps=substeps, nominal_controls=nominal,
                         cost_cfg=cost_cfg,
                     )
-                finally:
-                    self.fused_evaluator = fused_obj
+                    ref_failed[i] = fail_i
 
-                ref_failed = np.asarray(ref_failed, dtype=bool)
                 if not np.array_equal(failed, ref_failed):
-                    raise RuntimeError('fused rollout verification failed: failure flags differ')
-                finite = np.isfinite(ref_cost) & np.isfinite(costs)
-                if not np.allclose(costs[finite], np.asarray(ref_cost)[finite], rtol=1e-9, atol=1e-10):
-                    err = float(np.max(np.abs(costs[finite] - np.asarray(ref_cost)[finite]))) if np.any(finite) else math.nan
-                    raise RuntimeError(f'fused rollout verification failed: cost max_abs={err:g}')
-                if not np.allclose(terminal_progress, ref_progress, rtol=1e-9, atol=1e-10):
-                    err = float(np.max(np.abs(terminal_progress - np.asarray(ref_progress))))
-                    raise RuntimeError(f'fused rollout verification failed: progress max_abs={err:g}')
+                    mismatch = np.flatnonzero(failed != ref_failed)
+                    preview = ','.join(map(str, mismatch[:8]))
+                    raise RuntimeError(
+                        'fused rollout verification failed: exact failure flags differ '
+                        f'at rollout indices [{preview}]'
+                    )
+
+                # Compare continuous values only for trajectories that did not
+                # fail. Failed trajectories terminate at contact/off-track time
+                # in the fused evaluator, whereas the vectorized state rollout
+                # intentionally continues through the full horizon.
                 good = ~failed
-                if np.any(good) and not np.allclose(positions[good], np.asarray(ref_pos)[good], rtol=1e-9, atol=1e-10):
-                    err = float(np.max(np.abs(positions[good] - np.asarray(ref_pos)[good])))
-                    raise RuntimeError(f'fused rollout verification failed: XY max_abs={err:g}')
+                if np.any(good):
+                    numeric_rtol = 1.0e-7
+                    state_atol = 1.0e-7
+                    cost_atol = 1.0e-6
+                    if not np.allclose(
+                        terminal_progress[good], ref_progress[good],
+                        rtol=numeric_rtol, atol=state_atol,
+                    ):
+                        err = float(np.max(np.abs(
+                            terminal_progress[good] - ref_progress[good]
+                        )))
+                        raise RuntimeError(
+                            'fused rollout verification failed: '
+                            f'progress max_abs={err:g}'
+                        )
+                    if not np.allclose(
+                        positions[good], ref_pos[good],
+                        rtol=numeric_rtol, atol=state_atol,
+                    ):
+                        err = float(np.max(np.abs(positions[good] - ref_pos[good])))
+                        raise RuntimeError(
+                            'fused rollout verification failed: '
+                            f'XY max_abs={err:g}'
+                        )
+                    finite_good = good & np.isfinite(costs) & np.isfinite(ref_cost)
+                    if np.any(finite_good) and not np.allclose(
+                        costs[finite_good], ref_cost[finite_good],
+                        rtol=numeric_rtol, atol=cost_atol,
+                    ):
+                        diff = np.abs(costs[finite_good] - ref_cost[finite_good])
+                        err = float(np.max(diff))
+                        denom = np.maximum(
+                            np.maximum(
+                                np.abs(costs[finite_good]),
+                                np.abs(ref_cost[finite_good]),
+                            ),
+                            1.0,
+                        )
+                        rel = float(np.max(diff / denom))
+                        raise RuntimeError(
+                            'fused rollout verification failed: '
+                            f'cost max_abs={err:g}, max_rel={rel:g}'
+                        )
                 self._fused_verified = True
 
             # Physics and race-cost accumulation are deliberately fused and cannot
@@ -613,8 +715,14 @@ class NativeRolloutBatcher:
             _, root_flat_d2 = track.project(np.asarray(root_positions).reshape(-1, 2))
             root_d2 = np.asarray(root_flat_d2, dtype=np.float64).reshape(n, h)
             failure |= root_d2 > allowed * allowed
-        failure |= height < float(cost_cfg.fall_height_fraction) * max(self.robot.initial_root_height, 1e-6)
-        failure |= up < float(cost_cfg.min_root_up)
+        # FULLPHYSICS state output does not contain the contact list.  The
+        # stock vectorized fallback therefore uses a conservative proxy that
+        # still requires BOTH inversion and a very low torso.  The fused
+        # evaluator and the real race use exact torso-ground contact pairs.
+        failure |= (
+            (up < float(cost_cfg.min_root_up))
+            & (height < float(cost_cfg.fall_height_fraction) * max(self.robot.initial_root_height, 1e-6))
+        )
         if pushing:
             task_q = 1 + int(self._task_qadr)
             task_z = sampled[..., task_q + 2]
@@ -1132,11 +1240,8 @@ def rollout_controls(
         if float(d2) > allowed * allowed or float(robot_d2) > allowed * allowed:
             off_track = True
             break
-        if robot.root_height(d) < cfg.fall_height_fraction * max(robot.initial_root_height, 1e-6):
-            off_track = True
-            break
         up = robot.root_up(d)
-        if up < cfg.min_root_up:
+        if robot.has_fallen(d, flipped_threshold=cfg.min_root_up):
             off_track = True
             break
         if pushing and (

@@ -11,7 +11,7 @@ from racing.tracks import close_viewer, launch_minimal_viewer, safe_viewer_sync
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visual high-speed policy test without MPPI")
-    parser.add_argument("--robot", default="ant", choices=["ant", "humanoid"])
+    parser.add_argument("--robot", default="ant", choices=["ant", "spinner", "snake", "crawler", "biped"])
     parser.add_argument("--policy", required=True, help="checkpoint directory")
     parser.add_argument("--segment-seconds", type=float, default=3.0)
     parser.add_argument("--max-speed", type=float, default=None, help="optional visualization speed cap")
@@ -61,9 +61,11 @@ def main() -> None:
                     if not safe_viewer_sync(handle, state_only=True):
                         handle = None
                     time.sleep(max(0.0, 0.25 * policy.control_dt))
+                from racing.policies.velocity_env import training_spec
+                spec = training_spec(robot.name)
                 if (
-                    robot.root_height() < 0.35 * robot.initial_root_height
-                    or robot.root_up() < 0.1
+                    robot.root_height() < float(spec.healthy_height_fraction) * robot.initial_root_height
+                    or robot.root_up() < float(spec.min_root_up)
                 ):
                     print("robot fell; ending test")
                     return

@@ -129,7 +129,7 @@ def _measure(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark obstacle-sensitive MPPI rollouts")
-    parser.add_argument("--robot", default="ant")
+    parser.add_argument("--robot", default="ant", choices=["ant"])
     parser.add_argument("--scene", choices=["all", *SCENES], default="all")
     parser.add_argument("--backend", choices=["all", "native", "fused"], default="all")
     parser.add_argument("--rollouts", type=int, default=32)

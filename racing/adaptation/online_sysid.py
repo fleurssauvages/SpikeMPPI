@@ -71,7 +71,7 @@ class OnlineSystemIdentifier:
         pred = self.robot.snapshot(d)
         obs = transition.after
 
-        # qpos[0:3] is the free-root world position for Ant/Humanoid.
+        # qpos[0:3] is the Ant free-root world position.
         root_xy = float(np.mean((pred.qpos[:2] - obs.qpos[:2]) ** 2))
         root_z = float((pred.qpos[2] - obs.qpos[2]) ** 2)
         vel_scale = np.maximum(1.0, np.abs(obs.qvel))

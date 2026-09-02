@@ -10,9 +10,9 @@ This module ports the parts of Margolis et al. that are morphology independent:
 * the paper's dynamics-randomization ranges as metadata.
 
 The original paper targets the MIT Mini Cheetah with position targets and a PD
-loop.  This project targets the classic MuJoCo Ant/Humanoid and directly emits
-native MuJoCo actuator controls, so Mini-Cheetah-specific foot/contact terms are
-not copied blindly.
+loop.  This project retains those settings for Ant and reuses the same PPO
+configuration for the synthetic spinner/snake/crawler/biped suite.  Morphology-specific
+reward additions live in morphology_rewards.py.
 """
 
 from dataclasses import asdict, dataclass, replace

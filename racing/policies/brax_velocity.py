@@ -11,7 +11,9 @@ from .base import JointPolicy
 def body_motion_numpy(robot, data) -> tuple[np.ndarray, np.ndarray]:
     rot = np.asarray(data.xmat[robot.root_body_id], dtype=np.float64).reshape(3, 3)
     qvel = np.asarray(data.qvel, dtype=np.float64)
-    return rot.T @ qvel[:3], rot.T @ qvel[3:6]
+    qv0 = int(getattr(robot, "root_dof_adr", 0))
+    root_vel = qvel[qv0:qv0 + 6]
+    return rot.T @ root_vel[:3], rot.T @ root_vel[3:6]
 
 
 def rapid_observation_numpy(
@@ -29,13 +31,15 @@ def rapid_observation_numpy(
     qpos0 = np.asarray(robot.model.qpos0, dtype=np.float64)
     qpos_end = int(getattr(robot, "robot_nq", qpos.shape[0]))
     qvel_end = int(getattr(robot, "robot_nv", qvel.shape[0]))
+    qpos_start = int(getattr(robot, "root_qpos_adr", 0)) + 7
+    qvel_start = int(getattr(robot, "root_dof_adr", 0)) + 6
     return np.concatenate([
         body_linear,
         body_angular,
         projected_gravity,
         np.asarray(command, dtype=np.float64).reshape(3),
-        qpos[7:qpos_end] - qpos0[7:qpos_end],
-        qvel[6:qvel_end],
+        qpos[qpos_start:qpos_end] - qpos0[qpos_start:qpos_end],
+        qvel[qvel_start:qvel_end],
         np.asarray(previous_action, dtype=np.float64).reshape(robot.nu),
     ]).astype(np.float32, copy=False)
 
