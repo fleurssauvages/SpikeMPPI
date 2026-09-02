@@ -3,7 +3,7 @@
 /mujoco_playground
 .pyc*
 /racing/__pycache__
-/racing/adaption/__pycache__
+/racing/adaptation/__pycache__
 /racing/experiments/__pycache__
 /racing/mppi/__pycache__
 /racing/policies/__pycache__
