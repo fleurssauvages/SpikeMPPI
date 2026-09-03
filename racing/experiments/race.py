@@ -30,7 +30,7 @@ class RaceResult:
     controller_variant: str
     control_dt: float
     plant_integrator: str
-    planner_integrator: str
+    planner_mode: str
     xy: np.ndarray
     target_xy: np.ndarray
     qpos: np.ndarray
@@ -73,12 +73,10 @@ def run_race(
     viewer_ui: bool = False,
     controller_overlay: bool = False,
     rollout_workers: int = 16,
-    rollout_backend: str = "auto",
     rollout_chunk_size: int = 0,
     warm_start: bool = True,
     plant_integrator: str = "model",
-    planner_integrator: str = "model",
-    planner_contact_mode: str = "model",
+    planner_mode: str = "rk4",
     profile_controller: bool = False,
     disable_gc: bool = False,
     verbose: bool = True,
@@ -123,7 +121,8 @@ def run_race(
     ``plant`` is the rendered/physical environment and may be configured with
     fixed test-time perturbations. Known task/terrain/morphology changes are also
     compiled into ``planner``. Plant and planner integrators are selectable
-    independently; both remain fixed for the duration of a run.
+    independently; both remain fixed for the duration of a run. Planner mode
+    also selects the matching contact-solver profile.
     """
     # Build the track from the untouched robot reset pose, then compile task/terrain
     # additions into both plant and planner models.  PPO remains a flat-ground
@@ -202,15 +201,29 @@ def run_race(
     plant.apply_model_parameters(plant_params)
     planner.apply_model_parameters(ModelParameterScales())
 
-    # Plant and planner integrators can be selected independently. ``model``
-    # preserves the integrator compiled from the source XML.
+    # Resolve the controller period before configuring planner physics.  The
+    # fast-rk4 planner deliberately takes one RK4 step per control interval,
+    # whereas rk4/implicitfast retain the source model timestep.
+    prior = prior or GeometricPrior()
+    policy = make_policy(policy_spec, race_speed=policy_speed, robot_name=robot_name)
+    if control_dt is None:
+        control_dt = float(getattr(policy, "control_dt", 0.02))
+    control_dt = float(control_dt)
+    if control_dt <= 0.0:
+        raise ValueError("control_dt must be positive")
+
+    # Plant integrator remains independent. Planner physics is intentionally
+    # fused into one mode so integrator, timestep, and contact profile cannot drift:
+    #   rk4          -> RK4 + source timestep + source solver/contact settings
+    #   fast-rk4     -> RK4 + one step/control + fast solver/contact profile
+    #   implicitfast -> implicitfast + source timestep + the same fast profile
     integrator_names = {"model", "euler", "implicitfast"}
     plant_integrator = str(plant_integrator).strip().lower()
-    planner_integrator = str(planner_integrator).strip().lower()
+    planner_mode = str(planner_mode).strip().lower()
     if plant_integrator not in integrator_names:
         raise ValueError("plant_integrator must be model, euler, or implicitfast")
-    if planner_integrator not in integrator_names:
-        raise ValueError("planner_integrator must be model, euler, or implicitfast")
+    if planner_mode not in {"rk4", "fast-rk4", "implicitfast"}:
+        raise ValueError("planner_mode must be rk4, fast-rk4, or implicitfast")
     integrator_map = {
         "euler": plant.mujoco.mjtIntegrator.mjINT_EULER,
         "implicitfast": plant.mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
@@ -218,27 +231,38 @@ def run_race(
     if plant_integrator != "model":
         plant.model.opt.integrator = integrator_map[plant_integrator]
         plant.mujoco.mj_forward(plant.model, plant.data)
-    if planner_integrator != "model":
-        planner.model.opt.integrator = integrator_map[planner_integrator]
-    planner_contact_mode = str(planner_contact_mode).strip().lower()
-    if planner_contact_mode not in {"model", "fast"}:
-        raise ValueError("planner_contact_mode must be model or fast")
-    if planner_contact_mode == "fast":
-        # MPC only needs candidates ranked consistently over a short horizon.
-        # Capping the contact solve is especially valuable once terrain or
-        # dynamic objects create many simultaneous constraints. The rendered
-        # plant keeps the original, higher-fidelity settings.
+
+    # The plant must always advance exactly one control interval, independently
+    # of the planner timestep/substep count.
+    plant_ratio = control_dt / max(float(plant.physics_dt), 1e-12)
+    plant_control_substeps = max(1, int(round(plant_ratio)))
+    plant_actual_dt = plant_control_substeps * float(plant.physics_dt)
+    if abs(plant_actual_dt - control_dt) > 0.25 * float(plant.physics_dt):
+        raise ValueError(
+            f"control_dt={control_dt:g} is not close to an integer multiple of plant "
+            f"MuJoCo timestep={plant.physics_dt:g}; nearest is {plant_actual_dt:g}."
+        )
+
+    # The planner mode is explicit: unlike the old `model` option, `rk4`
+    # always selects RK4 regardless of the XML's original integrator.
+    if planner_mode in {"rk4", "fast-rk4"}:
+        planner.model.opt.integrator = planner.mujoco.mjtIntegrator.mjINT_RK4
+    else:
+        planner.model.opt.integrator = planner.mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+
+    if planner_mode == "fast-rk4":
+        # One RK4 step covers the whole control interval.  This halves the
+        # planner mj_step count for the default 20 ms control / 10 ms model.
+        planner.model.opt.timestep = control_dt
+
+    if planner_mode in {"fast-rk4", "implicitfast"}:
         planner.model.opt.iterations = min(int(planner.model.opt.iterations), 20)
         planner.model.opt.ls_iterations = min(int(planner.model.opt.ls_iterations), 10)
         planner.model.opt.tolerance = max(float(planner.model.opt.tolerance), 1e-6)
         planner.model.opt.noslip_iterations = 0
-    planner.mujoco.mj_forward(planner.model, planner.data)
-    prior = prior or GeometricPrior()
-    policy = make_policy(policy_spec, race_speed=policy_speed, robot_name=robot_name)
-    policy.reset(planner, planner.data)
 
-    if control_dt is None:
-        control_dt = float(getattr(policy, "control_dt", 0.02))
+    planner.mujoco.mj_forward(planner.model, planner.data)
+    policy.reset(planner, planner.data)
 
     # Reuse the same fast rollout/fused cost ABI for pushing and towing. The task
     # body is the box or sled respectively. Towing does not need an
@@ -264,7 +288,6 @@ def run_race(
         nominal_refine_iterations=int(nominal_refine_iterations),
         joint_noise_fraction=float(joint_noise_fraction),
         rollout_workers=int(rollout_workers),
-        rollout_backend=str(rollout_backend),
         rollout_chunk_size=int(rollout_chunk_size),
         warm_start=bool(warm_start),
         box_progress_weight=task_progress_weight,
@@ -312,9 +335,9 @@ def run_race(
         print(
             f"controller={controller.variant.value}  robot={plant.name}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
-            f"backend={controller.rollout_backend_name}  plant_integrator={plant_integrator} "
-            f"planner_integrator={planner_integrator} "
-            f"planner_contacts={planner_contact_mode} "
+            f"planner={controller.rollout_backend_name}  "
+            f"plant={plant_integrator}:{plant_control_substeps}x{plant.physics_dt:g}s  "
+            f"planner_mode={planner_mode}:{controller.control_substeps}x{planner.physics_dt:g}s  "
             f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain} "
             f"leg_mismatch={environment.leg_mismatch}"
         )
@@ -367,22 +390,32 @@ def run_race(
                 tm = info.get("timing_ms", {})
                 total_ms = float(tm.get("total", math.nan))
                 deadline_ms = 1000.0 * cfg.control_dt
-                rtf = deadline_ms / total_ms if total_ms > 0.0 else math.nan
+                status = "OK" if total_ms <= deadline_ms else "MISS"
+                nominal_detail = []
+                if tm.get("policy", 0.0) > 0.005:
+                    nominal_detail.append(f"policy {tm['policy']:.2f}")
+                if tm.get("warm_start", 0.0) > 0.005:
+                    nominal_detail.append(f"warm {tm['warm_start']:.2f}")
+                if tm.get("prior", 0.0) > 0.005:
+                    nominal_detail.append(f"prior {tm['prior']:.2f}")
+                nominal_suffix = f" ({', '.join(nominal_detail)})" if nominal_detail else ""
+
+                if tm.get("rollout_fused", 0.0) > 0.005:
+                    rollout_detail = [f"fused {tm['rollout_fused']:.2f}"]
+                else:
+                    rollout_detail = [f"physics {tm.get('rollout_physics', 0.0):.2f}"]
+                    if tm.get("rollout_cost", 0.0) > 0.005:
+                        rollout_detail.append(f"cost {tm['rollout_cost']:.2f}")
+
                 print(
-                    "MPPI timing "
-                    f"step={step + 1} nominal={tm.get('nominal', math.nan):.2f}ms "
-                    f"(policy={tm.get('policy', 0.0):.2f} warm={tm.get('warm_start', 0.0):.2f} "
-                    f"refine={tm.get('sensitivity', 0.0):.2f} prior={tm.get('prior', 0.0):.2f}) "
-                    f"sample={tm.get('sampling', 0.0):.2f}ms "
-                    f"rollouts={tm.get('rollouts', 0.0):.2f}ms "
-                    f"(physics={tm.get('rollout_physics', 0.0):.2f} cost={tm.get('rollout_cost', 0.0):.2f}"
-                    + (f" fused={tm.get('rollout_fused', 0.0):.2f}" if tm.get('rollout_fused', 0.0) > 0.0 else "")
-                    + ") "
-                    + f"update={tm.get('update', 0.0):.2f}ms total={total_ms:.2f}ms "
-                    + f"deadline={deadline_ms:.2f}ms xRT={rtf:.2f} "
-                   
+                    f"MPPI [{step + 1:5d}]  "
+                    f"nominal {tm.get('nominal', math.nan):7.2f} ms{nominal_suffix}  |  "
+                    f"sample {tm.get('sampling', 0.0):6.2f} ms  |  "
+                    f"rollout {tm.get('rollouts', 0.0):7.2f} ms ({', '.join(rollout_detail)})  |  "
+                    f"update {tm.get('update', 0.0):6.2f} ms  |  "
+                    f"total {total_ms:7.2f} / {deadline_ms:.2f} ms  [{status}]"
                 )
-            plant.step_control(ctrl, substeps=controller.control_substeps, data=plant.data)
+            plant.step_control(ctrl, substeps=plant_control_substeps, data=plant.data)
             after = plant.snapshot()
 
             p = plant.xy()
@@ -443,23 +476,37 @@ def run_race(
 
     runtime = time.perf_counter() - t0
     if profile_controller and profile_rows:
-        keys = ("policy", "warm_start", "sensitivity", "prior", "sampling", "rollouts", "rollout_physics", "rollout_cost", "rollout_fused", "update", "total")
         deadline_ms = 1000.0 * cfg.control_dt
-        summary = []
-        for key in keys:
-            vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
-            summary.append(f"{key}=p50 {np.median(vals):.2f}/p95 {np.percentile(vals, 95):.2f}ms")
         totals = np.asarray([r.get("total", math.inf) for r in profile_rows], dtype=np.float64)
         miss = 100.0 * float(np.mean(totals > deadline_ms))
-        print("MPPI profile (warm-up excluded): " + ", ".join(summary))
-        print(f"deadline={deadline_ms:.2f}ms  misses={miss:.1f}%  samples={len(profile_rows)}")
+        has_fused = max(r.get("rollout_fused", 0.0) for r in profile_rows) > 0.005
+        metrics = [
+            ("nominal", "nominal"),
+            ("warm", "warm_start"),
+            ("prior", "prior"),
+            ("sample", "sampling"),
+            ("rollout", "rollouts"),
+        ]
+        if has_fused:
+            metrics.append(("fused", "rollout_fused"))
+        else:
+            metrics.extend((("physics", "rollout_physics"), ("cost", "rollout_cost")))
+        metrics.extend((("update", "update"), ("total", "total")))
+        print(f"MPPI profile  warm-up excluded  n={len(profile_rows)}")
+        print("                 p50       p95")
+        for label, key in metrics:
+            vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
+            if key not in {"total", "rollouts", "rollout_physics"} and np.max(np.abs(vals)) < 0.005:
+                continue
+            print(f"  {label:<10} {np.median(vals):8.2f}  {np.percentile(vals, 95):8.2f} ms")
+        print(f"  deadline   {deadline_ms:8.2f} ms    misses {miss:5.1f}%")
 
     return RaceResult(
         robot_name=plant.name,
         controller_variant=controller.variant.value,
         control_dt=float(cfg.control_dt),
         plant_integrator=plant_integrator,
-        planner_integrator=planner_integrator,
+        planner_mode=planner_mode,
         xy=np.asarray(xy_hist, dtype=np.float64),
         target_xy=np.asarray(target_xy_hist, dtype=np.float64),
         qpos=np.asarray(qpos_hist, dtype=np.float64),
@@ -489,12 +536,12 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
-        replay_format_version=np.asarray(2, dtype=np.int64),
+        replay_format_version=np.asarray(3, dtype=np.int64),
         robot_name=result.robot_name,
         controller_variant=result.controller_variant,
         control_dt=result.control_dt,
         plant_integrator=np.asarray(result.plant_integrator),
-        planner_integrator=np.asarray(result.planner_integrator),
+        planner_mode=np.asarray(result.planner_mode),
         xy=result.xy,
         target_xy=result.target_xy,
         environment_json=np.asarray(result.environment.to_json()),
@@ -569,10 +616,6 @@ def main() -> None:
         help="native rollout thread-pool chunk size; 0=automatic. For 64 rollouts/16 workers, benchmark 2 and 4",
     )
     parser.add_argument(
-        "--rollout-backend", choices=["auto", "fused", "native", "python"], default="auto",
-        help="auto prefers the fused C++ evaluator and falls back to mujoco.rollout; python keeps the legacy evaluator",
-    )
-    parser.add_argument(
         "--warm-start", action=argparse.BooleanOptionalAction, default=True,
         help="shift the optimized sequence between updates (default: enabled; use --no-warm-start for the original behavior)",
     )
@@ -581,12 +624,12 @@ def main() -> None:
         help="integrator for the rendered/physical plant; model preserves the source XML setting",
     )
     parser.add_argument(
-        "--planner-integrator", choices=["model", "euler", "implicitfast"], default="model",
-        help="integrator for the MPPI planning copy; model preserves the source XML setting",
-    )
-    parser.add_argument(
-        "--planner-contact-mode", choices=["model", "fast"], default="model",
-        help="fast caps short-horizon planner contact-solver work; model preserves the source model settings",
+        "--planner-mode", choices=["rk4", "fast-rk4", "implicitfast"], default="rk4",
+        help=(
+            "planner physics profile: rk4 uses RK4 with the source timestep/solver; "
+            "fast-rk4 uses one RK4 step per control interval plus the fast solver/contact profile; "
+            "implicitfast uses implicitfast at the source timestep with that same fast profile"
+        ),
     )
     parser.add_argument(
         "--profile", action="store_true",
@@ -680,12 +723,10 @@ def main() -> None:
         viewer_ui=args.viewer_ui,
         controller_overlay=args.controller_overlay,
         rollout_workers=args.workers,
-        rollout_backend=args.rollout_backend,
         rollout_chunk_size=args.rollout_chunk_size,
         warm_start=args.warm_start,
         plant_integrator=args.plant_integrator,
-        planner_integrator=args.planner_integrator,
-        planner_contact_mode=args.planner_contact_mode,
+        planner_mode=args.planner_mode,
         profile_controller=args.profile,
         disable_gc=args.disable_gc,
         friction_scale=args.friction_scale,
@@ -721,15 +762,12 @@ def main() -> None:
         sled_max_lift=args.sled_max_lift,
         sled_min_up=args.sled_min_up,
     )
-    realtime_factor = (
-        result.simulated_time_s / result.runtime_s if result.runtime_s > 0.0 else math.inf
-    )
     print(
-        f"finished {result.robot_name} task={result.environment.task}: {result.completed_laps}/{result.requested_laps} laps, "
+        f"finished {result.robot_name} task={result.environment.task}: "
+        f"{result.completed_laps}/{result.requested_laps} laps, "
         f"off_track={result.off_track}, fell={result.fell}, "
         f"progress={result.cumulative_progress[-1]:.2f}m, "
-        f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s, "
-        f"xRT={realtime_factor:.2f}"
+        f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s"
     )
     if not args.no_save and args.save:
         saved = save_result(result, args.save)

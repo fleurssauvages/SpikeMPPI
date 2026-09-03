@@ -70,9 +70,6 @@ class ControllerConfig:
     box_max_lift: float = 0.12
     box_min_up: float = 0.75
     rollout_workers: int = 16
-    # Prefer the allocation-light fused evaluator when it has been built, while
-    # remaining runnable on installations that only provide mujoco.rollout.
-    rollout_backend: str = "auto"
     rollout_chunk_size: int = 0
 
     # Standard receding-horizon warm start. After the first update, shift the
@@ -100,9 +97,6 @@ class ControllerConfig:
         if not -1.0 <= self.box_min_up <= 1.0:
             raise ValueError("box_min_up must lie in [-1, 1]")
         self.rollout_chunk_size = max(0, int(self.rollout_chunk_size))
-        self.rollout_backend = str(self.rollout_backend).strip().lower()
-        if self.rollout_backend not in {"auto", "fused", "native", "python"}:
-            raise ValueError("rollout_backend must be 'auto', 'fused', 'native' or 'python'")
 
 
 class JointMPPIController:
@@ -155,6 +149,11 @@ class JointMPPIController:
             box_max_lift=cfg.box_max_lift,
             box_min_up=cfg.box_min_up,
         )
+        self.rollout_batcher = None
+        # The same persistent native batcher is reused for candidate evaluation
+        # and warm-start nominal propagation.
+        self.nominal_batcher = None
+        # Backwards-compatible alias used by candidate rollout helper arguments.
         self.native_batcher = None
         self._previous_plan: np.ndarray | None = None
         self._ctrl_low, self._ctrl_high = robot.control_bounds(cfg.unlimited_control_span)
@@ -163,52 +162,58 @@ class JointMPPIController:
             unlimited_span=cfg.unlimited_control_span,
         )
         self._standard_workspace: tuple[np.ndarray, np.ndarray] | None = None
-        if cfg.rollout_backend in {"auto", "native", "fused"}:
+        # Online MPPI is CPU-only. Prefer the allocation-light fused C++
+        # evaluator, then stock mujoco.rollout, then the Python fallback.
+        try:
+            self.rollout_batcher = NativeRolloutBatcher(
+                robot, workers=cfg.rollout_workers, batch_hint=cfg.num_rollouts,
+                chunk_size=cfg.rollout_chunk_size, fused=True,
+            )
+        except Exception:
             try:
-                self.native_batcher = NativeRolloutBatcher(
+                self.rollout_batcher = NativeRolloutBatcher(
                     robot, workers=cfg.rollout_workers, batch_hint=cfg.num_rollouts,
-                    chunk_size=cfg.rollout_chunk_size,
-                    fused=(cfg.rollout_backend in {"auto", "fused"}),
+                    chunk_size=cfg.rollout_chunk_size, fused=False,
                 )
             except Exception:
-                if cfg.rollout_backend == "fused":
-                    # Fused mode is explicit: never silently benchmark the slower
-                    # stock path when the extension is missing or incompatible.
-                    raise
-                # Auto mode prefers fused but falls back to the stock persistent
-                # native pool. Native mode keeps the legacy Python evaluator as
-                # its compatibility fallback.
-                if cfg.rollout_backend == "auto":
-                    try:
-                        self.native_batcher = NativeRolloutBatcher(
-                            robot, workers=cfg.rollout_workers,
-                            batch_hint=cfg.num_rollouts,
-                            chunk_size=cfg.rollout_chunk_size,
-                            fused=False,
-                        )
-                    except Exception:
-                        self.native_batcher = None
-                else:
-                    self.native_batcher = None
+                self.rollout_batcher = None
+        self.nominal_batcher = self.rollout_batcher
+        self.native_batcher = self.rollout_batcher
 
     @property
     def rollout_backend_name(self) -> str:
-        if self.native_batcher is not None and self.native_batcher.supports_vectorized_cost:
-            suffix = f"/chunk{self.native_batcher.chunk_size}" if self.native_batcher.chunk_size > 0 else ""
-            prefix = "fused" if self.native_batcher.uses_fused else "native"
-            return f"{prefix}/{self.native_batcher.nthread}t{suffix}"
-        return "python"
+        batcher = self.rollout_batcher
+        if batcher is None:
+            return "cpu/python"
+        if batcher.supports_vectorized_cost:
+            suffix = f"/chunk{batcher.chunk_size}" if batcher.chunk_size > 0 else ""
+            prefix = "cpu/fused" if batcher.uses_fused else "cpu/native"
+            return f"{prefix}/{batcher.nthread}t{suffix}"
+        return "cpu/python"
 
     def sync_planning_model(self) -> None:
-        """Synchronize an explicitly changed planner model into fused workers."""
-        if self.native_batcher is not None:
-            self.native_batcher.sync_fused_model()
+        """Synchronize explicit planner-model changes into active backends."""
+        seen = set()
+        for batcher in (self.rollout_batcher, self.nominal_batcher):
+            if batcher is None or id(batcher) in seen:
+                continue
+            seen.add(id(batcher))
+            if hasattr(batcher, "sync_model"):
+                batcher.sync_model()
+            elif hasattr(batcher, "sync_fused_model"):
+                batcher.sync_fused_model()
 
     def close(self) -> None:
-        """Release native rollout worker threads explicitly."""
-        if self.native_batcher is not None:
-            self.native_batcher.close()
-            self.native_batcher = None
+        """Release rollout resources explicitly."""
+        seen = set()
+        for batcher in (self.rollout_batcher, self.nominal_batcher):
+            if batcher is None or id(batcher) in seen:
+                continue
+            seen.add(id(batcher))
+            batcher.close()
+        self.rollout_batcher = None
+        self.nominal_batcher = None
+        self.native_batcher = None
 
     def _build_nominal(self, data, current_s: float):
         """Build the policy-seeded control nominal used by MPPI.
@@ -236,7 +241,7 @@ class JointMPPIController:
                 self.track,
                 current_s,
                 control_substeps=self.control_substeps,
-                native_batcher=self.native_batcher,
+                native_batcher=self.nominal_batcher,
             )
         else:
             policy_rollout = rollout_policy_nominal(
@@ -266,7 +271,7 @@ class JointMPPIController:
                 step_size=self.cfg.nominal_refine_step_size,
                 max_control_step_fraction=self.cfg.nominal_max_step_fraction,
                 epsilon_fraction=self.cfg.sensitivity_epsilon_fraction,
-                native_batcher=self.native_batcher,
+                native_batcher=self.nominal_batcher,
             )
         t_refine = time.perf_counter()
 
@@ -438,6 +443,10 @@ class JointMPPIController:
         if self.cfg.warm_start:
             self._previous_plan = np.asarray(candidate, dtype=np.float64).copy()
         best = int(np.argmin(costs)) if len(costs) else 0
+        if getattr(self.native_batcher, "returns_best_only", False):
+            best_rollout = np.asarray(positions, dtype=np.float64).copy()
+        else:
+            best_rollout = positions[best].copy()
         t_update = time.perf_counter()
         info = {
             "planned_control_sequence": candidate,
@@ -451,7 +460,7 @@ class JointMPPIController:
             "lbps_score": float(lbps_score),
             "finite_rollouts": int(finite_count),
             "collision_rollouts": int(np.count_nonzero(failed)),
-            "best_rollout": positions[best].copy(),
+            "best_rollout": best_rollout,
             "best_cost": float(costs[best]),
             "best_terminal_progress": float(terminal_progress[best]),
             "rollout_backend": self.rollout_backend_name,

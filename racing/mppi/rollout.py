@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 import os
+from pathlib import Path
 import time
 from typing import Sequence
 import numpy as np
@@ -35,6 +36,7 @@ class RolloutCostConfig:
 
 
 class NativeRolloutBatcher:
+    supports_vectorized_jacobians = True
     """Fast batched open-loop rollouts using MuJoCo's native C++ rollout module.
 
     Besides parallel MPPI evaluation, this class also owns the hot-path state
@@ -1474,7 +1476,10 @@ def refine_policy_nominal(
     max_step = max_control_step_fraction * np.maximum(robot.control_scale(fraction=1.0), 1e-6)
 
     def _estimate(rollout, ctrls):
-        if native_batcher is not None and native_batcher.supports_vectorized_cost:
+        if (
+            native_batcher is not None
+            and getattr(native_batcher, "supports_vectorized_jacobians", False)
+        ):
             return native_batcher.estimate_joint_task_jacobians(
                 rollout.snapshots if rollout.native_initial_states is None else None,
                 ctrls,
