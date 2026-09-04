@@ -1,5 +1,4 @@
 /mujoco_env
-/mujoco_menagerie
 /mujoco_playground
 .pyc*
 /racing/__pycache__
