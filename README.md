@@ -78,36 +78,46 @@ The MPPI controller acts directly on Ant's eight actuator controls. The pretrain
 
 ---
 
-## Fused C++ MuJoCo backend
+## CPU MuJoCo rollout backend
 
-The project includes an optional fused C++ MuJoCo rollout evaluator for low-latency MPPI planning.
+Online MPPI planning is CPU-only. The controller automatically selects the fastest available MuJoCo rollout path in this order:
 
-The fused backend combines MuJoCo stepping with racing-cost evaluation and uses persistent MuJoCo data and worker threads to reduce Python overhead and temporary allocations. It changes the implementation of rollout evaluation, not the planning model or MPPI objective.
+1. fused C++ MuJoCo physics + MPPI cost evaluation,
+2. stock batched `mujoco.rollout`,
+3. the legacy Python rollout loop as a compatibility fallback.
 
-With:
+There is no rollout-backend command-line selector. When the fused extension is available it is preferred automatically.
+
+The fused evaluator combines MuJoCo stepping with racing-cost evaluation and uses persistent MuJoCo data plus persistent worker threads to reduce Python overhead and temporary allocations. It changes the implementation of candidate evaluation, not the MPPI objective.
+
+The active CPU path is printed at startup, for example:
 
 ```text
---planner-integrator model
---planner-contact-mode model
+planner=cpu/fused/16t
 ```
 
-the planning copy keeps the model's configured integrator and contact settings.
+Planner fidelity is selected independently with `--planner-mode`:
 
-The available rollout backends are:
+| Mode | Integrator | Planner timestep | Solver/contact profile |
+| --- | --- | --- | --- |
+| `rk4` | RK4 | source MuJoCo timestep | source settings |
+| `fast-rk4` | RK4 | one step per control interval | fast profile |
+| `implicitfast` | implicitfast | source MuJoCo timestep | fast profile |
 
-| Backend  | Description                                                                                    |
-| -------- | ---------------------------------------------------------------------------------------------- |
-| `fused`  | Fused C++ MuJoCo physics + MPPI cost evaluation.                                               |
-| `native` | MuJoCo's stock batched `mujoco.rollout` path with cost evaluation outside the fused extension. |
-| `python` | Legacy Python rollout path.                                                                    |
-| `auto`   | Prefer `fused` when available, otherwise fall back to the native backend.                      |
+For the default 20 ms controller and 10 ms source MuJoCo timestep, this means:
 
-By default, the first fused candidate batch is verified against the reference rollout path before steady-state use.
+```text
+rk4          -> 2 x 10 ms RK4 steps / control update
+fast-rk4     -> 1 x 20 ms RK4 step  / control update
+implicitfast -> 2 x 10 ms implicitfast steps / control update
+```
 
-To disable the one-time verification after equivalence has already been established on a machine:
+The fast solver/contact profile caps solver iterations at 20, line-search iterations at 10, loosens tolerance to at least `1e-6`, and disables noslip iterations. `fast-rk4` is intended as a lower-cost RK4 planner while keeping the physical plant independent.
+
+By default, the first fused candidate batch is verified against the reference rollout path before steady-state use. To disable the one-time verification after equivalence has already been established on a machine:
 
 ```bash
-RACING_FUSED_VERIFY=0 python -m racing.experiments.race ... --rollout-backend fused
+RACING_FUSED_VERIFY=0 python -m racing.experiments.race ...
 ```
 
 ---
@@ -121,7 +131,7 @@ RACING_FUSED_VERIFY=0 python -m racing.experiments.race ... --rollout-backend fu
 * MuJoCo **3.3+**.
 * A GPU is strongly recommended for PPO training.
 * The fused C++ rollout evaluator currently targets Linux/macOS and requires a C++17 compiler.
-* The `native` and `python` rollout backends do not require the fused extension.
+* If the fused extension is unavailable, online MPPI falls back automatically to stock `mujoco.rollout` and then to the Python compatibility path.
 
 ### 1. Create an environment
 
@@ -179,7 +189,6 @@ import jax
 import mujoco
 from mujoco import mjx
 import mujoco_playground
-
 print("JAX backend:", jax.default_backend())
 print("JAX devices:", jax.devices())
 print("MuJoCo:", mujoco.__version__)
@@ -355,7 +364,9 @@ Warm-starting is enabled by default. Use:
 
 to disable it.
 
-### Fused MPPI
+### MPPI planner physics modes
+
+The default planner uses full RK4 with the source MuJoCo timestep and solver/contact settings:
 
 ```bash
 python -m racing.experiments.race \
@@ -366,10 +377,30 @@ python -m racing.experiments.race \
   --horizon 50 \
   --joint-noise 0.5 \
   --workers 16 \
-  --rollout-backend fused \
-  --planner-integrator model \
-  --planner-contact-mode model \
+  --planner-mode rk4 \
   --profile
+```
+
+For a cheaper RK4 planner, use:
+
+```text
+--planner-mode fast-rk4
+```
+
+`fast-rk4` keeps RK4 but sets the planner timestep equal to the control period, so the default 20 ms control interval requires one planner `mj_step` instead of two 10 ms steps. It also uses the fast solver/contact profile.
+
+For the cheapest supported MuJoCo planner profile, use:
+
+```text
+--planner-mode implicitfast
+```
+
+`implicitfast` keeps the source planner timestep and uses the same fast solver/contact profile. The physical plant remains independent; use `--plant-integrator` only when intentionally changing the plant integrator.
+
+At startup, the program prints both plant and planner stepping, for example:
+
+```text
+plant=model:2x0.01s  planner_mode=fast-rk4:1x0.02s
 ```
 
 ---
@@ -499,9 +530,9 @@ The short/long leg scales can be changed with:
 
 ---
 
-## Online model adaptation
+## Plant-model mismatch
 
-The physical plant can be perturbed without directly giving the true perturbation to the planning model.
+The physical plant can be perturbed without giving those perturbations directly to the planning model. This is useful for evaluating model mismatch between the online MPPI planner and the simulated plant.
 
 ```bash
 python -m racing.experiments.race \
@@ -511,29 +542,19 @@ python -m racing.experiments.race \
   --friction-scale 0.8 \
   --mass-scale 1.15 \
   --motor-scale 0.9 \
-  --slope-deg 2.0 \
-  --adapt-model
+  --slope-deg 2.0
 ```
 
-Useful options:
+The available plant perturbations are:
 
 ```text
---sysid-history N
---sysid-interval N
---sysid-estimate-slope
+--friction-scale FLOAT
+--mass-scale FLOAT
+--motor-scale FLOAT
+--slope-deg FLOAT
 ```
 
-A three-way comparison utility is also provided:
-
-```bash
-python -m racing.experiments.compare_adaptation
-```
-
-It compares:
-
-1. nominal policy,
-2. MPPI with a fixed nominal model,
-3. MPPI with online model adaptation.
+These parameters modify the physical plant only. The planning copy starts from the nominal model, so the run measures transfer under unobserved model mismatch.
 
 ---
 
@@ -551,38 +572,44 @@ To load a saved empirical prior:
 
 ## Core racing options
 
-| Option                                            | Default                       | Description                                                                                                  |
-| ------------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `--robot ant`                                     | `ant`                         | The only supported racing robot.                                                                             |
-| `--policy SPEC`                                   | `auto`                        | Loads `racing/policies/checkpoints/ant_rapid` automatically or accepts an explicit checkpoint/specification. |
-| `--policy-speed MPS`                              | none                          | Optional maximum racing-speed cap.                                                                           |
-| `--laps N`                                        | `1`                           | Requested laps.                                                                                              |
-| `--variant {nominal,mppi}`                        | `mppi`                        | Direct policy or policy-seeded MPPI.                                                                         |
-| `--rollouts N`                                    | `32`                          | MPPI candidate trajectories per update.                                                                      |
-| `--horizon N`                                     | `50`                          | MPPI horizon in control steps.                                                                               |
-| `--dt SEC`                                        | policy dt                     | Control period.                                                                                              |
-| `--lbps-delta FLOAT`                              | `0.95`                        | Adaptive-temperature target.                                                                                 |
-| `--joint-noise FLOAT`                             | `0.5`                         | Actuator-range MPPI exploration scale.                                                                       |
-| `--nominal-refine-iters N`                        | `0`                           | Optional policy-nominal refinement.                                                                          |
-| `--seed N`                                        | `1`                           | Controller random seed.                                                                                      |
-| `--workers N`                                     | `16`                          | Rollout worker threads.                                                                                      |
-| `--rollout-chunk-size N`                          | `0`                           | Worker-pool chunk size; `0` selects automatically.                                                           |
-| `--rollout-backend {auto,fused,native,python}`    | `auto`                        | Rollout implementation.                                                                                      |
-| `--warm-start / --no-warm-start`                  | enabled                       | Shift previous optimized sequence between MPPI updates.                                                      |
-| `--planner-integrator {model,euler,implicitfast}` | `model`                       | Planning-model integrator.                                                                                   |
-| `--planner-contact-mode {model,fast}`             | `model`                       | Planning contact configuration.                                                                              |
-| `--task {run,push_box,tow_sled}`                  | `run`                         | Test-time task.                                                                                              |
-| `--terrain {flat,ramps,stairs,rocky,mixed}`       | `flat`                        | Test-time terrain.                                                                                           |
-| `--leg-mismatch {none,same_side,diagonal}`        | `none`                        | Known Ant leg-length mismatch.                                                                               |
-| `--friction-scale FLOAT`                          | `1.0`                         | Plant friction scale.                                                                                        |
-| `--mass-scale FLOAT`                              | `1.0`                         | Plant mass scale.                                                                                            |
-| `--motor-scale FLOAT`                             | `1.0`                         | Plant actuator-strength scale.                                                                               |
-| `--slope-deg FLOAT`                               | `0.0`                         | Plant ground slope.                                                                                          |
-| `--adapt-model`                                   | off                           | Online planning-model system identification.                                                                 |
-| `--profile`                                       | off                           | Print controller timing statistics.                                                                          |
-| `--headless`                                      | off                           | Disable viewer.                                                                                              |
-| `--save PATH`                                     | `racing/results/last_run.npz` | Save exact trajectory for replay.                                                                            |
-| `--no-save`                                       | off                           | Disable replay-file saving.                                                                                  |
+| Option | Default | Description |
+| --- | --- | --- |
+| `--robot ant` | `ant` | The only supported racing robot. |
+| `--policy SPEC` | `auto` | Loads `racing/policies/checkpoints/ant_rapid` automatically or accepts an explicit checkpoint/specification. |
+| `--policy-speed MPS` | none | Optional maximum racing-speed cap. |
+| `--laps N` | `1` | Requested laps. |
+| `--variant {nominal,mppi}` | `mppi` | Direct policy or policy-seeded MPPI. |
+| `--rollouts N` | `32` | MPPI candidate trajectories per update. |
+| `--horizon N` | `50` | MPPI horizon in control steps. |
+| `--dt SEC` | policy dt | Control period. |
+| `--lbps-delta FLOAT` | `0.95` | Adaptive-temperature target. |
+| `--joint-noise FLOAT` | `0.5` | Actuator-range MPPI exploration scale. |
+| `--nominal-refine-iters N` | `0` | Optional policy-nominal refinement. |
+| `--seed N` | `1` | Controller random seed. |
+| `--workers N` | `16` | Persistent native rollout worker threads; `0` selects automatically. |
+| `--rollout-chunk-size N` | `0` | Worker-pool chunk size; `0` selects automatically. |
+| `--warm-start / --no-warm-start` | enabled | Shift the previous optimized sequence between MPPI updates. |
+| `--plant-integrator {model,euler,implicitfast}` | `model` | Physical-plant integrator; `model` preserves the source XML setting. |
+| `--planner-mode {rk4,fast-rk4,implicitfast}` | `rk4` | Planner physics profile. `fast-rk4` uses one RK4 step per control interval; `implicitfast` uses the source timestep. Both fast modes use the cheaper solver/contact profile. |
+| `--task {run,push_box,tow_sled}` | `run` | Test-time task. |
+| `--terrain {flat,ramps,stairs,rocky,mixed}` | `flat` | Test-time terrain. |
+| `--terrain-seed N` | `1` | Deterministic rocky/mixed terrain seed. |
+| `--terrain-scale FLOAT` | `1.0` | Terrain obstacle/ramp scale. |
+| `--leg-mismatch {none,same_side,diagonal}` | `none` | Known Ant leg-length mismatch. |
+| `--short-leg-scale FLOAT` | `0.75` | Short-leg scale when geometry mismatch is enabled. |
+| `--long-leg-scale FLOAT` | `1.25` | Long-leg scale when geometry mismatch is enabled. |
+| `--friction-scale FLOAT` | `1.0` | Plant friction scale. |
+| `--mass-scale FLOAT` | `1.0` | Plant mass scale. |
+| `--motor-scale FLOAT` | `1.0` | Plant actuator-strength scale. |
+| `--slope-deg FLOAT` | `0.0` | Plant ground slope. |
+| `--profile` | off | Print compact MPPI timing statistics. |
+| `--disable-gc` | off | Disable Python cyclic GC during the race loop to reduce timing jitter. |
+| `--max-steps N` | none | Optional control-step limit. |
+| `--headless` | off | Disable viewer. |
+| `--viewer-ui` | off | Show MuJoCo left/right viewer panels. |
+| `--controller-overlay` | off | Enable the controller overlay. |
+| `--save PATH` | `racing/results/last_run.npz` | Save exact trajectory for replay. |
+| `--no-save` | off | Disable replay-file saving. |
 
 For all options:
 
@@ -600,7 +627,15 @@ Add:
 --profile
 ```
 
-The profiler reports rollout and controller-stage timing, MPPI update time, p50/p95 latency, and deadline misses.
+The per-update profiler prints only the active timing components: nominal construction, sampling, rollout evaluation, MPPI update, total latency, the control deadline, and an `OK`/`MISS` deadline status. `refine` and real-time-factor (`xRT`) fields are not printed.
+
+Example steady-state output:
+
+```text
+MPPI [    2]  nominal    2.93 ms (warm 2.76, prior 0.16)  |  sample   0.45 ms  |  rollout    9.15 ms (fused 8.72)  |  update   0.49 ms  |  total   13.02 / 20.00 ms  [OK]
+```
+
+The final summary excludes the first five warm-up updates and reports aligned p50/p95 stage timing plus the deadline-miss percentage.
 
 For a 50 Hz controller, a useful target is approximately:
 
@@ -609,37 +644,15 @@ p95 total < 20 ms
 deadline misses close to 0%
 ```
 
-When comparing `nominal` and `mppi`, record at least:
+When comparing planner configurations, record at least:
 
 * lap time or task progress,
 * fall/off-track outcome,
 * MPPI effective sample size,
-* total p50/p95 latency,
+* rollout and total p50/p95 latency,
 * deadline misses.
 
-### Rollout backend benchmark
-
-```bash
-python -m racing.experiments.benchmark_rollouts \
-  --scene all \
-  --backend all \
-  --rollouts 32 \
-  --horizon 50 \
-  --workers 16 \
-  --repeats 25
-```
-
-Available benchmark scenes:
-
-```text
-flat
-rocky
-mixed
-push_box
-tow_sled
-```
-
-The benchmark reports p50, p95, and steady-state updates per second for native and fused rollouts.
+For CPU rollout tuning, benchmark `--workers` and `--rollout-chunk-size` on the target machine. The fused evaluator is selected automatically when the extension is available.
 
 ---
 
@@ -735,9 +748,7 @@ python -m racing.experiments.race \
   --horizon 50 \
   --joint-noise 0.5 \
   --workers 16 \
-  --planner-integrator model \
-  --planner-contact-mode model \
-  --rollout-backend fused \
+  --planner-mode rk4 \
   --profile
 ```
 
@@ -760,14 +771,15 @@ python -m racing.experiments.replay \
 
 ## Notes on reproducibility and performance
 
-* Use the same `--seed`, horizon, rollout count, physics settings, and task configuration when comparing `nominal` and `mppi`.
+* Use the same `--seed`, horizon, rollout count, plant/planner physics settings, and task configuration when comparing `nominal` and `mppi`.
 * The first JAX policy call includes JIT compilation and is much slower than steady-state inference.
 * MPPI warm start is enabled by default.
-* `--rollout-backend auto` prefers the fused C++ evaluator when available.
-* `native` uses MuJoCo's stock batched rollout implementation.
-* `python` is the legacy fallback.
-* Thread count and rollout chunk size are machine dependent.
-* `--planner-integrator model` and `--planner-contact-mode model` are the fidelity-preserving planner settings.
+* Online MPPI rollouts are CPU MuJoCo. The controller automatically prefers the fused C++ evaluator, then stock `mujoco.rollout`, then the Python compatibility path.
+* `--planner-mode rk4` is the fidelity-oriented planner profile: explicit RK4, source planner timestep, and source solver/contact settings.
+* `--planner-mode fast-rk4` keeps RK4 but uses one planner step per control interval plus the fast solver/contact profile. With the default 20 ms control period and 10 ms source timestep, this changes the planner from `2 x 10 ms` to `1 x 20 ms` while leaving the plant unchanged.
+* `--planner-mode implicitfast` uses MuJoCo `implicitfast` at the source timestep with the same fast solver/contact profile.
+* Plant and planner substep counts are computed independently. Changing planner mode does not change how far the physical plant advances per control update.
+* Thread count and rollout chunk size are machine dependent; benchmark them on the target CPU.
 * GIF export uses saved states, so rendering does not alter the racing result.
 
 ## Reference
