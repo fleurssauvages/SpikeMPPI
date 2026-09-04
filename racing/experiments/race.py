@@ -11,7 +11,7 @@ import numpy as np
 
 from racing.robots.model_params import ModelParameterScales
 from racing.environments import RaceEnvironmentConfig
-from racing.mppi import ControllerConfig, ControllerVariant, JointMPPIController
+from racing.mppi import ControllerConfig, ControllerVariant, SamplingOption, JointMPPIController
 from racing.policies import make_policy
 from racing.priors import EmpiricalPrior, GeometricPrior, SpatialPrior
 from racing.robots import make_robot
@@ -28,6 +28,7 @@ from racing.tracks import (
 class RaceResult:
     robot_name: str
     controller_variant: str
+    sampling_option: str
     control_dt: float
     plant_integrator: str
     planner_mode: str
@@ -61,12 +62,20 @@ def run_race(
     policy_spec: str | None = None,
     policy_speed: float | None = None,
     variant: ControllerVariant | str = ControllerVariant.MPPI,
+    sampling: SamplingOption | str = SamplingOption.STANDARD,
     num_rollouts: int = 32,
     horizon: int = 50,
     control_dt: float | None = None,
     lbps_delta: float = 0.9,
     nominal_refine_iterations: int = 0,
     joint_noise_fraction: float = 0.08,
+    guided_rank: int = 6,
+    guided_fraction: float = 0.50,
+    diag_lowrank_rate: float = 0.08,
+    diag_lowrank_min: float = 0.25,
+    diag_lowrank_max: float = 4.0,
+    spline_modes: int = 6,
+    icem_elites: int = 4,
     seed: int = 1,
     max_steps: int | None = None,
     viewer: bool = True,
@@ -287,6 +296,13 @@ def run_race(
         lbps_delta=float(lbps_delta),
         nominal_refine_iterations=int(nominal_refine_iterations),
         joint_noise_fraction=float(joint_noise_fraction),
+        guided_rank=int(guided_rank),
+        guided_fraction=float(guided_fraction),
+        diag_lowrank_rate=float(diag_lowrank_rate),
+        diag_lowrank_min=float(diag_lowrank_min),
+        diag_lowrank_max=float(diag_lowrank_max),
+        spline_modes=int(spline_modes),
+        icem_elites=int(icem_elites),
         rollout_workers=int(rollout_workers),
         rollout_chunk_size=int(rollout_chunk_size),
         warm_start=bool(warm_start),
@@ -296,7 +312,9 @@ def run_race(
         box_max_lift=task_max_lift,
         box_min_up=task_min_up,
     )
-    controller = JointMPPIController(planner, track, prior, policy, cfg, variant=variant, seed=seed)
+    controller = JointMPPIController(
+        planner, track, prior, policy, cfg, variant=variant, sampling=sampling, seed=seed
+    )
 
     current_s, _ = track.project(plant.task_xy())
     current_s = float(current_s)
@@ -333,7 +351,8 @@ def run_race(
 
     if verbose:
         print(
-            f"controller={controller.variant.value}  robot={plant.name}  nu={plant.nu}  "
+            f"controller={controller.variant.value}  sampling={controller.sampling.value}  "
+            f"robot={plant.name}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
             f"planner={controller.rollout_backend_name}  "
             f"plant={plant_integrator}:{plant_control_substeps}x{plant.physics_dt:g}s  "
@@ -341,6 +360,8 @@ def run_race(
             f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain} "
             f"leg_mismatch={environment.leg_mismatch}"
         )
+        if controller.variant == ControllerVariant.MPPI:
+            print(f"sampling: {controller.sampling_description}")
         if environment.leg_mismatch != "none":
             scale_text = ", ".join(f"{name}={scale:g}x" for name, scale in leg_scales.items())
             print(
@@ -407,8 +428,11 @@ def run_race(
                     if tm.get("rollout_cost", 0.0) > 0.005:
                         rollout_detail.append(f"cost {tm['rollout_cost']:.2f}")
 
+                profile_label = controller.variant.value.upper()
+                if controller.variant == ControllerVariant.MPPI and controller.sampling != SamplingOption.STANDARD:
+                    profile_label += f"/{controller.sampling.value.upper()}"
                 print(
-                    f"MPPI [{step + 1:5d}]  "
+                    f"{profile_label} [{step + 1:5d}]  "
                     f"nominal {tm.get('nominal', math.nan):7.2f} ms{nominal_suffix}  |  "
                     f"sample {tm.get('sampling', 0.0):6.2f} ms  |  "
                     f"rollout {tm.get('rollouts', 0.0):7.2f} ms ({', '.join(rollout_detail)})  |  "
@@ -492,7 +516,10 @@ def run_race(
         else:
             metrics.extend((("physics", "rollout_physics"), ("cost", "rollout_cost")))
         metrics.extend((("update", "update"), ("total", "total")))
-        print(f"MPPI profile  warm-up excluded  n={len(profile_rows)}")
+        profile_label = controller.variant.value.upper()
+        if controller.variant == ControllerVariant.MPPI and controller.sampling != SamplingOption.STANDARD:
+            profile_label += f"/{controller.sampling.value.upper()}"
+        print(f"{profile_label} profile  warm-up excluded  n={len(profile_rows)}")
         print("                 p50       p95")
         for label, key in metrics:
             vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
@@ -504,6 +531,7 @@ def run_race(
     return RaceResult(
         robot_name=plant.name,
         controller_variant=controller.variant.value,
+        sampling_option=controller.sampling.value,
         control_dt=float(cfg.control_dt),
         plant_integrator=plant_integrator,
         planner_mode=planner_mode,
@@ -539,6 +567,7 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
         replay_format_version=np.asarray(3, dtype=np.int64),
         robot_name=result.robot_name,
         controller_variant=result.controller_variant,
+        sampling_option=result.sampling_option,
         control_dt=result.control_dt,
         plant_integrator=np.asarray(result.plant_integrator),
         planner_mode=np.asarray(result.planner_mode),
@@ -600,11 +629,27 @@ def main() -> None:
     parser.add_argument("--lbps-delta", type=float, default=0.95)
     parser.add_argument("--nominal-refine-iters", type=int, default=0)
     parser.add_argument("--joint-noise", type=float, default=0.5, help="actuator-range exploration-noise scale for MPPI")
+    parser.add_argument("--guided-rank", type=int, default=6, help="history subspace rank for guided and diag-lowrank sampling")
+    parser.add_argument("--guided-fraction", type=float, default=0.50, help="blend weight of the learned low-rank component before trace renormalization")
+    parser.add_argument("--diag-lowrank-rate", type=float, default=0.08, help="EMA rate for time/joint diagonal variance adaptation")
+    parser.add_argument("--diag-lowrank-min", type=float, default=0.25, help="minimum normalized diagonal variance factor before trace normalization")
+    parser.add_argument("--diag-lowrank-max", type=float, default=4.0, help="maximum normalized diagonal variance factor before trace normalization")
+    parser.add_argument("--spline-modes", type=int, default=6, help="number of cubic B-spline latent modes per actuator")
+    parser.add_argument("--icem-elites", type=int, default=4, help="number of shifted previous elite control sequences reused by icem sampling")
     parser.add_argument(
         "--variant",
         choices=[v.value for v in ControllerVariant],
         default=ControllerVariant.MPPI.value,
-        help="nominal executes the pretrained policy directly; mppi runs standard policy-seeded MPPI",
+        help="controller: nominal policy execution or MPPI refinement",
+    )
+    parser.add_argument(
+        "--sampling",
+        choices=[v.value for v in SamplingOption],
+        default=SamplingOption.STANDARD.value,
+        help=(
+            "MPPI candidate sampling: standard Gaussian, guided low-rank history, "
+            "diag-lowrank adaptive covariance, spline latent sampling, or iCEM-style elite reuse"
+        ),
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -711,12 +756,20 @@ def main() -> None:
         policy_spec=args.policy,
         policy_speed=args.policy_speed,
         variant=args.variant,
+        sampling=args.sampling,
         num_rollouts=args.rollouts,
         horizon=args.horizon,
         control_dt=args.dt,
         lbps_delta=args.lbps_delta,
         nominal_refine_iterations=args.nominal_refine_iters,
         joint_noise_fraction=args.joint_noise,
+        guided_rank=args.guided_rank,
+        guided_fraction=args.guided_fraction,
+        diag_lowrank_rate=args.diag_lowrank_rate,
+        diag_lowrank_min=args.diag_lowrank_min,
+        diag_lowrank_max=args.diag_lowrank_max,
+        spline_modes=args.spline_modes,
+        icem_elites=args.icem_elites,
         seed=args.seed,
         max_steps=args.max_steps,
         viewer=not args.headless,

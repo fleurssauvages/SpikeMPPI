@@ -24,6 +24,16 @@ class ControllerVariant(str, Enum):
     MPPI = "mppi"
 
 
+class SamplingOption(str, Enum):
+    """Candidate-generation strategy used by the MPPI controller."""
+
+    STANDARD = "standard"
+    GUIDED = "guided"
+    DIAG_LOWRANK = "diag-lowrank"
+    SPLINE = "spline"
+    ICEM = "icem"
+
+
 @dataclass
 class ControllerConfig:
     control_dt: float = 0.02
@@ -38,6 +48,17 @@ class ControllerConfig:
     # Direct joint-space proposal.
     joint_noise_fraction: float = 0.08
     unlimited_control_span: float = 1.0
+
+    # Alternative sampling proposals.  These only change how candidate
+    # controls are generated; rollout physics, objective, LBPS and the MPPI
+    # weighted update remain identical to standard MPPI.
+    guided_rank: int = 6
+    guided_fraction: float = 0.50
+    diag_lowrank_rate: float = 0.08
+    diag_lowrank_min: float = 0.25
+    diag_lowrank_max: float = 4.0
+    spline_modes: int = 6
+    icem_elites: int = 4
 
     # Policy-seeded local iLQR-style nominal construction.
     nominal_refine_iterations: int = 0
@@ -90,6 +111,19 @@ class ControllerConfig:
             raise ValueError("temporal_noise_smoothing must lie in [0, 1)")
         if self.sensitivity_epsilon_fraction <= 0.0:
             raise ValueError("sensitivity_epsilon_fraction must be positive")
+        self.guided_rank = max(1, int(self.guided_rank))
+        if not 0.0 <= self.guided_fraction < 1.0:
+            raise ValueError("guided_fraction must lie in [0, 1)")
+        if not 0.0 < self.diag_lowrank_rate <= 1.0:
+            raise ValueError("diag_lowrank_rate must lie in (0, 1]")
+        if not 0.0 < self.diag_lowrank_min <= 1.0:
+            raise ValueError("diag_lowrank_min must lie in (0, 1]")
+        if self.diag_lowrank_max < 1.0:
+            raise ValueError("diag_lowrank_max must be >= 1")
+        if self.diag_lowrank_max < self.diag_lowrank_min:
+            raise ValueError("diag_lowrank_max must be >= diag_lowrank_min")
+        self.spline_modes = max(4, int(self.spline_modes))
+        self.icem_elites = max(0, int(self.icem_elites))
         if self.box_progress_weight < 0.0 or self.robot_progress_weight < 0.0 or self.robot_box_approach_weight < 0.0:
             raise ValueError("push-task reward weights must be nonnegative")
         if self.box_max_lift < 0.0:
@@ -120,6 +154,7 @@ class JointMPPIController:
         cfg: ControllerConfig,
         *,
         variant: ControllerVariant | str = ControllerVariant.MPPI,
+        sampling: SamplingOption | str = SamplingOption.STANDARD,
         seed: int = 1,
     ) -> None:
         self.robot = robot
@@ -128,6 +163,9 @@ class JointMPPIController:
         self.policy = policy
         self.cfg = cfg
         self.variant = ControllerVariant(variant)
+        self.sampling = SamplingOption(sampling)
+        if self.variant == ControllerVariant.NOMINAL and self.sampling != SamplingOption.STANDARD:
+            raise ValueError("non-standard --sampling options require --variant mppi")
         self.rng = np.random.default_rng(int(seed))
         ratio = float(cfg.control_dt) / max(float(robot.physics_dt), 1e-12)
         self.control_substeps = max(1, int(round(ratio)))
@@ -162,6 +200,11 @@ class JointMPPIController:
             unlimited_span=cfg.unlimited_control_span,
         )
         self._standard_workspace: tuple[np.ndarray, np.ndarray] | None = None
+        self._direction_history: list[np.ndarray] = []
+        self._last_proposal_rank = 0
+        self._diag_variance = np.ones((cfg.horizon, robot.nu), dtype=np.float64)
+        self._icem_elites: np.ndarray | None = None
+        self._spline_basis = self._make_bspline_basis(cfg.horizon, cfg.spline_modes)
         # Online MPPI is CPU-only. Prefer the allocation-light fused C++
         # evaluator, then stock mujoco.rollout, then the Python fallback.
         try:
@@ -190,6 +233,30 @@ class JointMPPIController:
             prefix = "cpu/fused" if batcher.uses_fused else "cpu/native"
             return f"{prefix}/{batcher.nthread}t{suffix}"
         return "cpu/python"
+
+    @property
+    def sampling_description(self) -> str:
+        if self.sampling == SamplingOption.GUIDED:
+            return (
+                f"guided low-rank: history_rank={self.cfg.guided_rank}, "
+                f"guided_fraction={self.cfg.guided_fraction:g}, baseline=standard MPPI"
+            )
+        if self.sampling == SamplingOption.DIAG_LOWRANK:
+            return (
+                f"diagonal + low-rank: history_rank={self.cfg.guided_rank}, "
+                f"guided_fraction={self.cfg.guided_fraction:g}, "
+                f"diag_rate={self.cfg.diag_lowrank_rate:g}"
+            )
+        if self.sampling == SamplingOption.SPLINE:
+            return f"spline latent sampling: cubic B-spline modes={self._spline_basis.shape[1]} per joint"
+        if self.sampling == SamplingOption.ICEM:
+            return f"iCEM-style elite reuse: shifted_elites={self.cfg.icem_elites}"
+        return "standard MPPI Gaussian sampling"
+
+    @property
+    def proposal_description(self) -> str:
+        """Backward-compatible alias for the former proposal terminology."""
+        return self.sampling_description
 
     def sync_planning_model(self) -> None:
         """Synchronize explicit planner-model changes into active backends."""
@@ -220,8 +287,8 @@ class JointMPPIController:
 
         With warm start enabled, the previous optimized plan is shifted and
         re-simulated. Otherwise the pretrained policy generates the H-step
-        nominal. Optional nominal refinement remains available, but the MPPI
-        proposal itself is always standard full joint-space Gaussian noise.
+        nominal. Optional nominal refinement remains available. MPPI candidate
+        generation is selected independently through ``SamplingOption``.
         """
         t0 = time.perf_counter()
         start = self.robot.snapshot(data)
@@ -320,6 +387,222 @@ class JointMPPIController:
         controls[0] = nominal
         return controls
 
+    @staticmethod
+    def _make_bspline_basis(horizon: int, modes: int, degree: int = 3) -> np.ndarray:
+        """Return a row-normalized clamped uniform B-spline basis.
+
+        Row normalization keeps unit latent coefficient variance at roughly
+        unit marginal variance in every control timestep, so ``joint_noise``
+        retains the same scale interpretation as standard MPPI.
+        """
+        h = max(1, int(horizon))
+        m = max(degree + 1, min(int(modes), h))
+        n_internal = m - degree - 1
+        if n_internal > 0:
+            interior = np.linspace(0.0, 1.0, n_internal + 2, dtype=np.float64)[1:-1]
+        else:
+            interior = np.empty(0, dtype=np.float64)
+        knots = np.concatenate((
+            np.zeros(degree + 1, dtype=np.float64),
+            interior,
+            np.ones(degree + 1, dtype=np.float64),
+        ))
+        x = np.linspace(0.0, 1.0, h, dtype=np.float64)
+        # Cox-de Boor recursion. There are m basis functions.
+        basis = np.zeros((h, m), dtype=np.float64)
+        for i in range(m):
+            left, right = knots[i], knots[i + 1]
+            basis[:, i] = ((x >= left) & (x < right)).astype(np.float64)
+        basis[-1, -1] = 1.0
+        for p in range(1, degree + 1):
+            nxt = np.zeros_like(basis)
+            for i in range(m):
+                left_den = knots[i + p] - knots[i]
+                if left_den > 0.0:
+                    nxt[:, i] += ((x - knots[i]) / left_den) * basis[:, i]
+                if i + 1 < m:
+                    right_den = knots[i + p + 1] - knots[i + 1]
+                    if right_den > 0.0:
+                        nxt[:, i] += ((knots[i + p + 1] - x) / right_den) * basis[:, i + 1]
+            basis = nxt
+        basis[-1, :] = 0.0
+        basis[-1, -1] = 1.0
+        row_norm = np.sqrt(np.sum(basis * basis, axis=1, keepdims=True))
+        basis /= np.maximum(row_norm, 1e-12)
+        return basis
+
+    def _temporal_filter_inplace(self, noise: np.ndarray) -> None:
+        rho = float(self.cfg.temporal_noise_smoothing)
+        beta = math.sqrt(max(0.0, 1.0 - rho * rho))
+        for t in range(1, noise.shape[1]):
+            noise[:, t] = rho * noise[:, t - 1] + beta * noise[:, t]
+
+    def _history_basis(self) -> np.ndarray | None:
+        """Orthonormal low-rank basis in normalized full-sequence space."""
+        if not self._direction_history:
+            return None
+        d = self.cfg.horizon * self.robot.nu
+        cols = []
+        for direction in self._direction_history[-self.cfg.guided_rank:]:
+            v = np.asarray(direction, dtype=np.float64).reshape(d)
+            nrm = float(np.linalg.norm(v))
+            if np.isfinite(nrm) and nrm > 1e-8:
+                cols.append(v / nrm)
+        if not cols:
+            return None
+        matrix = np.column_stack(cols)
+        try:
+            q, _ = np.linalg.qr(matrix, mode="reduced")
+        except np.linalg.LinAlgError:
+            return None
+        if q.size == 0:
+            return None
+        return np.asarray(q[:, : min(q.shape[1], self.cfg.guided_rank)], dtype=np.float64)
+
+    def _sample_guided(self, nominal: np.ndarray, *, adaptive_diagonal: bool) -> np.ndarray:
+        n, h, nu = self.cfg.num_rollouts, self.cfg.horizon, self.robot.nu
+        z = self.rng.standard_normal((n, h, nu))
+        if adaptive_diagonal:
+            z *= np.sqrt(np.maximum(self._diag_variance, 1e-12))[None, :, :]
+        self._temporal_filter_inplace(z)
+
+        q = self._history_basis()
+        self._last_proposal_rank = 0 if q is None else int(q.shape[1])
+        alpha = float(self.cfg.guided_fraction) if q is not None else 0.0
+        if alpha > 0.0 and q is not None:
+            # Blend an ordinary full-space draw with a low-rank guided draw,
+            # then renormalize the expected trace back to D.  This is much less
+            # aggressive than assigning alpha*D/r variance to each guided
+            # direction (which is pathological for D=H*nu=400 and small r).
+            d, r = h * nu, q.shape[1]
+            z *= math.sqrt(max(0.0, 1.0 - alpha))
+            coeff = self.rng.standard_normal((n, r))
+            z.reshape(n, d)[:] += math.sqrt(alpha) * (coeff @ q.T)
+            expected_trace = (1.0 - alpha) * d + alpha * r
+            z *= math.sqrt(d / max(expected_trace, 1e-12))
+
+        noise = z * self._joint_std[None, None, :]
+        controls = nominal[None, :, :] + noise
+        np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
+        controls[0] = nominal
+        return controls
+
+    def _sample_spline(self, nominal: np.ndarray) -> np.ndarray:
+        n, h, nu = self.cfg.num_rollouts, self.cfg.horizon, self.robot.nu
+        m = self._spline_basis.shape[1]
+        coeff = self.rng.standard_normal((n, m, nu))
+        z = np.einsum("tm,nmu->ntu", self._spline_basis, coeff, optimize=True)
+        controls = nominal[None, :, :] + z * self._joint_std[None, None, :]
+        np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
+        controls[0] = nominal
+        return controls
+
+    def _sample_icem(self, nominal: np.ndarray) -> np.ndarray:
+        controls = self._sample_standard(nominal)
+        if self._icem_elites is None or self.cfg.icem_elites <= 0:
+            return controls
+        k = min(int(self.cfg.icem_elites), controls.shape[0] - 1, self._icem_elites.shape[0])
+        if k <= 0:
+            return controls
+        shifted = np.empty_like(self._icem_elites[:k])
+        shifted[:, :-1] = self._icem_elites[:k, 1:]
+        shifted[:, -1] = self._icem_elites[:k, -1]
+        np.clip(shifted, self._ctrl_low, self._ctrl_high, out=shifted)
+        controls[1 : 1 + k] = shifted
+        return controls
+
+    @staticmethod
+    def _normalized_weights(costs: np.ndarray, temperature: float) -> np.ndarray:
+        c = np.asarray(costs, dtype=np.float64).reshape(-1)
+        finite = np.isfinite(c)
+        w = np.zeros_like(c)
+        if not np.any(finite):
+            if len(w):
+                w[:] = 1.0 / len(w)
+            return w
+        rho = float(np.min(c[finite]))
+        w[finite] = np.exp(np.clip(-(c[finite] - rho) / max(float(temperature), 1e-300), -745.0, 0.0))
+        total = float(np.sum(w))
+        if total <= 1e-12:
+            w[finite] = 1.0 / np.count_nonzero(finite)
+        else:
+            w /= total
+        return w
+
+    def _shift_horizon_array(self, x: np.ndarray, *, tail) -> np.ndarray:
+        y = np.empty_like(x)
+        y[:-1] = x[1:]
+        y[-1] = tail
+        return y
+
+    def _update_direction_memory(self, candidate: np.ndarray, nominal: np.ndarray) -> None:
+        if self.sampling not in {SamplingOption.GUIDED, SamplingOption.DIAG_LOWRANK}:
+            return
+        denom = np.maximum(self._joint_std, 1e-12)
+        direction = (np.asarray(candidate) - np.asarray(nominal)) / denom[None, :]
+        if not np.all(np.isfinite(direction)):
+            return
+        if self.cfg.warm_start:
+            shifted_history = []
+            for old in self._direction_history:
+                old_h = np.asarray(old, dtype=np.float64).reshape(self.cfg.horizon, self.robot.nu)
+                old_shift = self._shift_horizon_array(old_h, tail=np.zeros(self.robot.nu))
+                shifted_history.append(old_shift.reshape(-1))
+            direction = self._shift_horizon_array(direction, tail=np.zeros(self.robot.nu))
+            self._direction_history = shifted_history
+        else:
+            self._direction_history = []
+        self._direction_history.append(direction.reshape(-1).copy())
+        if len(self._direction_history) > self.cfg.guided_rank:
+            self._direction_history = self._direction_history[-self.cfg.guided_rank :]
+
+    def _update_adaptive_diagonal(
+        self,
+        controls: np.ndarray,
+        nominal: np.ndarray,
+        costs: np.ndarray,
+        temperature: float,
+        ess: float,
+    ) -> None:
+        if self.sampling != SamplingOption.DIAG_LOWRANK:
+            return
+        w = self._normalized_weights(costs, temperature)
+        denom = np.maximum(self._joint_std, 1e-12)
+        delta = (np.asarray(controls) - np.asarray(nominal)[None, :, :]) / denom[None, None, :]
+        mean = np.einsum("n,nhu->hu", w, delta)
+        centered = delta - mean[None, :, :]
+        empirical = np.einsum("n,nhu->hu", w, centered * centered)
+
+        # With small populations, only trust the empirical variance when the
+        # MPPI weights retain a reasonable ESS. Otherwise shrink to standard
+        # MPPI variance instead of collapsing around a few samples.
+        target_ess = max(4.0, min(16.0, 0.5 * self.cfg.num_rollouts))
+        confidence = float(np.clip((float(ess) - 1.0) / max(target_ess - 1.0, 1.0), 0.0, 1.0))
+        target = (1.0 - confidence) + confidence * empirical
+        target = np.clip(target, self.cfg.diag_lowrank_min, self.cfg.diag_lowrank_max)
+        mean_target = float(np.mean(target))
+        if mean_target > 1e-12:
+            target /= mean_target
+        rate = float(self.cfg.diag_lowrank_rate)
+        updated = (1.0 - rate) * self._diag_variance + rate * target
+        updated = np.clip(updated, self.cfg.diag_lowrank_min, self.cfg.diag_lowrank_max)
+        mean_updated = float(np.mean(updated))
+        if mean_updated > 1e-12:
+            updated /= mean_updated
+        if self.cfg.warm_start:
+            updated = self._shift_horizon_array(updated, tail=np.ones(self.robot.nu))
+        self._diag_variance = updated
+
+    def _update_icem_elites(self, controls: np.ndarray, costs: np.ndarray) -> None:
+        if self.sampling != SamplingOption.ICEM or self.cfg.icem_elites <= 0:
+            return
+        finite = np.flatnonzero(np.isfinite(costs))
+        if finite.size == 0:
+            return
+        order = finite[np.argsort(np.asarray(costs)[finite])]
+        k = min(int(self.cfg.icem_elites), len(order))
+        self._icem_elites = np.asarray(controls[order[:k]], dtype=np.float64).copy()
+
     def step(self, data, current_s: float) -> tuple[np.ndarray, dict[str, Any]]:
         t_total = time.perf_counter()
 
@@ -374,8 +657,16 @@ class JointMPPIController:
         t_nominal = time.perf_counter()
         nominal = refined.controls
 
-        factors = None
-        controls = self._sample_standard(nominal)
+        if self.sampling == SamplingOption.GUIDED:
+            controls = self._sample_guided(nominal, adaptive_diagonal=False)
+        elif self.sampling == SamplingOption.DIAG_LOWRANK:
+            controls = self._sample_guided(nominal, adaptive_diagonal=True)
+        elif self.sampling == SamplingOption.SPLINE:
+            controls = self._sample_spline(nominal)
+        elif self.sampling == SamplingOption.ICEM:
+            controls = self._sample_icem(nominal)
+        else:
+            controls = self._sample_standard(nominal)
         t_sample = time.perf_counter()
 
         positions, costs, terminal_progress, failed = evaluate_control_batch(
@@ -440,6 +731,9 @@ class JointMPPIController:
 
         candidate = weighted_control_sequence(costs, controls, temperature)
         np.clip(candidate, self._ctrl_low, self._ctrl_high, out=candidate)
+        self._update_adaptive_diagonal(controls, nominal, costs, temperature, ess)
+        self._update_direction_memory(candidate, nominal)
+        self._update_icem_elites(controls, costs)
         if self.cfg.warm_start:
             self._previous_plan = np.asarray(candidate, dtype=np.float64).copy()
         best = int(np.argmin(costs)) if len(costs) else 0
@@ -464,6 +758,12 @@ class JointMPPIController:
             "best_cost": float(costs[best]),
             "best_terminal_progress": float(terminal_progress[best]),
             "rollout_backend": self.rollout_backend_name,
+            "sampling_option": self.sampling.value,
+            "proposal": self.sampling.value,  # backward-compatible info key
+            "proposal_rank": int(self._last_proposal_rank),
+            "diag_variance_min": float(np.min(self._diag_variance)),
+            "diag_variance_max": float(np.max(self._diag_variance)),
+            "icem_elites": 0 if self._icem_elites is None else int(len(self._icem_elites)),
             "timing_ms": {
                 "nominal": 1e3 * (t_nominal - t_total),
                 **nominal_parts,

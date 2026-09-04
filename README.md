@@ -4,7 +4,7 @@ This project studies online refinement of a pretrained **Ant** locomotion policy
 
 A velocity-conditioned PPO policy provides the nominal joint-level behavior. At test time, MPPI can refine that nominal online for stadium racing and evaluate how much model-based sampling helps under terrain changes, task changes, and model mismatch.
 
-The locomotion policy trainer is adapted from Margolis et al., *Rapid Locomotion via Reinforcement Learning* (RSS 2022 / IJRR).
+The locomotion policy trainer is adapted from Margolis et al., **Rapid Locomotion via Reinforcement Learning** (RSS 2022 / IJRR).
 
 * Paper: https://doi.org/10.1177/02783649231224053
 * Released reference code: https://github.com/Improbable-AI/rapid-locomotion-rl
@@ -61,10 +61,20 @@ The locomotion policy trainer is adapted from Margolis et al., *Rapid Locomotion
 
 The current project intentionally supports a single robot, **Ant**, and two controller variants:
 
-| Variant   | Description                                                                     |
-| --------- | ------------------------------------------------------------------------------- |
-| `nominal` | Execute the pretrained velocity-conditioned policy directly.                    |
-| `mppi`    | Refine a policy-seeded control sequence online with standard direct-joint MPPI. |
+| Controller variant | Description |
+| --- | --- |
+| `nominal` | Execute the pretrained velocity-conditioned policy directly. |
+| `mppi` | Refine a policy-seeded control sequence online with MPPI. Candidate generation is selected independently with `--sampling`. |
+
+MPPI sampling is an orthogonal configuration option:
+
+| Sampling option | Description |
+| --- | --- |
+| `standard` | Standard fixed-scale direct-joint Gaussian MPPI sampling. |
+| `guided` | Low-rank history-guided sampling built from recent successful MPPI update directions. |
+| `diag-lowrank` | Time/joint-dependent diagonal variance adaptation plus the history-guided low-rank component. |
+| `spline` | Smooth low-dimensional cubic B-spline perturbations instead of independent control noise at every horizon step. |
+| `icem` | iCEM-style memory: shifted elite control sequences from the previous update are reused in the next population. |
 
 The main pipeline is:
 
@@ -356,6 +366,110 @@ python -m racing.experiments.race \
 
 `mppi` is the default controller variant.
 
+### MPPI sampling options
+
+`--sampling` changes **only candidate generation inside MPPI**. The controller remains `--variant mppi`, with the same policy-seeded nominal, nonlinear MuJoCo rollout physics, racing/task objective, LBPS temperature selection, actuator clipping, and exponentially weighted MPPI control update. This separation makes controller design and sampling design independent.
+
+The non-standard sampling options are implementation-specific adaptations inspired by the cited methods below; they are **not exact reproductions** of Guided ES, CMA-ES, Model Tensor Planning, or iCEM.
+
+#### Guided low-rank sampling (`--sampling guided`)
+
+`guided` stores recent full-horizon MPPI update directions, shifts them with the receding horizon, and orthonormalizes the most recent directions into a low-rank basis. The next proposal mixes ordinary full-space MPPI noise with noise inside that history subspace. The expected proposal trace is renormalized so the method reallocates the standard exploration budget instead of simply adding more noise.
+
+This is inspired by Guided Evolutionary Strategies, which elongates a random-search distribution along a low-dimensional guiding subspace [1]. Here the guiding vectors are previous MPPI update directions rather than external surrogate gradients.
+
+```bash
+python -m racing.experiments.race \
+  --variant mppi \
+  --sampling guided \
+  --rollouts 32 \
+  --horizon 50 \
+  --joint-noise 0.5 \
+  --guided-rank 6 \
+  --guided-fraction 0.5 \
+  --profile
+```
+
+Key parameters:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--guided-rank N` | `6` | Maximum number of recent update directions retained in the guiding subspace. |
+| `--guided-fraction FLOAT` | `0.50` | Fraction of proposal energy assigned to the learned low-rank component before trace renormalization. |
+
+#### Diagonal + low-rank sampling (`--sampling diag-lowrank`)
+
+`diag-lowrank` extends `guided` with an adaptive normalized variance for every `(horizon step, actuator)` pair. The diagonal target is estimated from the MPPI-weighted applied perturbations. With a small rollout population, the update is deliberately conservative: low ESS shrinks the estimate back toward standard MPPI, the variance is clipped, smoothed with an EMA, renormalized to preserve the average exploration scale, and shifted with the warm start.
+
+The diagonal covariance-adaptation idea is inspired by the covariance adaptation principles of CMA-ES [2], while the low-rank history component follows the guided-subspace idea in [1]. This controller does not implement the full CMA-ES algorithm.
+
+```bash
+python -m racing.experiments.race \
+  --variant mppi \
+  --sampling diag-lowrank \
+  --rollouts 32 \
+  --horizon 50 \
+  --joint-noise 0.5 \
+  --guided-rank 6 \
+  --guided-fraction 0.5 \
+  --diag-lowrank-rate 0.08 \
+  --diag-lowrank-min 0.25 \
+  --diag-lowrank-max 4.0 \
+  --profile
+```
+
+Key parameters:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--diag-lowrank-rate FLOAT` | `0.08` | EMA rate for the time/joint variance update. |
+| `--diag-lowrank-min FLOAT` | `0.25` | Minimum normalized variance factor before renormalization. |
+| `--diag-lowrank-max FLOAT` | `4.0` | Maximum normalized variance factor before renormalization. |
+
+#### B-spline latent sampling (`--sampling spline`)
+
+`spline` samples a small set of cubic B-spline coefficients per actuator and expands them into the full horizon. With the default `H=50`, eight Ant actuators, and six spline modes, the stochastic proposal is parameterized by `6 x 8 = 48` latent coefficients rather than 400 independent time/joint values. The basis is row-normalized so `joint_noise` remains approximately comparable to the standard MPPI scale. Because the spline perturbation is already temporally smooth, the standard AR temporal-noise filter is not applied a second time.
+
+This sampling option is inspired by structured spline control-trajectory sampling, including the B-spline trajectory parameterization used in Model Tensor Planning [3]. It implements only the low-dimensional B-spline proposal, not the tensor-sampling algorithm of that paper.
+
+```bash
+python -m racing.experiments.race \
+  --variant mppi \
+  --sampling spline \
+  --rollouts 32 \
+  --horizon 50 \
+  --joint-noise 0.5 \
+  --spline-modes 6 \
+  --profile
+```
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--spline-modes N` | `6` | Number of cubic B-spline latent modes per actuator; values below four are raised to four. |
+
+#### iCEM-style elite reuse (`--sampling icem`)
+
+`icem` retains the best finite-cost control sequences from the previous controller update. At the next MPC step those sequences are shifted by one horizon step and inserted into the new candidate population; the remaining candidates are sampled using the standard MPPI proposal. The controller still uses LBPS and the standard MPPI weighted update rather than a CEM elite-mean update.
+
+This is inspired by the memory/sample-reuse mechanism in sample-efficient iCEM [4].
+
+```bash
+python -m racing.experiments.race \
+  --variant mppi \
+  --sampling icem \
+  --rollouts 32 \
+  --horizon 50 \
+  --joint-noise 0.5 \
+  --icem-elites 4 \
+  --profile
+```
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--icem-elites N` | `4` | Number of best previous control sequences shifted and reused in the next rollout population. |
+
+For controlled sampling comparisons, keep `--variant mppi`, `--seed`, `--rollouts`, `--horizon`, `--joint-noise`, planner physics, plant physics, task, and terrain fixed and change only `--sampling` plus sampling-specific parameters.
+
 Warm-starting is enabled by default. Use:
 
 ```text
@@ -578,12 +692,20 @@ To load a saved empirical prior:
 | `--policy SPEC` | `auto` | Loads `racing/policies/checkpoints/ant_rapid` automatically or accepts an explicit checkpoint/specification. |
 | `--policy-speed MPS` | none | Optional maximum racing-speed cap. |
 | `--laps N` | `1` | Requested laps. |
-| `--variant {nominal,mppi}` | `mppi` | Direct policy or policy-seeded MPPI. |
+| `--variant {nominal,mppi}` | `mppi` | Controller family: direct nominal-policy execution or MPPI refinement. |
+| `--sampling {standard,guided,diag-lowrank,spline,icem}` | `standard` | Candidate-generation strategy used by MPPI; non-standard values require `--variant mppi`. |
 | `--rollouts N` | `32` | MPPI candidate trajectories per update. |
 | `--horizon N` | `50` | MPPI horizon in control steps. |
 | `--dt SEC` | policy dt | Control period. |
 | `--lbps-delta FLOAT` | `0.95` | Adaptive-temperature target. |
 | `--joint-noise FLOAT` | `0.5` | Actuator-range MPPI exploration scale. |
+| `--guided-rank N` | `6` | History-subspace rank used by `guided` and `diag-lowrank`. |
+| `--guided-fraction FLOAT` | `0.50` | Low-rank proposal fraction used by `guided` and `diag-lowrank`. |
+| `--diag-lowrank-rate FLOAT` | `0.08` | EMA rate for adaptive time/joint variances. |
+| `--diag-lowrank-min FLOAT` | `0.25` | Minimum normalized adaptive diagonal variance factor. |
+| `--diag-lowrank-max FLOAT` | `4.0` | Maximum normalized adaptive diagonal variance factor. |
+| `--spline-modes N` | `6` | Cubic B-spline latent modes per actuator. |
+| `--icem-elites N` | `4` | Shifted previous elites reused by the `icem` proposal. |
 | `--nominal-refine-iters N` | `0` | Optional policy-nominal refinement. |
 | `--seed N` | `1` | Controller random seed. |
 | `--workers N` | `16` | Persistent native rollout worker threads; `0` selects automatically. |
@@ -602,7 +724,7 @@ To load a saved empirical prior:
 | `--mass-scale FLOAT` | `1.0` | Plant mass scale. |
 | `--motor-scale FLOAT` | `1.0` | Plant actuator-strength scale. |
 | `--slope-deg FLOAT` | `0.0` | Plant ground slope. |
-| `--profile` | off | Print compact MPPI timing statistics. |
+| `--profile` | off | Print compact controller timing statistics. |
 | `--disable-gc` | off | Disable Python cyclic GC during the race loop to reduce timing jitter. |
 | `--max-steps N` | none | Optional control-step limit. |
 | `--headless` | off | Disable viewer. |
@@ -771,7 +893,7 @@ python -m racing.experiments.replay \
 
 ## Notes on reproducibility and performance
 
-* Use the same `--seed`, horizon, rollout count, plant/planner physics settings, and task configuration when comparing `nominal` and `mppi`.
+* Use the same `--seed`, horizon, rollout count, `--joint-noise`, plant/planner physics settings, task, and terrain when comparing MPPI sampling options.
 * The first JAX policy call includes JIT compilation and is much slower than steady-state inference.
 * MPPI warm start is enabled by default.
 * Online MPPI rollouts are CPU MuJoCo. The controller automatically prefers the fused C++ evaluator, then stock `mujoco.rollout`, then the Python compatibility path.
@@ -782,6 +904,16 @@ python -m racing.experiments.replay \
 * Thread count and rollout chunk size are machine dependent; benchmark them on the target CPU.
 * GIF export uses saved states, so rendering does not alter the racing result.
 
-## Reference
+## References
 
-Margolis, G. B., Yang, G., Paigwar, K., Chen, T., & Agrawal, P. *Rapid Locomotion via Reinforcement Learning*. International Journal of Robotics Research. https://doi.org/10.1177/02783649231224053
+The non-standard sampling options above are implementation-specific adaptations of the following ideas; the citations identify the main methodological inspiration rather than claiming exact reproduction.
+
+[1] Maheswaranathan, N., Metz, L., Tucker, G., Choi, D., & Sohl-Dickstein, J. *Guided evolutionary strategies: augmenting random search with surrogate gradients*. Proceedings of the 36th International Conference on Machine Learning (ICML), PMLR 97:4264-4273, 2019. https://proceedings.mlr.press/v97/maheswaranathan19a.html
+
+[2] Hansen, N. *The CMA Evolution Strategy: A Tutorial*. arXiv:1604.00772, 2016. https://arxiv.org/abs/1604.00772
+
+[3] Le, A. T., Nguyen, K., Vu, M. N., Carvalho, J., & Peters, J. *Model Tensor Planning*. Transactions on Machine Learning Research, 2025. https://arxiv.org/abs/2505.01059
+
+[4] Pinneri, C., Sawant, S., Blaes, S., Achterhold, J., Stueckler, J., Rolinek, M., & Martius, G. *Sample-efficient Cross-Entropy Method for Real-time Planning*. Proceedings of the 2020 Conference on Robot Learning, PMLR 155:1049-1065, 2021. https://proceedings.mlr.press/v155/pinneri21a.html
+
+[5] Margolis, G. B., Yang, G., Paigwar, K., Chen, T., & Agrawal, P. *Rapid Locomotion via Reinforcement Learning*. International Journal of Robotics Research. https://doi.org/10.1177/02783649231224053
