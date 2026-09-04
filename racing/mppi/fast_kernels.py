@@ -13,45 +13,7 @@ except Exception:  # pragma: no cover - optional acceleration dependency
         def decorate(fn):
             return fn
         return decorate
-
-
-@njit(cache=True, nogil=True, fastmath=False)
-def spg_dense_project_and_smooth(
-    task_factor: np.ndarray,
-    null_projector: np.ndarray,
-    z_task: np.ndarray,
-    z_null: np.ndarray,
-    default_std: np.ndarray,
-    rho: float,
-    null_std_scale: float,
-    out: np.ndarray,
-) -> None:
-    n = out.shape[0]
-    h = out.shape[1]
-    nu = out.shape[2]
-    r = min(max(float(rho), 0.0), 0.999999)
-    beta = math.sqrt(max(0.0, 1.0 - r * r))
-    null_scale = float(null_std_scale)
-
-    for i in range(n):
-        for t in range(h):
-            for u in range(nu):
-                value = (
-                    task_factor[t, u, 0] * z_task[i, t, 0]
-                    + task_factor[t, u, 1] * z_task[i, t, 1]
-                )
-                if null_scale > 0.0:
-                    null_value = 0.0
-                    for k in range(nu):
-                        null_value += null_projector[t, u, k] * z_null[i, t, k]
-                    value += null_value * default_std[u] * null_scale
-
-                if t == 0 or r <= 0.0:
-                    out[i, t, u] = value
-                else:
-                    out[i, t, u] = r * out[i, t - 1, u] + beta * value
-
-
+        
 @njit(cache=True, nogil=True, fastmath=False)
 def _stadium_project_scalar(
     xw: float, yw: float,
