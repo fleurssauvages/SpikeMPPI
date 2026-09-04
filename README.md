@@ -1,5 +1,19 @@
 # Online refinement of policies using MPPI
 
+<p align="center"><strong>
+<a href="#results">Results</a> ·
+<a href="#overview">Overview</a> ·
+<a href="#requirements">Requirements</a> ·
+<a href="#training-the-ant-locomotion-policy">Training</a> ·
+<a href="#racing">Racing</a> ·
+<a href="#terrain-transfer">Terrain Transfer</a> ·
+<a href="#task-transfer">Task Transfer</a> ·
+<a href="#ant-geometry-transfer">Geometry Transfer</a> ·
+<a href="#plant-model-mismatch">Model Mismatch</a> ·
+<a href="#replay">Replay</a> ·
+<a href="#references">References</a>
+</strong></p>
+
 This project studies online refinement of a pretrained **Ant** locomotion policy with **Model Predictive Path Integral control (MPPI)** in MuJoCo.
 
 A velocity-conditioned PPO policy provides the nominal joint-level behavior. At test time, MPPI can refine that nominal online for stadium racing and evaluate how much model-based sampling helps under terrain changes, task changes, and model mismatch.
