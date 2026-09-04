@@ -1,6 +1,7 @@
-# Online refinement of policies using MPPI
+# Spike-MPPI: motoneuron-inspired online policy refinement with MPPI
 
 <p align="center"><strong>
+<a href="#spike-mppi">Spike-MPPI</a> ·
 <a href="#results">Results</a> ·
 <a href="#overview">Overview</a> ·
 <a href="#requirements">Requirements</a> ·
@@ -14,91 +15,232 @@
 <a href="#references">References</a>
 </strong></p>
 
-This project studies online refinement of a pretrained **Ant** locomotion policy with **Model Predictive Path Integral control (MPPI)** in MuJoCo.
+This project studies **online refinement of a pretrained Ant locomotion policy with Model Predictive Path Integral control (MPPI)** in MuJoCo. A velocity-conditioned PPO policy provides the nominal joint-level behavior, while MPPI improves that behavior online without retraining the policy.
 
-A velocity-conditioned PPO policy provides the nominal joint-level behavior. At test time, MPPI can refine that nominal online for stadium racing and evaluate how much model-based sampling helps under terrain changes, task changes, and model mismatch.
+The main novelty of this repository is **Spike-MPPI**, a motoneuron-inspired MPPI sampling method. Instead of perturbing the nominal control sequence with independent Gaussian noise, Spike-MPPI samples sparse marked motor events, maps them through coordinated actuator synergies, and converts them into smooth control perturbations with causal twitch kernels. The proposal distribution itself adapts online from MPPI rollout weights by learning when a synergy should fire, which sign is useful, and which recruitment amplitudes are favored.
+
+The same pretrained policy and controller are evaluated across stadium racing, novel terrain, new tasks, morphology changes, and plant-model mismatch. The remaining MPPI samplers in this repository are retained primarily as controlled comparison baselines.
 
 The locomotion policy trainer is adapted from Margolis et al., **Rapid Locomotion via Reinforcement Learning** (RSS 2022 / IJRR).
 
 * Paper: https://doi.org/10.1177/02783649231224053
 * Released reference code: https://github.com/Improbable-AI/rapid-locomotion-rl
 
+## Spike-MPPI
+
+Spike-MPPI replaces direct Gaussian control noise with a **marked point-process proposal**. For rollout \(i\), horizon step \(t\), and motor synergy \(m\), positive and negative spike counts are sampled from learned intensities. Each event also carries a recruitment level. The event train is convolved with a causal twitch kernel and projected through a multi-joint synergy dictionary before being added to the policy-seeded nominal control. After the rollouts are evaluated, the usual MPPI weights update the proposal state online. Spike-MPPI learns:
+
+* **firing intensity** — when and which synergy should be explored;
+* **sign preference** — whether positive or negative events are more useful;
+* **recruitment distribution** — which event magnitudes are favored.
+
+The signed proposal is mean-centered and dynamically variance-normalized, so adapting the spike statistics changes the **structure, skew and temporal organization** of exploration without simply increasing its RMS magnitude. The learned proposal state is shifted with the receding horizon in the same way as the warm-started control sequence.
+
+The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergies, 16 Hz base firing rate (about 128 expected events over the default 1 s horizon), 0.02 rate adaptation, 0.5 rate prior, rate factors in `[0.5, 5.0]`, 6 recruitment levels, and a 16/64/200 ms rise/decay/duration twitch.
+
 ## Results
 
 ### Same-task refinement
 
-|                       Nominal                      |                                             MPPI                                             |
-| :------------------------------------------------: | :------------------------------------------------------------------------------------------: |
-| <img src="racing/results/nominal.gif" width="460"> | <img src="racing/results/mppi.gif" width="460" alt="MPPI racing on the obstacle-free track"> |
+<table align="center">
+  <tr>
+    <th align="center">Nominal</th>
+    <th align="center">MPPI</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="racing/results/nominal.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+    </td>
+    <td align="center">
+      <img src="racing/results/mppi.gif" width="460" alt="MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+  <tr>
+    <th colspan="2" align="center">Spike-MPPI</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="racing/results/spike.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+</table>
 
 ### Adaptation to novel terrain
 
-|                          Nominal                         |                                       MPPI                                       |
-| :------------------------------------------------------: | :------------------------------------------------------------------------------: |
-| <img src="racing/results/nominal_ramps.gif" width="460"> | <img src="racing/results/mppi_ramps.gif" width="460" alt="MPPI racing on ramps"> |
+<table align="center">
+  <tr>
+    <th align="center">Nominal</th>
+    <th align="center">MPPI</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="racing/results/nominal_rocky.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+    </td>
+    <td align="center">
+      <img src="racing/results/mppi_rocky.gif" width="460" alt="MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+  <tr>
+    <th colspan="2" align="center">Spike-MPPI</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="racing/results/spike_rocky.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+</table>
 
-|                          Nominal                          |                                        MPPI                                        |
-| :-------------------------------------------------------: | :--------------------------------------------------------------------------------: |
-| <img src="racing/results/nominal_stairs.gif" width="460"> | <img src="racing/results/mppi_stairs.gif" width="460" alt="MPPI racing on stairs"> |
-
-|                          Nominal                         |                                           MPPI                                           |
-| :------------------------------------------------------: | :--------------------------------------------------------------------------------------: |
-| <img src="racing/results/nominal_rocky.gif" width="460"> | <img src="racing/results/mppi_rocky.gif" width="460" alt="MPPI racing on rocky terrain"> |
-
-|                          Nominal                         |                                           MPPI                                           |
-| :------------------------------------------------------: | :--------------------------------------------------------------------------------------: |
-| <img src="racing/results/nominal_mixed.gif" width="460"> | <img src="racing/results/mppi_mixed.gif" width="460" alt="MPPI racing on mixed terrain"> |
+<table align="center">
+  <tr>
+    <th align="center">Nominal</th>
+    <th align="center">MPPI</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="racing/results/nominal_mixed.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+    </td>
+    <td align="center">
+      <img src="racing/results/mppi_mixed.gif" width="460" alt="MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+  <tr>
+    <th colspan="2" align="center">Spike-MPPI</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="racing/results/spike_mixed.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+</table>
 
 ### Adaptation to new tasks
 
-|                         Nominal                         |                                      MPPI                                     |
-| :-----------------------------------------------------: | :---------------------------------------------------------------------------: |
-| <img src="racing/results/nominal_sled.gif" width="460"> | <img src="racing/results/mppi_sled.gif" width="460" alt="MPPI towing a sled"> |
+<table align="center">
+  <tr>
+    <th align="center">Nominal</th>
+    <th align="center">MPPI</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="racing/results/nominal_box.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+    </td>
+    <td align="center">
+      <img src="racing/results/mppi_box.gif" width="460" alt="MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+  <tr>
+    <th colspan="2" align="center">Spike-MPPI</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="racing/results/spike_box.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+</table>
 
-|                         Nominal                        |                                     MPPI                                     |
-| :----------------------------------------------------: | :--------------------------------------------------------------------------: |
-| <img src="racing/results/nominal_box.gif" width="460"> | <img src="racing/results/mppi_box.gif" width="460" alt="MPPI pushing a box"> |
+<table align="center">
+  <tr>
+    <th align="center">Nominal</th>
+    <th align="center">MPPI</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="racing/results/nominal_sled.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+    </td>
+    <td align="center">
+      <img src="racing/results/mppi_sled.gif" width="460" alt="MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+  <tr>
+    <th colspan="2" align="center">Spike-MPPI</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="racing/results/spike_sled.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+</table>
 
 ### Adaptation to modified Ant geometry
 
-|                           Nominal                           |                                               MPPI                                              |
-| :---------------------------------------------------------: | :---------------------------------------------------------------------------------------------: |
-| <img src="racing/results/nominal_sameside.gif" width="460"> | <img src="racing/results/mppi_sameside.gif" width="460" alt="MPPI with same-side leg mismatch"> |
+<table align="center">
+  <tr>
+    <th align="center">Nominal</th>
+    <th align="center">MPPI</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="racing/results/nominal_diagonal.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+    </td>
+    <td align="center">
+      <img src="racing/results/mppi_diagonal.gif" width="460" alt="MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+  <tr>
+    <th colspan="2" align="center">Spike-MPPI</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="racing/results/spike_diagonal.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+</table>
 
-|                           Nominal                           |                                              MPPI                                              |
-| :---------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
-| <img src="racing/results/nominal_diagonal.gif" width="460"> | <img src="racing/results/mppi_diagonal.gif" width="460" alt="MPPI with diagonal leg mismatch"> |
+<table align="center">
+  <tr>
+    <th align="center">Nominal</th>
+    <th align="center">MPPI</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="racing/results/nominal_sameside.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+    </td>
+    <td align="center">
+      <img src="racing/results/mppi_sameside.gif" width="460" alt="MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+  <tr>
+    <th colspan="2" align="center">Spike-MPPI</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="racing/results/spike_sameside.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+    </td>
+  </tr>
+</table>
+
 
 ---
 
 ## Overview
 
-The current project intentionally supports a single robot, **Ant**, and two controller variants:
+The project supports one robot, **Ant**, and two controller variants:
 
 | Controller variant | Description |
 | --- | --- |
 | `nominal` | Execute the pretrained velocity-conditioned policy directly. |
 | `mppi` | Refine a policy-seeded control sequence online with MPPI. Candidate generation is selected independently with `--sampling`. |
 
-MPPI sampling is an orthogonal configuration option:
+Spike-MPPI is the primary sampling contribution. Other samplers are included as baselines and ablations:
 
-| Sampling option | Description |
-| --- | --- |
-| `standard` | Standard fixed-scale direct-joint Gaussian MPPI sampling. |
-| `guided` | Low-rank history-guided sampling built from recent successful MPPI update directions. |
-| `diag-lowrank` | Time/joint-dependent diagonal variance adaptation plus the history-guided low-rank component. |
-| `spline` | Smooth low-dimensional cubic B-spline perturbations instead of independent control noise at every horizon step. |
-| `icem` | iCEM-style memory: shifted elite control sequences from the previous update are reused in the next population. |
+| Sampling option | Role | Description |
+| --- | --- | --- |
+| `spike` | **Main method** | Motoneuron-inspired marked spike events, multi-joint synergies, causal twitch decoding, and online adaptation of firing rate, sign and recruitment statistics. |
+| `standard` | Baseline | Fixed-scale direct-joint Gaussian MPPI sampling. |
+| `guided` | Baseline | Low-rank history-guided sampling from recent successful MPPI update directions. |
+| `diag-lowrank` | Baseline | Time/joint-dependent diagonal variance adaptation plus a history-guided low-rank component. |
+| `spline` | Baseline | Smooth low-dimensional cubic B-spline perturbations. |
+| `icem` | Baseline | Shifted elite control sequences from the previous update are reused in the next population. |
 
 The main pipeline is:
 
 1. Train a velocity-conditioned Ant locomotion policy with PPO and a Grid Adaptive Curriculum.
 2. Use the learned policy as the nominal controller for a 2-D stadium task.
-3. Optionally refine the nominal online with MPPI.
+3. Refine the nominal online with Spike-MPPI or a comparison sampler.
 4. Evaluate transfer to new terrain, new tasks, leg-length mismatch, and model-parameter mismatch.
 5. Save exact MuJoCo states for deterministic replay and GIF export.
 
-The MPPI controller acts directly on Ant's eight actuator controls. The pretrained policy remains the nominal source of locomotion behavior; MPPI searches locally around that behavior rather than replacing the locomotion policy.
+The MPPI controller acts directly on Ant's eight actuator controls. The pretrained policy remains the source of nominal locomotion behavior; Spike-MPPI searches around that behavior rather than replacing the policy.
 
 ---
 
@@ -107,7 +249,9 @@ The MPPI controller acts directly on Ant's eight actuator controls. The pretrain
 Online MPPI planning is CPU-only. The controller automatically selects the fastest available MuJoCo rollout path in this order:
 
 1. fused C++ MuJoCo physics + MPPI cost evaluation,
+
 2. stock batched `mujoco.rollout`,
+
 3. the legacy Python rollout loop as a compatibility fallback.
 
 There is no rollout-backend command-line selector. When the fused extension is available it is preferred automatically.
@@ -151,10 +295,15 @@ RACING_FUSED_VERIFY=0 python -m racing.experiments.race ...
 ### Platform
 
 * Python **3.10+**.
+
 * Git.
+
 * MuJoCo **3.3+**.
+
 * A GPU is strongly recommended for PPO training.
+
 * The fused C++ rollout evaluator currently targets Linux/macOS and requires a C++17 compiler.
+
 * If the fused extension is unavailable, online MPPI falls back automatically to stock `mujoco.rollout` and then to the Python compatibility path.
 
 ### 1. Create an environment
@@ -202,7 +351,9 @@ python -m pip install -r requirements.txt
 Useful upstream references:
 
 * MuJoCo MJX: https://mujoco.readthedocs.io/en/latest/mjx.html
+
 * MuJoCo Warp: https://mujoco.readthedocs.io/en/latest/mjwarp/index.html
+
 * MuJoCo Playground: https://github.com/google-deepmind/mujoco_playground
 
 Verify the environment:
@@ -366,25 +517,57 @@ python -m racing.experiments.race \
 
 `nominal` executes one closed-loop policy action per control tick and does not perform MPPI rollout optimization.
 
-### MPPI
+### Spike-MPPI
+
+The main controller configuration is:
 
 ```bash
 python -m racing.experiments.race \
   --robot ant \
   --policy auto \
   --variant mppi \
+  --sampling spike \
   --rollouts 32 \
   --horizon 50 \
-  --joint-noise 0.5
+  --profile
 ```
 
-`mppi` is the default controller variant.
+`--sampling spike` keeps the policy-seeded nominal, MuJoCo rollout physics, task cost, LBPS temperature selection, actuator clipping and exponentially weighted MPPI control update unchanged. Only the stochastic proposal is replaced.
 
-### MPPI sampling options
+At each update, Spike-MPPI samples signed, marked events in a motor-synergy space. Causal twitch kernels transform those sparse events into smooth horizon-length actuator perturbations. MPPI rollout weights then adapt the firing-rate map, positive/negative preference and recruitment-level distribution online. The learned proposal is warm-started by shifting these statistics with the receding horizon.
 
-`--sampling` changes **only candidate generation inside MPPI**. The controller remains `--variant mppi`, with the same policy-seeded nominal, nonlinear MuJoCo rollout physics, racing/task objective, LBPS temperature selection, actuator clipping, and exponentially weighted MPPI control update. This separation makes controller design and sampling design independent.
+Primary spike parameters:
 
-The non-standard sampling options are implementation-specific adaptations inspired by the cited methods below; they are **not exact reproductions** of Guided ES, CMA-ES, Model Tensor Planning, or iCEM.
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--spike-synergies N` | `8` | Number of motor-synergy channels. Ant supports an overcomplete dictionary when larger values are requested. |
+| `--spike-rate-hz FLOAT` | `16.0` | Base event rate per synergy. With 8 synergies and the default 1 s horizon this gives about 128 expected events/rollout. |
+| `--spike-rate-update FLOAT` | `0.02` | Online firing-rate adaptation rate. |
+| `--spike-rate-prior FLOAT` | `0.5` | Prior strength pulling learned rates toward the base rate. |
+| `--spike-rate-min-factor FLOAT` | `0.5` | Minimum firing-rate factor relative to the base rate. |
+| `--spike-rate-max-factor FLOAT` | `5.0` | Maximum firing-rate factor relative to the base rate. |
+| `--spike-recruitment-levels N` | `6` | Number of discrete recruitment amplitudes. |
+| `--spike-twitch-rise SEC` | `0.016` | Twitch rise time. |
+| `--spike-twitch-decay SEC` | `0.064` | Twitch decay time. |
+| `--spike-twitch-duration SEC` | `0.200` | Causal twitch support. |
+| `--spike-sign-update FLOAT` | `0.10` | Online adaptation rate of positive/negative event preference. |
+| `--spike-sign-prior FLOAT` | `0.50` | Prior strength toward balanced event signs. |
+| `--spike-sign-min-prob FLOAT` | `0.10` | Minimum probability assigned to either sign. |
+| `--spike-mark-update FLOAT` | `0.10` | Online adaptation rate of the recruitment-level distribution. |
+| `--spike-mark-prior FLOAT` | `0.50` | Prior strength on the recruitment-level distribution. |
+| `--spike-mark-min-prob FLOAT` | `0.01` | Minimum probability assigned to any recruitment level. |
+
+For the flat-ground HPO result, `--joint-noise 0.3` is a useful starting point; transfer experiments should retune or validate that value rather than assuming it is universal.
+
+### Comparison MPPI samplers
+
+The samplers below are retained for controlled comparisons. `--sampling` changes **only candidate generation inside MPPI**, so comparisons can keep the nominal policy, rollout count, horizon, task objective and physics fixed.
+
+The non-standard comparison samplers are implementation-specific adaptations inspired by the cited methods; they are not exact reproductions of Guided ES, CMA-ES, Model Tensor Planning or iCEM.
+
+#### Standard Gaussian sampling (`--sampling standard`)
+
+`standard` perturbs each actuator trajectory directly with fixed-scale Gaussian MPPI noise. It is the reference baseline for measuring whether structured spike-based exploration improves sample efficiency, transfer behavior, or control quality.
 
 #### Guided low-rank sampling (`--sampling guided`)
 
@@ -482,7 +665,7 @@ python -m racing.experiments.race \
 | --- | ---: | --- |
 | `--icem-elites N` | `4` | Number of best previous control sequences shifted and reused in the next rollout population. |
 
-For controlled sampling comparisons, keep `--variant mppi`, `--seed`, `--rollouts`, `--horizon`, `--joint-noise`, planner physics, plant physics, task, and terrain fixed and change only `--sampling` plus sampling-specific parameters.
+For controlled sampling comparisons, keep `--variant mppi`, `--seed`, `--rollouts`, `--horizon`, `--joint-noise`, planner physics, plant physics, task and terrain fixed and change only `--sampling` plus sampling-specific parameters.
 
 Warm-starting is enabled by default. Use:
 
@@ -707,12 +890,24 @@ To load a saved empirical prior:
 | `--policy-speed MPS` | none | Optional maximum racing-speed cap. |
 | `--laps N` | `1` | Requested laps. |
 | `--variant {nominal,mppi}` | `mppi` | Controller family: direct nominal-policy execution or MPPI refinement. |
-| `--sampling {standard,guided,diag-lowrank,spline,icem}` | `standard` | Candidate-generation strategy used by MPPI; non-standard values require `--variant mppi`. |
+| `--sampling {spike,standard,guided,diag-lowrank,spline,icem}` | `standard` | Candidate-generation strategy used by MPPI. `spike` is the primary method in this repository. |
 | `--rollouts N` | `32` | MPPI candidate trajectories per update. |
 | `--horizon N` | `50` | MPPI horizon in control steps. |
 | `--dt SEC` | policy dt | Control period. |
 | `--lbps-delta FLOAT` | `0.95` | Adaptive-temperature target. |
 | `--joint-noise FLOAT` | `0.5` | Actuator-range MPPI exploration scale. |
+| `--spike-synergies N` | `8` | Motor-synergy channels used by Spike-MPPI. |
+| `--spike-rate-hz FLOAT` | `16.0` | Base spike-event rate per synergy. |
+| `--spike-rate-update FLOAT` | `0.02` | Online firing-rate adaptation rate. |
+| `--spike-rate-prior FLOAT` | `0.5` | Prior strength toward the base firing rate. |
+| `--spike-rate-min-factor FLOAT` | `0.5` | Minimum normalized firing-rate factor. |
+| `--spike-rate-max-factor FLOAT` | `5.0` | Maximum normalized firing-rate factor. |
+| `--spike-recruitment-levels N` | `6` | Number of recruitment amplitudes. |
+| `--spike-twitch-rise SEC` | `0.016` | Twitch rise time. |
+| `--spike-twitch-decay SEC` | `0.064` | Twitch decay time. |
+| `--spike-twitch-duration SEC` | `0.200` | Twitch duration. |
+| `--spike-sign-update FLOAT` | `0.10` | Sign-preference adaptation rate. |
+| `--spike-mark-update FLOAT` | `0.10` | Recruitment-distribution adaptation rate. |
 | `--guided-rank N` | `6` | History-subspace rank used by `guided` and `diag-lowrank`. |
 | `--guided-fraction FLOAT` | `0.50` | Low-rank proposal fraction used by `guided` and `diag-lowrank`. |
 | `--diag-lowrank-rate FLOAT` | `0.08` | EMA rate for adaptive time/joint variances. |
@@ -771,7 +966,7 @@ Example steady-state output:
 MPPI [    2]  nominal    2.93 ms (warm 2.76, prior 0.16)  |  sample   0.45 ms  |  rollout    9.15 ms (fused 8.72)  |  update   0.49 ms  |  total   13.02 / 20.00 ms  [OK]
 ```
 
-The final summary excludes the first five warm-up updates and reports aligned p50/p95 stage timing plus the deadline-miss percentage.
+The first controller update is treated as warm-up: it remains visible in the live trace but is excluded from p50/p95 timing, deadline-miss statistics, and HPO latency scoring. Steps 2 onward determine the steady-state profile.
 
 For a 50 Hz controller, a useful target is approximately:
 
@@ -783,9 +978,13 @@ deadline misses close to 0%
 When comparing planner configurations, record at least:
 
 * lap time or task progress,
+
 * fall/off-track outcome,
+
 * MPPI effective sample size,
+
 * rollout and total p50/p95 latency,
+
 * deadline misses.
 
 For CPU rollout tuning, benchmark `--workers` and `--rollout-chunk-size` on the target machine. The fused evaluator is selected automatically when the extension is available.
@@ -873,16 +1072,16 @@ python -m racing.experiments.race \
   --variant nominal
 ```
 
-### 4. Run MPPI
+### 4. Run Spike-MPPI
 
 ```bash
 python -m racing.experiments.race \
   --robot ant \
   --policy auto \
   --variant mppi \
+  --sampling spike \
   --rollouts 32 \
   --horizon 50 \
-  --joint-noise 0.5 \
   --workers 16 \
   --planner-mode rk4 \
   --profile
@@ -908,26 +1107,35 @@ python -m racing.experiments.replay \
 ## Notes on reproducibility and performance
 
 * Use the same `--seed`, horizon, rollout count, `--joint-noise`, plant/planner physics settings, task, and terrain when comparing MPPI sampling options.
-* The first JAX policy call includes JIT compilation and is much slower than steady-state inference.
+
+* The first controller update warms JAX/native/controller paths and can be much slower than steady state. It is printed for diagnostics but excluded from profiling and HPO latency statistics.
+
 * MPPI warm start is enabled by default.
+
 * Online MPPI rollouts are CPU MuJoCo. The controller automatically prefers the fused C++ evaluator, then stock `mujoco.rollout`, then the Python compatibility path.
+
 * `--planner-mode rk4` is the fidelity-oriented planner profile: explicit RK4, source planner timestep, and source solver/contact settings.
+
 * `--planner-mode fast-rk4` keeps RK4 but uses one planner step per control interval plus the fast solver/contact profile. With the default 20 ms control period and 10 ms source timestep, this changes the planner from `2 x 10 ms` to `1 x 20 ms` while leaving the plant unchanged.
+
 * `--planner-mode implicitfast` uses MuJoCo `implicitfast` at the source timestep with the same fast solver/contact profile.
+
 * Plant and planner substep counts are computed independently. Changing planner mode does not change how far the physical plant advances per control update.
+
 * Thread count and rollout chunk size are machine dependent; benchmark them on the target CPU.
+
 * GIF export uses saved states, so rendering does not alter the racing result.
 
 ## References
 
 The non-standard sampling options above are implementation-specific adaptations of the following ideas; the citations identify the main methodological inspiration rather than claiming exact reproduction.
 
-[1] Maheswaranathan, N., Metz, L., Tucker, G., Choi, D., & Sohl-Dickstein, J. *Guided evolutionary strategies: augmenting random search with surrogate gradients*. Proceedings of the 36th International Conference on Machine Learning (ICML), PMLR 97:4264-4273, 2019. https://proceedings.mlr.press/v97/maheswaranathan19a.html
+[1] Maheswaranathan, N., Metz, L., Tucker, G., Choi, D., & Sohl-Dickstein, J. **Guided evolutionary strategies: augmenting random search with surrogate gradients**. Proceedings of the 36th International Conference on Machine Learning (ICML), PMLR 97:4264-4273, 2019. https://proceedings.mlr.press/v97/maheswaranathan19a.html
 
-[2] Hansen, N. *The CMA Evolution Strategy: A Tutorial*. arXiv:1604.00772, 2016. https://arxiv.org/abs/1604.00772
+[2] Hansen, N. **The CMA Evolution Strategy: A Tutorial**. arXiv:1604.00772, 2016. https://arxiv.org/abs/1604.00772
 
-[3] Le, A. T., Nguyen, K., Vu, M. N., Carvalho, J., & Peters, J. *Model Tensor Planning*. Transactions on Machine Learning Research, 2025. https://arxiv.org/abs/2505.01059
+[3] Le, A. T., Nguyen, K., Vu, M. N., Carvalho, J., & Peters, J. **Model Tensor Planning**. Transactions on Machine Learning Research, 2025. https://arxiv.org/abs/2505.01059
 
-[4] Pinneri, C., Sawant, S., Blaes, S., Achterhold, J., Stueckler, J., Rolinek, M., & Martius, G. *Sample-efficient Cross-Entropy Method for Real-time Planning*. Proceedings of the 2020 Conference on Robot Learning, PMLR 155:1049-1065, 2021. https://proceedings.mlr.press/v155/pinneri21a.html
+[4] Pinneri, C., Sawant, S., Blaes, S., Achterhold, J., Stueckler, J., Rolinek, M., & Martius, G. **Sample-efficient Cross-Entropy Method for Real-time Planning**. Proceedings of the 2020 Conference on Robot Learning, PMLR 155:1049-1065, 2021. https://proceedings.mlr.press/v155/pinneri21a.html
 
-[5] Margolis, G. B., Yang, G., Paigwar, K., Chen, T., & Agrawal, P. *Rapid Locomotion via Reinforcement Learning*. International Journal of Robotics Research. https://doi.org/10.1177/02783649231224053
+[5] Margolis, G. B., Yang, G., Paigwar, K., Chen, T., & Agrawal, P. **Rapid Locomotion via Reinforcement Learning**. International Journal of Robotics Research. https://doi.org/10.1177/02783649231224053

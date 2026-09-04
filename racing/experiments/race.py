@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import gc
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 import math
 from pathlib import Path
 import time
 from typing import Optional
 import numpy as np
+
+PROFILE_INITIAL_STEPS_EXCLUDED = 1
 
 from racing.robots.model_params import ModelParameterScales
 from racing.environments import RaceEnvironmentConfig
@@ -52,6 +55,7 @@ class RaceResult:
     track: StadiumTrack
     environment: RaceEnvironmentConfig
     plant_parameters: ModelParameterScales
+    profile_summary: dict[str, float] = field(default_factory=dict)
 
 
 def run_race(
@@ -76,6 +80,22 @@ def run_race(
     diag_lowrank_max: float = 4.0,
     spline_modes: int = 6,
     icem_elites: int = 4,
+    spike_synergies: int = 8,
+    spike_rate_hz: float = 16.0,
+    spike_rate_update: float = 0.02,
+    spike_rate_prior: float = 0.50,
+    spike_rate_min_factor: float = 0.50,
+    spike_rate_max_factor: float = 5.0,
+    spike_sign_update: float = 0.10,
+    spike_sign_prior: float = 0.50,
+    spike_sign_min_prob: float = 0.10,
+    spike_recruitment_levels: int = 6,
+    spike_mark_update: float = 0.10,
+    spike_mark_prior: float = 0.50,
+    spike_mark_min_prob: float = 0.01,
+    spike_twitch_rise_s: float = 0.016,
+    spike_twitch_decay_s: float = 0.064,
+    spike_twitch_duration_s: float = 0.200,
     seed: int = 1,
     max_steps: int | None = None,
     viewer: bool = True,
@@ -303,6 +323,22 @@ def run_race(
         diag_lowrank_max=float(diag_lowrank_max),
         spline_modes=int(spline_modes),
         icem_elites=int(icem_elites),
+        spike_synergies=int(spike_synergies),
+        spike_rate_hz=float(spike_rate_hz),
+        spike_rate_update=float(spike_rate_update),
+        spike_rate_prior=float(spike_rate_prior),
+        spike_rate_min_factor=float(spike_rate_min_factor),
+        spike_rate_max_factor=float(spike_rate_max_factor),
+        spike_sign_update=float(spike_sign_update),
+        spike_sign_prior=float(spike_sign_prior),
+        spike_sign_min_prob=float(spike_sign_min_prob),
+        spike_recruitment_levels=int(spike_recruitment_levels),
+        spike_mark_update=float(spike_mark_update),
+        spike_mark_prior=float(spike_mark_prior),
+        spike_mark_min_prob=float(spike_mark_min_prob),
+        spike_twitch_rise_s=float(spike_twitch_rise_s),
+        spike_twitch_decay_s=float(spike_twitch_decay_s),
+        spike_twitch_duration_s=float(spike_twitch_duration_s),
         rollout_workers=int(rollout_workers),
         rollout_chunk_size=int(rollout_chunk_size),
         warm_start=bool(warm_start),
@@ -405,13 +441,16 @@ def run_race(
             ctrl, info = controller.step(plant.data, current_s)
             if profile_controller:
                 tm_all = info.get("timing_ms", {})
-                if step >= 5:
+                if step >= PROFILE_INITIAL_STEPS_EXCLUDED:
                     profile_rows.append({k: float(v) for k, v in tm_all.items()})
             if profile_controller and (step < 5 or (step + 1) % 50 == 0):
                 tm = info.get("timing_ms", {})
                 total_ms = float(tm.get("total", math.nan))
                 deadline_ms = 1000.0 * cfg.control_dt
-                status = "OK" if total_ms <= deadline_ms else "MISS"
+                if step < PROFILE_INITIAL_STEPS_EXCLUDED:
+                    status = "WARMUP"
+                else:
+                    status = "OK" if total_ms <= deadline_ms else "MISS"
                 nominal_detail = []
                 if tm.get("policy", 0.0) > 0.005:
                     nominal_detail.append(f"policy {tm['policy']:.2f}")
@@ -499,10 +538,23 @@ def run_race(
             gc.enable()
 
     runtime = time.perf_counter() - t0
+    profile_summary: dict[str, float] = {}
     if profile_controller and profile_rows:
         deadline_ms = 1000.0 * cfg.control_dt
         totals = np.asarray([r.get("total", math.inf) for r in profile_rows], dtype=np.float64)
         miss = 100.0 * float(np.mean(totals > deadline_ms))
+        profile_summary = {
+            "n": float(len(profile_rows)),
+            "deadline_ms": float(deadline_ms),
+            "deadline_miss_pct": float(miss),
+            "initial_steps_excluded": float(PROFILE_INITIAL_STEPS_EXCLUDED),
+            "total_p50_ms": float(np.median(totals)),
+            "total_p95_ms": float(np.percentile(totals, 95)),
+        }
+        for key in ("nominal", "sampling", "rollouts", "rollout_fused", "update"):
+            vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
+            profile_summary[f"{key}_p50_ms"] = float(np.median(vals))
+            profile_summary[f"{key}_p95_ms"] = float(np.percentile(vals, 95))
         has_fused = max(r.get("rollout_fused", 0.0) for r in profile_rows) > 0.005
         metrics = [
             ("nominal", "nominal"),
@@ -519,14 +571,17 @@ def run_race(
         profile_label = controller.variant.value.upper()
         if controller.variant == ControllerVariant.MPPI and controller.sampling != SamplingOption.STANDARD:
             profile_label += f"/{controller.sampling.value.upper()}"
-        print(f"{profile_label} profile  warm-up excluded  n={len(profile_rows)}")
-        print("                 p50       p95")
-        for label, key in metrics:
-            vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
-            if key not in {"total", "rollouts", "rollout_physics"} and np.max(np.abs(vals)) < 0.005:
-                continue
-            print(f"  {label:<10} {np.median(vals):8.2f}  {np.percentile(vals, 95):8.2f} ms")
-        print(f"  deadline   {deadline_ms:8.2f} ms    misses {miss:5.1f}%")
+        if verbose:
+            print(
+                f"{profile_label} profile  first-step warm-up excluded  n={len(profile_rows)}"
+            )
+            print("                 p50       p95")
+            for label, key in metrics:
+                vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
+                if key not in {"total", "rollouts", "rollout_physics"} and np.max(np.abs(vals)) < 0.005:
+                    continue
+                print(f"  {label:<10} {np.median(vals):8.2f}  {np.percentile(vals, 95):8.2f} ms")
+            print(f"  deadline   {deadline_ms:8.2f} ms    misses {miss:5.1f}%")
 
     return RaceResult(
         robot_name=plant.name,
@@ -555,6 +610,7 @@ def run_race(
         track=track,
         environment=environment,
         plant_parameters=plant_params,
+        profile_summary=profile_summary,
     )
 
 
@@ -589,6 +645,7 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
         fell=result.fell,
         runtime_s=result.runtime_s,
         simulated_time_s=result.simulated_time_s,
+        profile_summary_json=np.asarray(json.dumps(result.profile_summary, sort_keys=True)),
         track=np.asarray([
             result.track.width,
             result.track.height,
@@ -637,6 +694,25 @@ def main() -> None:
     parser.add_argument("--spline-modes", type=int, default=6, help="number of cubic B-spline latent modes per actuator")
     parser.add_argument("--icem-elites", type=int, default=4, help="number of shifted previous elite control sequences reused by icem sampling")
     parser.add_argument(
+        "--spike-synergies", type=int, default=8,
+        help="number of coordinated motor-synergy channels used by SpikeMPPI-3 (up to 2*nu; Ant supports 16)",
+    )
+    parser.add_argument("--spike-rate-hz", type=float, default=16.0, help="total base Poisson event rate per spike synergy [Hz]")
+    parser.add_argument("--spike-rate-update", type=float, default=0.02, help="EMA rate for MPPI-weighted total spike-intensity adaptation")
+    parser.add_argument("--spike-rate-prior", type=float, default=0.50, help="base-rate pseudo-exposure strength for total intensity adaptation")
+    parser.add_argument("--spike-rate-min-factor", type=float, default=0.50, help="minimum adaptive total spike rate as a factor of the base rate")
+    parser.add_argument("--spike-rate-max-factor", type=float, default=5.0, help="maximum adaptive total spike rate as a factor of the base rate")
+    parser.add_argument("--spike-sign-update", type=float, default=0.10, help="EMA rate for positive/negative event preference adaptation")
+    parser.add_argument("--spike-sign-prior", type=float, default=0.50, help="symmetric Beta-prior strength for positive/negative preference")
+    parser.add_argument("--spike-sign-min-prob", type=float, default=0.10, help="minimum probability assigned to either event sign")
+    parser.add_argument("--spike-recruitment-levels", type=int, default=6, help="number of discrete motor-unit recruitment amplitude marks")
+    parser.add_argument("--spike-mark-update", type=float, default=0.10, help="EMA rate for recruitment-mark distribution adaptation")
+    parser.add_argument("--spike-mark-prior", type=float, default=0.50, help="Dirichlet-prior strength for recruitment-mark adaptation")
+    parser.add_argument("--spike-mark-min-prob", type=float, default=0.01, help="minimum probability retained for each recruitment level")
+    parser.add_argument("--spike-twitch-rise", type=float, default=0.016, help="spike twitch rise time constant [s]")
+    parser.add_argument("--spike-twitch-decay", type=float, default=0.064, help="spike twitch decay time constant [s]")
+    parser.add_argument("--spike-twitch-duration", type=float, default=0.200, help="finite twitch-kernel support [s]")
+    parser.add_argument(
         "--variant",
         choices=[v.value for v in ControllerVariant],
         default=ControllerVariant.MPPI.value,
@@ -648,7 +724,8 @@ def main() -> None:
         default=SamplingOption.STANDARD.value,
         help=(
             "MPPI candidate sampling: standard Gaussian, guided low-rank history, "
-            "diag-lowrank adaptive covariance, spline latent sampling, or iCEM-style elite reuse"
+            "diag-lowrank adaptive covariance, spline latent sampling, iCEM-style elite reuse, "
+            "or SpikeMPPI-3 adaptive signed marked motor-synergy events"
         ),
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -770,6 +847,22 @@ def main() -> None:
         diag_lowrank_max=args.diag_lowrank_max,
         spline_modes=args.spline_modes,
         icem_elites=args.icem_elites,
+        spike_synergies=args.spike_synergies,
+        spike_rate_hz=args.spike_rate_hz,
+        spike_rate_update=args.spike_rate_update,
+        spike_rate_prior=args.spike_rate_prior,
+        spike_rate_min_factor=args.spike_rate_min_factor,
+        spike_rate_max_factor=args.spike_rate_max_factor,
+        spike_sign_update=args.spike_sign_update,
+        spike_sign_prior=args.spike_sign_prior,
+        spike_sign_min_prob=args.spike_sign_min_prob,
+        spike_recruitment_levels=args.spike_recruitment_levels,
+        spike_mark_update=args.spike_mark_update,
+        spike_mark_prior=args.spike_mark_prior,
+        spike_mark_min_prob=args.spike_mark_min_prob,
+        spike_twitch_rise_s=args.spike_twitch_rise,
+        spike_twitch_decay_s=args.spike_twitch_decay,
+        spike_twitch_duration_s=args.spike_twitch_duration,
         seed=args.seed,
         max_steps=args.max_steps,
         viewer=not args.headless,
