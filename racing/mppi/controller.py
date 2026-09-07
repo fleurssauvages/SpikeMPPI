@@ -42,7 +42,7 @@ class ControllerConfig:
     num_rollouts: int = 32
     lambda_temperature: float = 1.0
     adaptive_temperature_lbps: bool = True
-    lbps_delta: float = 0.9
+    lbps_delta: float = 0.95
     lbps_optimizer_iterations: int = 32
     temporal_noise_smoothing: float = 0.25
 
@@ -61,30 +61,32 @@ class ControllerConfig:
     spline_modes: int = 6
     icem_elites: int = 4
 
-    # SpikeMPPI-3: adaptive marked point-process exploration in a coordinated
-    # multi-joint synergy basis. ``spike_rate_hz`` is the total nominal event
-    # rate of each synergy channel, split initially 50/50 between positive and
-    # negative events. Online adaptation learns (1) where/which synergy fires,
-    # (2) sign preference through separate positive/negative intensities, and
-    # (3) the recruitment-amplitude distribution. The global expected event
-    # budget is preserved and the sampled signed impulses are mean-centered so
-    # the proposal remains centered on the policy nominal.
-    spike_synergies: int = 8
-    spike_rate_hz: float = 2.0
-    spike_rate_update: float = 0.15
-    spike_rate_prior: float = 2.0
-    spike_rate_min_factor: float = 0.25
-    spike_rate_max_factor: float = 4.0
+    # SpikeMPPI-3: marked point-process exploration in a coordinated multi-joint
+    # synergy basis. ``spike_rate_hz`` is the total nominal event rate of each
+    # synergy channel, split initially 50/50 between positive and negative
+    # events. ``spike_online`` enables MPPI-weighted online plasticity of
+    # (1) where/which synergy fires, (2) sign preference through separate
+    # positive/negative intensities, and (3) the recruitment-amplitude
+    # distribution. The global expected event budget is preserved and the
+    # sampled signed impulses are mean-centered so the proposal remains centered
+    # on the policy nominal.
+    spike_synergies: int = 16
+    spike_online: bool = True
+    spike_rate_hz: float = 16.0
+    spike_rate_update: float = 0.02
+    spike_rate_prior: float = 0.50
+    spike_rate_min_factor: float = 0.50
+    spike_rate_max_factor: float = 5.0
     spike_sign_update: float = 0.10
     spike_sign_prior: float = 0.50
     spike_sign_min_prob: float = 0.10
-    spike_recruitment_levels: int = 4
+    spike_recruitment_levels: int = 6
     spike_mark_update: float = 0.10
     spike_mark_prior: float = 0.50
     spike_mark_min_prob: float = 0.01
-    spike_twitch_rise_s: float = 0.015
-    spike_twitch_decay_s: float = 0.080
-    spike_twitch_duration_s: float = 0.20
+    spike_twitch_rise_s: float = 0.016
+    spike_twitch_decay_s: float = 0.064
+    spike_twitch_duration_s: float = 0.200
 
     # Policy-seeded local iLQR-style nominal construction.
     nominal_refine_iterations: int = 0
@@ -151,6 +153,7 @@ class ControllerConfig:
         self.spline_modes = max(4, int(self.spline_modes))
         self.icem_elites = max(0, int(self.icem_elites))
         self.spike_synergies = max(1, int(self.spike_synergies))
+        self.spike_online = bool(self.spike_online)
         if self.spike_rate_hz <= 0.0:
             raise ValueError("spike_rate_hz must be positive")
         if not 0.0 < self.spike_rate_update <= 1.0:
@@ -255,6 +258,13 @@ class JointMPPIController:
         self.native_batcher = None
         self._previous_plan: np.ndarray | None = None
         self._ctrl_low, self._ctrl_high = robot.control_bounds(cfg.unlimited_control_span)
+        # Actuator-scale normalization used only by benchmark/control-quality
+        # diagnostics. Keep this independent of --joint-noise so normalized
+        # residual/smoothness metrics remain comparable across samplers and
+        # exploration-scale sweeps. This matches NativeRolloutBatcher.
+        self._ctrl_scale = np.maximum(
+            np.asarray(robot.control_scale(), dtype=np.float64), 1e-6
+        )
         self._joint_std = robot.control_scale(
             fraction=cfg.joint_noise_fraction,
             unlimited_span=cfg.unlimited_control_span,
@@ -337,11 +347,18 @@ class JointMPPIController:
         if self.sampling == SamplingOption.ICEM:
             return f"iCEM-style elite reuse: shifted_elites={self.cfg.icem_elites}"
         if self.sampling == SamplingOption.SPIKE:
+            online = bool(self.cfg.spike_online)
+            mode = "online plasticity" if online else "fixed proposal"
+            update_desc = (
+                f"updates=rate:{self.cfg.spike_rate_update:g}/"
+                f"sign:{self.cfg.spike_sign_update:g}/mark:{self.cfg.spike_mark_update:g}"
+                if online
+                else "updates=disabled"
+            )
             return (
-                "SpikeMPPI-3: adaptive signed marked-Poisson motor events + causal twitch decoding, "
+                "SpikeMPPI-3: signed marked-Poisson motor events + causal twitch decoding, "
                 f"synergies={self._spike_synergies.shape[0]}, "
-                f"base_rate={self.cfg.spike_rate_hz:g}Hz, "
-                f"updates=rate:{self.cfg.spike_rate_update:g}/sign:{self.cfg.spike_sign_update:g}/mark:{self.cfg.spike_mark_update:g}"
+                f"base_rate={self.cfg.spike_rate_hz:g}Hz, mode={mode}, {update_desc}"
             )
         return "standard MPPI Gaussian sampling"
 
@@ -674,17 +691,24 @@ class JointMPPIController:
         return kernel
 
     @staticmethod
-    def _make_recruitment_marks(levels: int) -> tuple[np.ndarray, np.ndarray]:
-        """Amplitude marks with low-threshold/small events more probable."""
+    def _make_recruitment_marks(
+        levels: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ordered normalized recruitment marks and a uniform prior."""
         levels = max(1, int(levels))
-        if levels == 1:
-            return np.ones(1, dtype=np.float64), np.ones(1, dtype=np.float64)
-        amplitudes = np.linspace(0.35, 1.0, levels, dtype=np.float64)
-        # A simple size-principle-inspired prior: small recruitment marks are
-        # common, high-amplitude recruitment is progressively rarer.
-        p = np.exp(-0.75 * np.arange(levels, dtype=np.float64))
-        p /= np.sum(p)
-        return amplitudes, p
+
+        amplitudes = (
+            np.arange(1, levels + 1, dtype=np.float64)
+            / float(levels)
+        )
+
+        prior = np.full(
+            levels,
+            1.0 / float(levels),
+            dtype=np.float64,
+        )
+
+        return amplitudes, prior
 
     def _project_mark_probabilities(self, p: np.ndarray) -> np.ndarray:
         """Normalize recruitment probabilities with an optional probability floor."""
@@ -729,16 +753,78 @@ class JointMPPIController:
         horizon_variance = np.mean(variance_hu, axis=0)
         return 1.0 / np.sqrt(np.maximum(horizon_variance, 1e-12))
 
-    def _sample_spike(self, nominal: np.ndarray) -> np.ndarray:
-        """SpikeMPPI-3 adaptive signed marked-point-process candidate generation.
+    def _spike_diagnostics(self) -> dict[str, float]:
+        """Compact diagnostics of the current SpikeMPPI proposal.
 
-        Positive and negative Poisson intensities are learned separately at
-        each (time, synergy) coordinate, and the recruitment-level categorical
-        distribution is learned at the same resolution.  The expected signed
-        impulse is subtracted from stochastic candidates, so sign learning
-        changes skew/tail allocation while keeping the proposal centered on the
-        policy nominal.  A dynamic analytic variance normalization keeps
-        ``joint_noise`` comparable as the learned distribution evolves.
+        The rate-derived synergy distribution measures where the fixed global
+        event budget is allocated.  exp(entropy) is the effective number of
+        active synergies: it is M for uniform activity and approaches 1 as the
+        proposal concentrates on a single synergy.
+        """
+        if self.sampling != SamplingOption.SPIKE:
+            return {
+                "spike_rate_hz_mean": math.nan,
+                "spike_rate_hz_std": math.nan,
+                "spike_sign_entropy": math.nan,
+                "spike_recruitment_entropy": math.nan,
+                "spike_mean_recruitment": math.nan,
+                "spike_effective_synergies": math.nan,
+                "spike_synergy_entropy": math.nan,
+                "spike_expected_events": math.nan,
+            }
+
+        total_rate = np.asarray(
+            self._spike_pos_rate_map + self._spike_neg_rate_map,
+            dtype=np.float64,
+        )
+        safe_total = np.maximum(total_rate, 1e-15)
+        q = np.clip(self._spike_pos_rate_map / safe_total, 1e-15, 1.0 - 1e-15)
+        sign_entropy = -(q * np.log(q) + (1.0 - q) * np.log(1.0 - q)) / math.log(2.0)
+
+        p = np.asarray(self._spike_mark_prob_map, dtype=np.float64)
+        p_safe = np.maximum(p, 1e-15)
+        level_norm = max(math.log(max(len(self._spike_levels), 2)), 1e-15)
+        recruitment_entropy = -np.sum(p * np.log(p_safe), axis=-1) / level_norm
+        mean_recruitment = np.sum(
+            p * self._spike_levels[None, None, :], axis=-1
+        )
+
+        synergy_activity = np.mean(total_rate, axis=0)
+        activity_sum = float(np.sum(synergy_activity))
+        if activity_sum > 1e-15:
+            synergy_prob = synergy_activity / activity_sum
+            synergy_prob_safe = np.maximum(synergy_prob, 1e-15)
+            synergy_entropy_raw = float(-np.sum(synergy_prob * np.log(synergy_prob_safe)))
+            effective_synergies = float(np.exp(synergy_entropy_raw))
+            synergy_entropy = synergy_entropy_raw / max(
+                math.log(max(len(synergy_activity), 2)), 1e-15
+            )
+        else:
+            effective_synergies = 0.0
+            synergy_entropy = 0.0
+
+        return {
+            "spike_rate_hz_mean": float(np.mean(total_rate)),
+            "spike_rate_hz_std": float(np.std(total_rate)),
+            "spike_sign_entropy": float(np.mean(sign_entropy)),
+            "spike_recruitment_entropy": float(np.mean(recruitment_entropy)),
+            "spike_mean_recruitment": float(np.mean(mean_recruitment)),
+            "spike_effective_synergies": effective_synergies,
+            "spike_synergy_entropy": float(synergy_entropy),
+            "spike_expected_events": float(self.cfg.control_dt * np.sum(total_rate)),
+        }
+
+    def _sample_spike(self, nominal: np.ndarray) -> np.ndarray:
+        """SpikeMPPI-3 signed marked-point-process candidate generation.
+
+        Positive and negative Poisson intensities and recruitment probabilities
+        are stored at each (time, synergy) coordinate.  With ``spike_online``
+        enabled these statistics are adapted after each MPPI update; with it
+        disabled they remain fixed at their initialized priors.  The expected
+        signed impulse is subtracted from stochastic candidates so asymmetric
+        sign preferences do not shift the proposal mean away from the policy
+        nominal. A dynamic analytic variance normalization keeps ``joint_noise``
+        comparable as the proposal statistics vary.
         """
         n, h = self.cfg.num_rollouts, self.cfg.horizon
         m = self._spike_synergies.shape[0]
@@ -766,7 +852,7 @@ class JointMPPIController:
             neg_counts += minus_i
             level_counts[:, :, :, level_idx] = plus_i + minus_i
 
-        # Center the adaptive signed proposal.  This preserves the policy
+        # Center the signed proposal. This preserves the policy
         # nominal as E[u] even when successful rollouts have learned q(+/-) != .5.
         expected_mark = np.sum(
             mark_prob * self._spike_levels[None, None, :], axis=-1
@@ -954,15 +1040,16 @@ class JointMPPIController:
     ) -> None:
         """Adapt SpikeMPPI-3 rate, sign and recruitment-mark distributions.
 
+        This update is active only when ``cfg.spike_online`` is enabled.
         MPPI weights produce soft sufficient statistics from successful
         rollouts. Total firing rate uses Gamma-Poisson-style shrinkage and a
         bounded global-mean projection. Sign preference uses a symmetric Beta
         prior, and recruitment marks use a Dirichlet prior centered on the
-        size-principle-inspired base distribution. ESS controls how strongly a
+        uniform base distribution. ESS controls how strongly a
         single MPPI update is trusted. Warm starting shifts every learned map
         one step into the receding horizon.
         """
-        if self.sampling != SamplingOption.SPIKE:
+        if self.sampling != SamplingOption.SPIKE or not self.cfg.spike_online:
             return
         if (
             self._last_spike_pos_counts is None
@@ -1025,7 +1112,7 @@ class JointMPPIController:
         updated_q = np.clip(updated_q, q_lo, 1.0 - q_lo)
 
         # 3) Recruitment marks: learn p(level | event,t,m) with a Dirichlet
-        # prior around the low-threshold-biased base mark distribution.
+        # prior around the uniform base mark distribution.
         mark_prior = float(self.cfg.spike_mark_prior)
         mark_denom = weighted_total[:, :, None] + mark_prior
         p_hat = np.broadcast_to(self._spike_level_prior, weighted_levels.shape).copy()
@@ -1204,6 +1291,7 @@ class JointMPPIController:
         self._update_direction_memory(candidate, nominal)
         self._update_icem_elites(controls, costs)
         self._update_spike_distribution(costs, temperature, ess)
+
         if self.cfg.warm_start:
             self._previous_plan = np.asarray(candidate, dtype=np.float64).copy()
         best = int(np.argmin(costs)) if len(costs) else 0
@@ -1212,6 +1300,52 @@ class JointMPPIController:
         else:
             best_rollout = positions[best].copy()
         t_update = time.perf_counter()
+
+        # Optimization-quality diagnostics use the already-evaluated rollout
+        # population and therefore add no extra physics rollouts. Candidate 0 is
+        # the exact proposal nominal for every sampler.
+        diag_weights = self._normalized_weights(costs, temperature)
+        finite_cost = np.isfinite(costs)
+        nominal_cost = float(costs[0]) if len(costs) and np.isfinite(costs[0]) else math.nan
+        if np.any(finite_cost):
+            weighted_rollout_cost = float(
+                np.sum(diag_weights[finite_cost] * np.asarray(costs)[finite_cost])
+            )
+            best_finite_cost = float(np.min(np.asarray(costs)[finite_cost]))
+        else:
+            weighted_rollout_cost = math.nan
+            best_finite_cost = math.nan
+
+        if np.isfinite(nominal_cost) and np.isfinite(weighted_rollout_cost):
+            nominal_weighted_improvement = nominal_cost - weighted_rollout_cost
+            nominal_weighted_improvement_rel = nominal_weighted_improvement / max(
+                abs(nominal_cost), 1e-12
+            )
+        else:
+            nominal_weighted_improvement = math.nan
+            nominal_weighted_improvement_rel = math.nan
+
+        if np.isfinite(nominal_cost) and np.isfinite(best_finite_cost):
+            nominal_best_improvement = nominal_cost - best_finite_cost
+            nominal_best_improvement_rel = nominal_best_improvement / max(
+                abs(nominal_cost), 1e-12
+            )
+        else:
+            nominal_best_improvement = math.nan
+            nominal_best_improvement_rel = math.nan
+
+        applied_delta = np.asarray(candidate[0] - nominal[0], dtype=np.float64)
+        applied_residual_l2 = float(np.linalg.norm(applied_delta))
+        applied_residual_rms_norm = float(
+            np.sqrt(np.mean((applied_delta / np.maximum(self._ctrl_scale, 1e-12)) ** 2))
+        )
+        ctrl0 = np.asarray(candidate[0], dtype=np.float64)
+        sat_tol = 1e-6 * np.maximum(self._ctrl_high - self._ctrl_low, 1.0)
+        applied_saturation_fraction = float(
+            np.mean((ctrl0 <= self._ctrl_low + sat_tol) | (ctrl0 >= self._ctrl_high - sat_tol))
+        )
+        spike_diag = self._spike_diagnostics()
+
         info = {
             "planned_control_sequence": candidate,
             "policy_nominal": policy_nom.controls,
@@ -1247,6 +1381,17 @@ class JointMPPIController:
             "spike_mark_prob_min": float(np.min(self._spike_mark_prob_map)),
             "spike_mark_prob_max": float(np.max(self._spike_mark_prob_map)),
             "spike_mark_entropy_mean": float(np.mean(-np.sum(self._spike_mark_prob_map * np.log(np.maximum(self._spike_mark_prob_map, 1e-15)), axis=-1) / max(math.log(max(len(self._spike_levels), 2)), 1e-15))),
+            **spike_diag,
+            "nominal_cost": nominal_cost,
+            "weighted_rollout_cost": weighted_rollout_cost,
+            "best_finite_cost": best_finite_cost,
+            "nominal_weighted_improvement": float(nominal_weighted_improvement),
+            "nominal_weighted_improvement_rel": float(nominal_weighted_improvement_rel),
+            "nominal_best_improvement": float(nominal_best_improvement),
+            "nominal_best_improvement_rel": float(nominal_best_improvement_rel),
+            "applied_residual_l2": applied_residual_l2,
+            "applied_residual_rms_norm": applied_residual_rms_norm,
+            "applied_saturation_fraction": applied_saturation_fraction,
             "timing_ms": {
                 "nominal": 1e3 * (t_nominal - t_total),
                 **nominal_parts,

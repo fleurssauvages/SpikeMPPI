@@ -56,6 +56,7 @@ class RaceResult:
     environment: RaceEnvironmentConfig
     plant_parameters: ModelParameterScales
     profile_summary: dict[str, float] = field(default_factory=dict)
+    diagnostics_summary: dict[str, float] = field(default_factory=dict)
 
 
 def run_race(
@@ -70,7 +71,7 @@ def run_race(
     num_rollouts: int = 32,
     horizon: int = 50,
     control_dt: float | None = None,
-    lbps_delta: float = 0.9,
+    lbps_delta: float = 0.95,
     nominal_refine_iterations: int = 0,
     joint_noise_fraction: float = 0.08,
     guided_rank: int = 6,
@@ -80,7 +81,8 @@ def run_race(
     diag_lowrank_max: float = 4.0,
     spline_modes: int = 6,
     icem_elites: int = 4,
-    spike_synergies: int = 8,
+    spike_synergies: int = 16,
+    spike_online: bool = True,
     spike_rate_hz: float = 16.0,
     spike_rate_update: float = 0.02,
     spike_rate_prior: float = 0.50,
@@ -324,6 +326,7 @@ def run_race(
         spline_modes=int(spline_modes),
         icem_elites=int(icem_elites),
         spike_synergies=int(spike_synergies),
+        spike_online=bool(spike_online),
         spike_rate_hz=float(spike_rate_hz),
         spike_rate_update=float(spike_rate_update),
         spike_rate_prior=float(spike_rate_prior),
@@ -374,6 +377,9 @@ def run_race(
     off_track = False
     fell = False
     profile_rows: list[dict[str, float]] = []
+    diagnostic_rows: list[dict[str, float]] = []
+    primary_reward_sum = 0.0
+    previous_ctrl: np.ndarray | None = None
 
     handle = None
     if viewer:
@@ -439,6 +445,47 @@ def run_race(
             # The controller reads the physical qpos/qvel through the current data,
             # but all candidate rollouts use the separate planning MuJoCo model.
             ctrl, info = controller.step(plant.data, current_s)
+            step_diag: dict[str, float] = {}
+            for key in (
+                "nominal_cost",
+                "weighted_rollout_cost",
+                "best_finite_cost",
+                "nominal_weighted_improvement",
+                "nominal_weighted_improvement_rel",
+                "nominal_best_improvement",
+                "nominal_best_improvement_rel",
+                "applied_residual_l2",
+                "applied_residual_rms_norm",
+                "applied_saturation_fraction",
+                "spike_events_mean",
+                "spike_rate_hz_mean",
+                "spike_rate_hz_std",
+                "spike_sign_entropy",
+                "spike_recruitment_entropy",
+                "spike_mean_recruitment",
+                "spike_effective_synergies",
+                "spike_synergy_entropy",
+                "spike_expected_events",
+            ):
+                value = info.get(key, math.nan)
+                try:
+                    step_diag[key] = float(value)
+                except (TypeError, ValueError):
+                    step_diag[key] = math.nan
+
+            ctrl_arr = np.asarray(ctrl, dtype=np.float64)
+            if previous_ctrl is None:
+                step_diag["control_increment_l2"] = math.nan
+                step_diag["control_increment_rms_norm"] = math.nan
+            else:
+                du_exec = ctrl_arr - previous_ctrl
+                step_diag["control_increment_l2"] = float(np.linalg.norm(du_exec))
+                ctrl_scale = np.maximum(np.asarray(controller._ctrl_scale, dtype=np.float64), 1e-12)
+                step_diag["control_increment_rms_norm"] = float(
+                    np.sqrt(np.mean((du_exec / ctrl_scale) ** 2))
+                )
+            previous_ctrl = ctrl_arr.copy()
+
             if profile_controller:
                 tm_all = info.get("timing_ms", {})
                 if step >= PROFILE_INITIAL_STEPS_EXCLUDED:
@@ -488,6 +535,15 @@ def run_race(
             ds = track.signed_progress_delta(float(new_s), current_s)
             cumulative += ds
             current_s = float(new_s)
+
+            # The primary executed reward is the task-body progress term used by
+            # every scenario. It is intentionally kept separate from the full
+            # horizon rollout objective, whose additional shaping differs by task.
+            primary_reward = float(cfg.box_progress_weight) * float(ds)
+            primary_reward_sum += primary_reward
+            step_diag["task_progress_step_m"] = float(ds)
+            step_diag["primary_reward_step"] = primary_reward
+            diagnostic_rows.append(step_diag)
 
             xy_hist.append(p)
             target_xy_hist.append(task_p)
@@ -551,8 +607,10 @@ def run_race(
             "total_p50_ms": float(np.median(totals)),
             "total_p95_ms": float(np.percentile(totals, 95)),
         }
-        for key in ("nominal", "sampling", "rollouts", "rollout_fused", "update"):
+        for key in ("nominal", "sampling", "rollouts", "rollout_fused", "update", "total"):
             vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
+            profile_summary[f"{key}_mean_ms"] = float(np.mean(vals))
+            profile_summary[f"{key}_std_ms"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
             profile_summary[f"{key}_p50_ms"] = float(np.median(vals))
             profile_summary[f"{key}_p95_ms"] = float(np.percentile(vals, 95))
         has_fused = max(r.get("rollout_fused", 0.0) for r in profile_rows) > 0.005
@@ -583,6 +641,83 @@ def run_race(
                 print(f"  {label:<10} {np.median(vals):8.2f}  {np.percentile(vals, 95):8.2f} ms")
             print(f"  deadline   {deadline_ms:8.2f} ms    misses {miss:5.1f}%")
 
+    diagnostics_summary: dict[str, float] = {}
+    if diagnostic_rows:
+        def finite_values(key: str) -> np.ndarray:
+            values = np.asarray([r.get(key, math.nan) for r in diagnostic_rows], dtype=np.float64)
+            return values[np.isfinite(values)]
+
+        aggregate_keys = (
+            "nominal_cost",
+            "weighted_rollout_cost",
+            "best_finite_cost",
+            "nominal_weighted_improvement",
+            "nominal_weighted_improvement_rel",
+            "nominal_best_improvement",
+            "nominal_best_improvement_rel",
+            "applied_residual_l2",
+            "applied_residual_rms_norm",
+            "applied_saturation_fraction",
+            "control_increment_l2",
+            "control_increment_rms_norm",
+            "task_progress_step_m",
+            "primary_reward_step",
+            "spike_events_mean",
+            "spike_rate_hz_mean",
+            "spike_rate_hz_std",
+            "spike_sign_entropy",
+            "spike_recruitment_entropy",
+            "spike_mean_recruitment",
+            "spike_effective_synergies",
+            "spike_synergy_entropy",
+            "spike_expected_events",
+        )
+        for key in aggregate_keys:
+            vals = finite_values(key)
+            if vals.size:
+                diagnostics_summary[f"{key}_mean"] = float(np.mean(vals))
+                diagnostics_summary[f"{key}_median"] = float(np.median(vals))
+                diagnostics_summary[f"{key}_std"] = float(np.std(vals, ddof=1)) if vals.size > 1 else 0.0
+
+        diagnostics_summary["primary_reward_sum"] = float(primary_reward_sum)
+        diagnostics_summary["mean_primary_reward_per_step"] = float(
+            primary_reward_sum / max(len(diagnostic_rows), 1)
+        )
+        diagnostics_summary["mean_task_progress_per_step_m"] = float(
+            cumulative / max(len(diagnostic_rows), 1)
+        )
+        diagnostics_summary["task_progress_rate_mps"] = float(
+            cumulative / max(len(diagnostic_rows) * cfg.control_dt, 1e-12)
+        )
+
+        # Cleaner paper-facing aliases for per-step quantities whose internal
+        # names already contain ``mean``.
+        event_vals = finite_values("spike_events_mean")
+        if event_vals.size:
+            diagnostics_summary["spike_events_per_rollout_mean"] = float(np.mean(event_vals))
+        rate_vals = finite_values("spike_rate_hz_mean")
+        if rate_vals.size:
+            diagnostics_summary["spike_rate_hz_mean"] = float(np.mean(rate_vals))
+
+        if controller.sampling == SamplingOption.SPIKE:
+            eff = finite_values("spike_effective_synergies")
+            if eff.size:
+                diagnostics_summary["spike_effective_synergies_initial"] = float(controller._spike_synergies.shape[0])
+                diagnostics_summary["spike_effective_synergies_final"] = float(eff[-1])
+                diagnostics_summary["spike_effective_synergies_delta"] = float(
+                    eff[-1] - controller._spike_synergies.shape[0]
+                )
+            for key in (
+                "spike_rate_hz_std",
+                "spike_sign_entropy",
+                "spike_recruitment_entropy",
+                "spike_mean_recruitment",
+                "spike_synergy_entropy",
+            ):
+                vals = finite_values(key)
+                if vals.size:
+                    diagnostics_summary[f"{key}_final"] = float(vals[-1])
+
     return RaceResult(
         robot_name=plant.name,
         controller_variant=controller.variant.value,
@@ -611,6 +746,7 @@ def run_race(
         environment=environment,
         plant_parameters=plant_params,
         profile_summary=profile_summary,
+        diagnostics_summary=diagnostics_summary,
     )
 
 
@@ -646,6 +782,7 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
         runtime_s=result.runtime_s,
         simulated_time_s=result.simulated_time_s,
         profile_summary_json=np.asarray(json.dumps(result.profile_summary, sort_keys=True)),
+        diagnostics_summary_json=np.asarray(json.dumps(result.diagnostics_summary, sort_keys=True)),
         track=np.asarray([
             result.track.width,
             result.track.height,
@@ -685,7 +822,7 @@ def main() -> None:
     )
     parser.add_argument("--lbps-delta", type=float, default=0.95)
     parser.add_argument("--nominal-refine-iters", type=int, default=0)
-    parser.add_argument("--joint-noise", type=float, default=0.3, help="actuator-range exploration-noise scale for MPPI")
+    parser.add_argument("--joint-noise", type=float, default=0.25, help="actuator-range exploration-noise scale for MPPI")
     parser.add_argument("--guided-rank", type=int, default=6, help="history subspace rank for guided and diag-lowrank sampling")
     parser.add_argument("--guided-fraction", type=float, default=0.50, help="blend weight of the learned low-rank component before trace renormalization")
     parser.add_argument("--diag-lowrank-rate", type=float, default=0.08, help="EMA rate for time/joint diagonal variance adaptation")
@@ -693,9 +830,21 @@ def main() -> None:
     parser.add_argument("--diag-lowrank-max", type=float, default=4.0, help="maximum normalized diagonal variance factor before trace normalization")
     parser.add_argument("--spline-modes", type=int, default=6, help="number of cubic B-spline latent modes per actuator")
     parser.add_argument("--icem-elites", type=int, default=4, help="number of shifted previous elite control sequences reused by icem sampling")
+    
     parser.add_argument(
-        "--spike-synergies", type=int, default=8,
+        "--spike-synergies", type=int, default=16,
         help="number of coordinated motor-synergy channels used by SpikeMPPI-3 (up to 2*nu; Ant supports 16)",
+    )
+    parser.add_argument(
+        "--online",
+        "--spike-online",
+        dest="spike_online",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "enable MPPI-weighted online plasticity of SpikeMPPI firing rate, sign, "
+            "and recruitment statistics (default: enabled; use --no-online for the fixed-proposal ablation)"
+        ),
     )
     parser.add_argument("--spike-rate-hz", type=float, default=16.0, help="total base Poisson event rate per spike synergy [Hz]")
     parser.add_argument("--spike-rate-update", type=float, default=0.02, help="EMA rate for MPPI-weighted total spike-intensity adaptation")
@@ -725,7 +874,8 @@ def main() -> None:
         help=(
             "MPPI candidate sampling: standard Gaussian, guided low-rank history, "
             "diag-lowrank adaptive covariance, spline latent sampling, iCEM-style elite reuse, "
-            "or SpikeMPPI-3 adaptive signed marked motor-synergy events"
+            "or SpikeMPPI-3 signed marked motor-synergy events; SpikeMPPI online plasticity "
+            "is controlled separately by --spike-online/--no-spike-online"
         ),
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -761,7 +911,7 @@ def main() -> None:
         "--disable-gc", action="store_true",
         help="disable Python cyclic GC during the race loop to reduce real-time jitter",
     )
-    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=1200, help="Maximum number of control steps to simulate (default: 1200)")
     parser.add_argument("--headless", action="store_true", help="disable the MuJoCo viewer")
     parser.add_argument("--viewer-ui", action="store_true", help="show MuJoCo left/right UI panels")
     parser.add_argument("--controller-overlay", action="store_true")
@@ -848,6 +998,7 @@ def main() -> None:
         spline_modes=args.spline_modes,
         icem_elites=args.icem_elites,
         spike_synergies=args.spike_synergies,
+        spike_online=args.spike_online,
         spike_rate_hz=args.spike_rate_hz,
         spike_rate_update=args.spike_rate_update,
         spike_rate_prior=args.spike_rate_prior,
@@ -914,6 +1065,14 @@ def main() -> None:
         f"off_track={result.off_track}, fell={result.fell}, "
         f"progress={result.cumulative_progress[-1]:.2f}m, "
         f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s"
+    )
+    benchmark_metrics = {
+        **result.diagnostics_summary,
+        **result.profile_summary,
+    }
+    print(
+        "BENCHMARK_METRICS_JSON="
+        + json.dumps(benchmark_metrics, sort_keys=True, separators=(",", ":"))
     )
     if not args.no_save and args.save:
         saved = save_result(result, args.save)

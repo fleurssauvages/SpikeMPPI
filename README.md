@@ -225,7 +225,7 @@ Spike-MPPI is the primary sampling contribution. Other samplers are included as 
 
 | Sampling option | Role | Description |
 | --- | --- | --- |
-| `spike` | **Main method** | Motoneuron-inspired marked spike events, multi-joint synergies, causal twitch decoding, and online adaptation of firing rate, sign and recruitment statistics. |
+| `spike` | **Main method** | Motoneuron-inspired marked spike events, multi-joint synergies, causal twitch decoding, and online adaptation of firing rate, sign and recruitment statistics. By default, it runs with online adaption of its parameters, use `--no-online`  to deactivate online adaptation |
 | `standard` | Baseline | Fixed-scale direct-joint Gaussian MPPI sampling. |
 | `guided` | Baseline | Low-rank history-guided sampling from recent successful MPPI update directions. |
 | `diag-lowrank` | Baseline | Time/joint-dependent diagonal variance adaptation plus a history-guided low-rank component. |

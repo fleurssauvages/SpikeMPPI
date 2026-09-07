@@ -15,3 +15,6 @@
 /build
 /racing/results/last_run.npz
 /racing/_fused_mujoco.cpython-312-x86_64-linux-gnu.so
+/racing/results/benchmark_100
+benchmark_all_samplers.py
+analyze_benchmark.py
