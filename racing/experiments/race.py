@@ -822,7 +822,7 @@ def main() -> None:
     )
     parser.add_argument("--lbps-delta", type=float, default=0.95)
     parser.add_argument("--nominal-refine-iters", type=int, default=0)
-    parser.add_argument("--joint-noise", type=float, default=0.25, help="actuator-range exploration-noise scale for MPPI")
+    parser.add_argument("--joint-noise", type=float, default=0.5, help="actuator-range exploration-noise scale for MPPI")
     parser.add_argument("--guided-rank", type=int, default=6, help="history subspace rank for guided and diag-lowrank sampling")
     parser.add_argument("--guided-fraction", type=float, default=0.50, help="blend weight of the learned low-rank component before trace renormalization")
     parser.add_argument("--diag-lowrank-rate", type=float, default=0.08, help="EMA rate for time/joint diagonal variance adaptation")
@@ -1070,10 +1070,6 @@ def main() -> None:
         **result.diagnostics_summary,
         **result.profile_summary,
     }
-    print(
-        "BENCHMARK_METRICS_JSON="
-        + json.dumps(benchmark_metrics, sort_keys=True, separators=(",", ":"))
-    )
     if not args.no_save and args.save:
         saved = save_result(result, args.save)
         print(f"saved replay: {saved}")

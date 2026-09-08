@@ -49,10 +49,10 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td align="center">
-      <img src="racing/results/nominal.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/nominal.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
     </td>
     <td align="center">
-      <img src="racing/results/mppi.gif" width="460" alt="MPPI racing on the obstacle-free track">
+      <img src="assets/mppi.gif" width="460" alt="MPPI racing on the obstacle-free track">
     </td>
   </tr>
   <tr>
@@ -60,7 +60,7 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="racing/results/spike.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
     </td>
   </tr>
 </table>
@@ -74,10 +74,10 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td align="center">
-      <img src="racing/results/nominal_rocky.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/nominal_rocky.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
     </td>
     <td align="center">
-      <img src="racing/results/mppi_rocky.gif" width="460" alt="MPPI racing on the obstacle-free track">
+      <img src="assets/mppi_rocky.gif" width="460" alt="MPPI racing on the obstacle-free track">
     </td>
   </tr>
   <tr>
@@ -85,7 +85,7 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="racing/results/spike_rocky.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_rocky.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
     </td>
   </tr>
 </table>
@@ -97,10 +97,10 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td align="center">
-      <img src="racing/results/nominal_mixed.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/nominal_mixed.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
     </td>
     <td align="center">
-      <img src="racing/results/mppi_mixed.gif" width="460" alt="MPPI racing on the obstacle-free track">
+      <img src="assets/mppi_mixed.gif" width="460" alt="MPPI racing on the obstacle-free track">
     </td>
   </tr>
   <tr>
@@ -108,7 +108,7 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="racing/results/spike_mixed.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_mixed.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
     </td>
   </tr>
 </table>
@@ -122,10 +122,10 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td align="center">
-      <img src="racing/results/nominal_box.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/nominal_box.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
     </td>
     <td align="center">
-      <img src="racing/results/mppi_box.gif" width="460" alt="MPPI racing on the obstacle-free track">
+      <img src="assets/mppi_box.gif" width="460" alt="MPPI racing on the obstacle-free track">
     </td>
   </tr>
   <tr>
@@ -133,7 +133,7 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="racing/results/spike_box.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_box.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
     </td>
   </tr>
 </table>
@@ -145,10 +145,10 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td align="center">
-      <img src="racing/results/nominal_sled.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/nominal_sled.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
     </td>
     <td align="center">
-      <img src="racing/results/mppi_sled.gif" width="460" alt="MPPI racing on the obstacle-free track">
+      <img src="assets/mppi_sled.gif" width="460" alt="MPPI racing on the obstacle-free track">
     </td>
   </tr>
   <tr>
@@ -156,7 +156,7 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="racing/results/spike_sled.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_sled.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
     </td>
   </tr>
 </table>
@@ -170,10 +170,10 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td align="center">
-      <img src="racing/results/nominal_diagonal.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/nominal_diagonal.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
     </td>
     <td align="center">
-      <img src="racing/results/mppi_diagonal.gif" width="460" alt="MPPI racing on the obstacle-free track">
+      <img src="assets/mppi_diagonal.gif" width="460" alt="MPPI racing on the obstacle-free track">
     </td>
   </tr>
   <tr>
@@ -181,7 +181,7 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="racing/results/spike_diagonal.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_diagonal.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
     </td>
   </tr>
 </table>
@@ -193,10 +193,10 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td align="center">
-      <img src="racing/results/nominal_sameside.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/nominal_sameside.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
     </td>
     <td align="center">
-      <img src="racing/results/mppi_sameside.gif" width="460" alt="MPPI racing on the obstacle-free track">
+      <img src="assets/mppi_sameside.gif" width="460" alt="MPPI racing on the obstacle-free track">
     </td>
   </tr>
   <tr>
@@ -204,7 +204,7 @@ The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergi
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="racing/results/spike_sameside.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_sameside.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
     </td>
   </tr>
 </table>
