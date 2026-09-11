@@ -275,6 +275,22 @@ class FusedRolloutEvaluator {
     }
   }
 
+  void ConfigureScreening(double timestep, int iterations, int ls_iterations,
+                          double tolerance) {
+    if (!(timestep > 0.0) || !std::isfinite(timestep)) {
+      throw std::runtime_error("screening timestep must be finite and positive");
+    }
+    if (!(tolerance >= 0.0) || !std::isfinite(tolerance)) {
+      throw std::runtime_error("screening tolerance must be finite and nonnegative");
+    }
+    model_->opt.integrator = mjINT_IMPLICITFAST;
+    model_->opt.timestep = timestep;
+    model_->opt.iterations = std::max(1, iterations);
+    model_->opt.ls_iterations = std::max(0, ls_iterations);
+    model_->opt.noslip_iterations = 0;
+    model_->opt.tolerance = tolerance;
+  }
+
   ~FusedRolloutEvaluator() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1151,6 +1167,9 @@ PYBIND11_MODULE(_fused_mujoco, m) {
            py::arg("initial_state"), py::arg("controls"),
            py::arg("nominal_controls"), py::arg("ctrl_scale"),
            py::arg("params"), py::arg("control_substeps"))
+      .def("configure_screening", &FusedRolloutEvaluator::ConfigureScreening,
+           py::arg("timestep"), py::arg("iterations") = 5,
+           py::arg("ls_iterations") = 1, py::arg("tolerance") = 1e-4)
       .def("rollout_nominal", &FusedRolloutEvaluator::RolloutNominal,
            py::arg("initial_state"), py::arg("controls"),
            py::arg("control_substeps"))

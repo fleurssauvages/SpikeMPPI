@@ -45,7 +45,7 @@ class NativeRolloutBatcher:
     loops and repeated state packing.
     """
 
-    def __init__(self, robot, *, workers: int = 16, batch_hint: int = 32, chunk_size: int = 0, fused: bool = False) -> None:
+    def __init__(self, robot, *, workers: int = 16, batch_hint: int = 32, chunk_size: int = 0, fused: bool = False, screening: bool = False) -> None:
         from mujoco import rollout as mj_rollout
         import inspect
 
@@ -85,7 +85,11 @@ class NativeRolloutBatcher:
         self.last_rollout_cost_ms = 0.0
         self.last_rollout_fused_ms = 0.0
         self.fused_evaluator = None
+        self.screening_evaluator = None
         self.fused_requested = bool(fused)
+        self.screening_requested = bool(screening)
+        self._screening_config: tuple[float, int, int, float] | None = None
+        self.last_screen_ms = 0.0
         self._fused_verified = False
         self._fused_params: np.ndarray | None = None
         self._fused_param_owner: tuple[int, int] | None = None
@@ -144,6 +148,24 @@ class NativeRolloutBatcher:
                     "fused rollout extension has an old ABI. Rebuild it with: "
                     "python racing/setup_native.py build_ext --inplace"
                 )
+            if self.screening_requested:
+                if not hasattr(self.fused_evaluator, 'configure_screening'):
+                    self.fused_evaluator = None
+                    raise RuntimeError(
+                        "fused rollout extension lacks screening support. Rebuild it with: "
+                        "python racing/setup_native.py build_ext --inplace"
+                    )
+                self.screening_evaluator = _fused_mujoco.FusedRolloutEvaluator(
+                    model_path, int(self.nthread), int(self._root_qadr),
+                    int(self._task_qadr), int(chunk)
+                )
+                if not hasattr(self.screening_evaluator, 'configure_screening'):
+                    self.screening_evaluator = None
+                    self.fused_evaluator = None
+                    raise RuntimeError(
+                        "fused rollout extension lacks screening support. Rebuild it with: "
+                        "python racing/setup_native.py build_ext --inplace"
+                    )
         finally:
             Path(model_path).unlink(missing_ok=True)
 
@@ -154,6 +176,8 @@ class NativeRolloutBatcher:
         # Destroying the old object joins its persistent workers before loading
         # the newly serialized planning model. This is outside the MPPI hot path.
         self.fused_evaluator = None
+        self.screening_evaluator = None
+        self._screening_config = None
         self._init_fused_evaluator()
 
     @property
@@ -162,6 +186,7 @@ class NativeRolloutBatcher:
 
     def close(self) -> None:
         self.fused_evaluator = None
+        self.screening_evaluator = None
         runner = getattr(self, 'runner', None)
         if runner is not None:
             try:
@@ -418,6 +443,110 @@ class NativeRolloutBatcher:
         idx = np.minimum(np.arange(h, dtype=np.int64) + L - 1, h - 1)
         xy = self._task_xy_from_state(states[idx])
         return np.asarray(xy, dtype=np.float64).copy()
+
+    def evaluate_screen(
+        self,
+        start_snapshot,
+        control_batch: np.ndarray,
+        track,
+        current_s: float,
+        *,
+        nominal_controls: np.ndarray,
+        cost_cfg: RolloutCostConfig,
+        screen_timestep: float,
+        iterations: int = 5,
+        ls_iterations: int = 1,
+        tolerance: float = 1e-4,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Cheap fused preview used only to rank candidate control sequences.
+
+        The screening evaluator owns a separate copy of the planning model. It
+        runs MuJoCo ``implicitfast`` with one physics step per supplied control
+        bin, so changing its solver/timestep cannot alter the full-fidelity
+        evaluator or the executed plant. The returned cost uses the same racing
+        objective over the shorter supplied horizon.
+        """
+        if self.screening_evaluator is None:
+            raise RuntimeError(
+                'screening requires the rebuilt fused evaluator with configure_screening support'
+            )
+        if not self.supports_vectorized_cost:
+            raise RuntimeError('screening requires the fused StadiumTrack rollout path')
+        batch = np.ascontiguousarray(control_batch, dtype=np.float64)
+        nominal = np.ascontiguousarray(nominal_controls, dtype=np.float64)
+        if batch.ndim != 3 or nominal.ndim != 2:
+            raise ValueError('screen controls must be [N,H,nu] and nominal [H,nu]')
+        if batch.shape[1:] != nominal.shape:
+            raise ValueError('screen control and nominal horizons must match')
+
+        config = (float(screen_timestep), int(iterations), int(ls_iterations), float(tolerance))
+        if config != self._screening_config:
+            self.screening_evaluator.configure_screening(*config)
+            self._screening_config = config
+
+        pushing = self._task_qadr != self._root_qadr
+        if pushing:
+            qpos0 = np.asarray(start_snapshot.qpos, dtype=np.float64)
+            root_xy0 = qpos0[int(self._root_qadr):int(self._root_qadr) + 2]
+            task_xy0 = qpos0[int(self._task_qadr):int(self._task_qadr) + 2]
+            current_root_s = float(track.project(root_xy0)[0])
+            initial_task_root_distance = float(np.linalg.norm(task_xy0 - root_xy0))
+            initial_task_height = float(self.robot.task_rest_height)
+        else:
+            current_root_s = float(current_s)
+            initial_task_root_distance = 0.0
+            initial_task_height = 0.0
+
+        required = (
+            '_origin', '_rot', '_canonical_start', 'centerline_radius',
+            'left_arc_x', 'right_arc_x', 'center_y', 'straight_length',
+            'length', 'road_width',
+        )
+        if not all(hasattr(track, name) for name in required):
+            raise RuntimeError('screening currently supports StadiumTrack only')
+        initial = self.snapshot_to_state(start_snapshot, out=self._state_pack)
+        allowed = max(
+            0.0, 0.5 * float(track.road_width) - float(cost_cfg.hard_collision_clearance)
+        )
+        if self._fused_params is None:
+            self._fused_params = np.empty(29, dtype=np.float64)
+        params = self._fused_params
+        owner = (id(track), id(cost_cfg))
+        if self._fused_param_owner != owner:
+            params[:24] = [
+                float(track._origin[0]), float(track._origin[1]),
+                float(track._rot[0, 0]), float(track._rot[0, 1]),
+                float(track._rot[1, 0]), float(track._rot[1, 1]),
+                float(track._canonical_start[0]), float(track._canonical_start[1]),
+                float(track.centerline_radius), float(track.left_arc_x),
+                float(track.right_arc_x), float(track.center_y),
+                float(track.straight_length), float(track.length),
+                allowed * allowed,
+                float(cost_cfg.fall_height_fraction) * max(self.robot.initial_root_height, 1e-6),
+                float(cost_cfg.min_root_up), float(cost_cfg.upright_weight),
+                float(cost_cfg.control_deviation_weight),
+                float(cost_cfg.box_progress_weight),
+                float(cost_cfg.robot_progress_weight),
+                float(cost_cfg.robot_box_approach_weight),
+                float(cost_cfg.box_max_lift), float(cost_cfg.box_min_up),
+            ]
+            self._fused_param_owner = owner
+        params[24] = float(current_s)
+        params[25] = float(current_root_s)
+        params[26] = float(initial_task_root_distance)
+        params[27] = float(initial_task_height)
+        params[28] = float(start_snapshot.time)
+
+        t0 = time.perf_counter()
+        result = self.screening_evaluator.evaluate(
+            initial, batch, nominal, self._ctrl_scale, params, 1
+        )
+        self.last_screen_ms = 1e3 * (time.perf_counter() - t0)
+        positions, costs, progress, failed = result
+        return (
+            np.asarray(positions), np.asarray(costs),
+            np.asarray(progress), np.asarray(failed, dtype=bool),
+        )
 
     def evaluate(
         self,

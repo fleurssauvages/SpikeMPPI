@@ -87,6 +87,9 @@ def run_race(
     spike_twitch_rise_s: float = 0.016,
     spike_twitch_decay_s: float = 0.064,
     spike_twitch_duration_s: float = 0.200,
+    screen_pool: int = 0,
+    screen_exploit: int = 0,
+    audit: int = 0,
     seed: int = 1,
     max_steps_per_lap: int = 2000,
     max_steps: int | None = None,
@@ -323,6 +326,9 @@ def run_race(
         spike_twitch_rise_s=float(spike_twitch_rise_s),
         spike_twitch_decay_s=float(spike_twitch_decay_s),
         spike_twitch_duration_s=float(spike_twitch_duration_s),
+        screen_pool_size=int(screen_pool),
+        screen_exploit=int(screen_exploit),
+        screen_audit_every=int(audit),
         rollout_workers=int(rollout_workers),
         rollout_chunk_size=int(rollout_chunk_size),
         warm_start=bool(warm_start),
@@ -471,6 +477,19 @@ def run_race(
                 "spike_effective_synergies",
                 "spike_synergy_entropy",
                 "spike_expected_events",
+            "screen_pool_size",
+            "screen_horizon",
+            "screen_exploit_count",
+            "screen_explore_count",
+            "screen_failed_fraction",
+            "screen_ms",
+            "screen_full_best_from_explore",
+            "screen_full_best_cheap_rank",
+            "screen_audit_full_ess",
+            "screen_audit_top_recall",
+            "screen_audit_captured_weight_mass",
+            "screen_audit_oracle_top_mass",
+            "screen_audit_first_action_cosine",
             ):
                 value = info.get(key, math.nan)
                 try:
@@ -526,7 +545,8 @@ def run_race(
                     f"{profile_label} [{step + 1:5d}]  "
                     f"nominal {tm.get('nominal', math.nan):7.2f} ms{nominal_suffix}  |  "
                     f"sample {tm.get('sampling', 0.0):6.2f} ms  |  "
-                    f"rollout {tm.get('rollouts', 0.0):7.2f} ms ({', '.join(rollout_detail)})  |  "
+                    + (f"screen {tm.get('screening', 0.0):7.2f} ms  |  " if tm.get('screening', 0.0) > 0.005 else "")
+                    + f"rollout {tm.get('rollouts', 0.0):7.2f} ms ({', '.join(rollout_detail)})  |  "
                     f"update {tm.get('update', 0.0):6.2f} ms  |  "
                     f"total {total_ms:7.2f} / {deadline_ms:.2f} ms  [{status}]"
                 )
@@ -624,7 +644,7 @@ def run_race(
             "total_p50_ms": float(np.median(totals)),
             "total_p95_ms": float(np.percentile(totals, 95)),
         }
-        for key in ("nominal", "sampling", "rollouts", "rollout_fused", "update", "total"):
+        for key in ("nominal", "sampling", "screening", "rollouts", "rollout_fused", "update", "total"):
             vals = np.asarray([r.get(key, 0.0) for r in profile_rows], dtype=np.float64)
             profile_summary[f"{key}_mean_ms"] = float(np.mean(vals))
             profile_summary[f"{key}_std_ms"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
@@ -636,6 +656,7 @@ def run_race(
             ("warm", "warm_start"),
             ("prior", "prior"),
             ("sample", "sampling"),
+            ("screen", "screening"),
             ("rollout", "rollouts"),
         ]
         if has_fused:
@@ -688,6 +709,19 @@ def run_race(
             "spike_effective_synergies",
             "spike_synergy_entropy",
             "spike_expected_events",
+            "screen_pool_size",
+            "screen_horizon",
+            "screen_exploit_count",
+            "screen_explore_count",
+            "screen_failed_fraction",
+            "screen_ms",
+            "screen_full_best_from_explore",
+            "screen_full_best_cheap_rank",
+            "screen_audit_full_ess",
+            "screen_audit_top_recall",
+            "screen_audit_captured_weight_mass",
+            "screen_audit_oracle_top_mass",
+            "screen_audit_first_action_cosine",
         )
         for key in aggregate_keys:
             vals = finite_values(key)
@@ -734,6 +768,10 @@ def run_race(
                 vals = finite_values(key)
                 if vals.size:
                     diagnostics_summary[f"{key}_final"] = float(vals[-1])
+
+        audit_vals = finite_values("screen_audit_captured_weight_mass")
+        if audit_vals.size:
+            diagnostics_summary["screen_audit_count"] = float(audit_vals.size)
 
     return RaceResult(
         robot_name=plant.name,
@@ -862,6 +900,21 @@ def main() -> None:
     parser.add_argument("--spike-twitch-rise", type=float, default=0.016, help="spike twitch rise time constant [s]")
     parser.add_argument("--spike-twitch-decay", type=float, default=0.064, help="spike twitch decay time constant [s]")
     parser.add_argument("--spike-twitch-duration", type=float, default=0.200, help="finite twitch-kernel support [s]")
+    parser.add_argument(
+        "--screen-pool", type=int, default=0,
+        help="with --sampling spike, pre-screen this many Spike candidates over the full planning horizon; 0 disables screening",
+    )
+    parser.add_argument(
+        "--screen-exploit", type=int, default=0,
+        help="with --sampling spike and --screen-pool > 0, fill this many full-rollout slots from the best screen scores; remaining slots stay random; 0 disables screening",
+    )
+    parser.add_argument(
+        "--audit", type=int, default=0, metavar="N",
+        help=(
+            "with Spike screening enabled, evaluate the entire screen pool at full fidelity every N MPC updates "
+            "and report extraction diagnostics; 0 disables auditing (default)"
+        ),
+    )
 
     parser.add_argument(
         "--variant",
@@ -876,7 +929,8 @@ def main() -> None:
         help=(
             "MPPI candidate sampling: standard Gaussian, guided low-rank history, "
             "diag-lowrank adaptive covariance, spline latent sampling, iCEM-style elite reuse, "
-            "or spike (fixed direct-joint Poisson/twitch baseline)."
+            "or spike (fixed direct-joint Poisson/twitch sampling; optional full-horizon "
+            "screening is enabled with --screen-pool/--screen-exploit)."
         ),
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -1025,6 +1079,9 @@ def main() -> None:
         spike_twitch_rise_s=args.spike_twitch_rise,
         spike_twitch_decay_s=args.spike_twitch_decay,
         spike_twitch_duration_s=args.spike_twitch_duration,
+        screen_pool=args.screen_pool,
+        screen_exploit=args.screen_exploit,
+        audit=args.audit,
         seed=args.seed,
         max_steps_per_lap=args.max_steps_per_lap,
         max_steps=args.max_steps,
@@ -1078,6 +1135,27 @@ def main() -> None:
         f"progress={result.cumulative_progress[-1]:.2f}m, "
         f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s"
     )
+    ds = result.diagnostics_summary
+    if result.sampling_option == SamplingOption.SPIKE.value and "screen_pool_size_median" in ds:
+        parts = []
+        if "screen_ms_median" in ds:
+            parts.append(f"preview={ds['screen_ms_median']:.2f}ms")
+        if "screen_full_best_from_explore_mean" in ds:
+            parts.append(f"exploreWins={100.0*ds['screen_full_best_from_explore_mean']:.1f}%")
+        if "screen_full_best_cheap_rank_median" in ds:
+            parts.append(f"bestFullCheapRankMed={ds['screen_full_best_cheap_rank_median']:.1f}")
+        if "screen_audit_captured_weight_mass_median" in ds:
+            parts.append(f"auditMassMed={ds['screen_audit_captured_weight_mass_median']:.3f}")
+        if "screen_audit_oracle_top_mass_median" in ds:
+            parts.append(f"auditOracleMassMed={ds['screen_audit_oracle_top_mass_median']:.3f}")
+        if "screen_audit_top_recall_median" in ds:
+            parts.append(f"auditTopRecallMed={ds['screen_audit_top_recall_median']:.3f}")
+        if "screen_audit_first_action_cosine_median" in ds:
+            parts.append(f"auditCosMed={ds['screen_audit_first_action_cosine_median']:.3f}")
+        if "screen_audit_count" in ds:
+            parts.append(f"audits={int(ds['screen_audit_count'])}")
+        if parts:
+            print("SpikeScreen " + " ".join(parts))
     lap_times_s = [float(v) for v in result.lap_times]
     lap_durations_s = [
         lap_times_s[i] - (lap_times_s[i - 1] if i else 0.0)

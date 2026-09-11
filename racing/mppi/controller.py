@@ -77,6 +77,17 @@ class ControllerConfig:
     spike_twitch_decay_s: float = 0.064
     spike_twitch_duration_s: float = 0.200
 
+    # Optional full-horizon multi-fidelity screening for the ordinary ``spike``
+    # sampler. Both values at zero recover the exact standard Spike-MPPI path.
+    # When enabled, ``screen_pool_size`` Spike candidates are ranked with the
+    # existing full-horizon implicitfast preview and only ``num_rollouts`` are
+    # evaluated at full fidelity.
+    screen_pool_size: int = 0
+    screen_exploit: int = 0
+    # Optional diagnostic audit cadence for screened Spike populations.
+    # 0 disables the expensive full-population audit; N>0 audits every N MPC steps.
+    screen_audit_every: int = 0
+
     # Policy-seeded local iLQR-style nominal construction.
     nominal_refine_iterations: int = 0
     nominal_refine_damping: float = 1e-4
@@ -155,6 +166,17 @@ class ControllerConfig:
             raise ValueError("spike_twitch_decay_s must be greater than spike_twitch_rise_s")
         if self.spike_twitch_duration_s <= 0.0:
             raise ValueError("spike_twitch_duration_s must be positive")
+        self.screen_pool_size = max(0, int(self.screen_pool_size))
+        self.screen_exploit = max(0, int(self.screen_exploit))
+        self.screen_audit_every = max(0, int(self.screen_audit_every))
+        if (self.screen_pool_size == 0) != (self.screen_exploit == 0):
+            raise ValueError("screen_pool_size and screen_exploit must both be zero or both be positive")
+        if self.screen_pool_size > 0 and self.screen_pool_size < self.num_rollouts:
+            raise ValueError("screen_pool_size must be >= num_rollouts when screening is enabled")
+        if self.screen_exploit > self.num_rollouts:
+            raise ValueError("screen_exploit must be <= num_rollouts")
+        if self.screen_audit_every > 0 and self.screen_pool_size == 0:
+            raise ValueError("screen_audit_every requires screening (--screen-pool/--screen-exploit)")
         if self.box_progress_weight < 0.0 or self.robot_progress_weight < 0.0 or self.robot_box_approach_weight < 0.0:
             raise ValueError("push-task reward weights must be nonnegative")
         if self.box_max_lift < 0.0:
@@ -194,6 +216,13 @@ class JointMPPIController:
         self.cfg = cfg
         self.variant = ControllerVariant(variant)
         self.sampling = SamplingOption(sampling)
+        self._screen_enabled = (
+            self.sampling == SamplingOption.SPIKE
+            and cfg.screen_pool_size > 0
+            and cfg.screen_exploit > 0
+        )
+        if (cfg.screen_pool_size > 0 or cfg.screen_exploit > 0) and self.sampling != SamplingOption.SPIKE:
+            raise ValueError("--screen-pool/--screen-exploit are only valid with --sampling spike")
         if self.variant == ControllerVariant.NOMINAL and self.sampling != SamplingOption.STANDARD:
             raise ValueError("non-standard --sampling options require --variant mppi")
         self.rng = np.random.default_rng(int(seed))
@@ -245,7 +274,7 @@ class JointMPPIController:
         self._spline_basis = self._make_bspline_basis(cfg.horizon, cfg.spline_modes)
         self._spike_sampler_backend = (
             resolve_spike_sampler(cfg.spike_sampler)
-            if self.sampling == SamplingOption.SPIKE
+            if self.sampling in BIO_EVENT_SAMPLING_OPTIONS
             else "unused"
         )
         self._spike_levels, self._spike_level_prior = self._make_recruitment_marks(
@@ -280,13 +309,16 @@ class JointMPPIController:
         self._spike_variance_weights = k2_prefix[remaining - 1] / float(h)
         self._spike_global_noise_scale = self._compute_spike_global_noise_scale()
         self._spike_generator = None
-        if self.sampling == SamplingOption.SPIKE:
+        if self.sampling in BIO_EVENT_SAMPLING_OPTIONS:
+            spike_n = cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts
             self._spike_generator = StaticSpikeSampler(
                 self._spike_pos_rate_map, self._spike_neg_rate_map,
                 self._spike_mark_prob_map, self._spike_levels,
-                cfg.control_dt, cfg.num_rollouts, self._spike_twitch,
+                cfg.control_dt, spike_n, self._spike_twitch,
                 backend=self._spike_sampler_backend,
             )
+        self._screen_step = 0
+        self._last_screen_diag: dict[str, float] = {}
 
         self._fixed_spike_diagnostics = self._make_fixed_spike_diagnostics()
 
@@ -294,10 +326,14 @@ class JointMPPIController:
         # evaluator, then stock mujoco.rollout, then the Python fallback.
         try:
             self.rollout_batcher = NativeRolloutBatcher(
-                robot, workers=cfg.rollout_workers, batch_hint=cfg.num_rollouts,
+                robot, workers=cfg.rollout_workers,
+                batch_hint=max(cfg.num_rollouts, cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts),
                 chunk_size=cfg.rollout_chunk_size, fused=True,
+                screening=self._screen_enabled,
             )
         except Exception:
+            if self._screen_enabled:
+                raise
             try:
                 self.rollout_batcher = NativeRolloutBatcher(
                     robot, workers=cfg.rollout_workers, batch_hint=cfg.num_rollouts,
@@ -337,6 +373,15 @@ class JointMPPIController:
         if self.sampling == SamplingOption.ICEM:
             return f"iCEM-style elite reuse: shifted_elites={self.cfg.icem_elites}"
         if self.sampling == SamplingOption.SPIKE:
+            if self._screen_enabled:
+                return (
+                    "Spike-MPPI with optional full-horizon screening: fixed direct-joint "
+                    "signed marked-Poisson events + causal twitch; "
+                    f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
+                    f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
+                    "preview=implicitfast, full update unchanged, "
+                    f"implementation={self._spike_sampler_backend}"
+                )
             return (
                 "Spike-MPPI: fixed direct-joint signed marked-Poisson events + causal twitch; "
                 f"neurons={self.robot.nu}, base_rate={self.cfg.spike_rate_hz:g}Hz, "
@@ -681,12 +726,12 @@ class JointMPPIController:
             "spike_mark_entropy_mean": float(levels > 1),
             "spike_mark_prob_min": 1.0 / levels, "spike_mark_prob_max": 1.0 / levels,
             "spike_mean_recruitment": float(np.mean(self._spike_levels)),
-            "spike_effective_synergies": float(m) if self.sampling == SamplingOption.SPIKE else math.nan,
-            "spike_synergy_entropy": float(m > 1) if self.sampling == SamplingOption.SPIKE else math.nan,
+            "spike_effective_synergies": float(m) if self.sampling in BIO_EVENT_SAMPLING_OPTIONS else math.nan,
+            "spike_synergy_entropy": float(m > 1) if self.sampling in BIO_EVENT_SAMPLING_OPTIONS else math.nan,
             "spike_expected_events": self.cfg.control_dt * self.cfg.horizon * total_rate,
             "spike_total_rate_hz": total_rate,
             "spike_event_budget_fixed": 1.0,
-            "spike_firing_fixed": float(self.sampling == SamplingOption.SPIKE),
+            "spike_firing_fixed": float(self.sampling in BIO_EVENT_SAMPLING_OPTIONS),
         }
         if self.sampling not in BIO_EVENT_SAMPLING_OPTIONS:
             return {key: math.nan for key in out}
@@ -699,8 +744,8 @@ class JointMPPIController:
         """Fixed spike-joint baseline: no contextual or online adaptation."""
         if self._spike_generator is None:
             raise RuntimeError("Spike generator is unavailable")
-        n = self.cfg.num_rollouts
         z, event_total = self._spike_generator.sample_projected_identity(self.rng)
+        n = int(z.shape[0])
         z *= self._spike_global_noise_scale
         z *= self._joint_std[None, None, :]
         # ``z`` is borrowed sampler workspace and is fully overwritten on the
@@ -710,6 +755,92 @@ class JointMPPIController:
         np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
         self._last_spike_event_count_mean = float(event_total) / n
         return z
+
+    def _screen_spike_population(
+        self,
+        start,
+        nominal: np.ndarray,
+        population: np.ndarray,
+        current_s: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+        """Rank a large fixed-law Spike population with a cheap MuJoCo preview.
+
+        The first ``screen_exploit`` full-fidelity slots take the lowest
+        preview costs. Remaining slots are sampled uniformly from the rest to
+        retain coverage when the coarse model misranks candidates.
+        """
+        if self.native_batcher is None or not hasattr(self.native_batcher, 'evaluate_screen'):
+            raise RuntimeError('Spike screening requires the rebuilt fused screening evaluator')
+        hs = int(self.cfg.horizon)
+        preview = np.ascontiguousarray(population[:, :hs, :], dtype=np.float64)
+        nominal_preview = np.ascontiguousarray(nominal[:hs], dtype=np.float64)
+        _, cheap_costs, _, cheap_failed = self.native_batcher.evaluate_screen(
+            start, preview, self.track, current_s,
+            nominal_controls=nominal_preview, cost_cfg=self.cost_cfg,
+            screen_timestep=float(self.cfg.control_dt),
+            iterations=5,
+            ls_iterations=1,
+            tolerance=1e-4,
+        )
+        cheap_costs = np.asarray(cheap_costs, dtype=np.float64).reshape(-1)
+        cheap_failed = np.asarray(cheap_failed, dtype=bool).reshape(-1)
+        n_pool = int(len(cheap_costs))
+        n_full = int(self.cfg.num_rollouts)
+        n_exploit = min(int(self.cfg.screen_exploit), n_full, n_pool)
+        order = np.argsort(cheap_costs, kind='stable')
+        exploit_idx = np.asarray(order[:n_exploit], dtype=np.int64)
+
+        selected_mask = np.zeros(n_pool, dtype=bool)
+        selected_mask[exploit_idx] = True
+        remaining_idx = np.flatnonzero(~selected_mask)
+        n_explore = n_full - n_exploit
+        if n_explore > 0:
+            explore_idx = np.asarray(
+                self.rng.choice(remaining_idx, size=n_explore, replace=False),
+                dtype=np.int64,
+            )
+            selected_idx = np.concatenate((exploit_idx, explore_idx))
+        else:
+            selected_idx = exploit_idx
+        controls = np.ascontiguousarray(population[selected_idx], dtype=np.float64)
+
+        finite = cheap_costs[np.isfinite(cheap_costs)]
+        if finite.size:
+            cheap_min = float(np.min(finite))
+            cheap_median = float(np.median(finite))
+        else:
+            cheap_min = math.inf
+            cheap_median = math.inf
+        diag = {
+            'screen_pool_size': float(n_pool),
+            'screen_horizon': float(hs),
+            'screen_exploit_count': float(n_exploit),
+            'screen_explore_count': float(n_explore),
+            'screen_failed_fraction': float(np.mean(cheap_failed)) if n_pool else 0.0,
+            'screen_cost_min': cheap_min,
+            'screen_cost_median': cheap_median,
+            'screen_ms': float(getattr(self.native_batcher, 'last_screen_ms', 0.0)),
+        }
+        return controls, selected_idx, cheap_costs, diag
+
+    @staticmethod
+    def _weights_copy(costs: np.ndarray, temperature: float) -> np.ndarray:
+        c = np.asarray(costs, dtype=np.float64).reshape(-1)
+        w = np.zeros_like(c)
+        finite = np.isfinite(c)
+        count = int(np.count_nonzero(finite))
+        if count == 0:
+            if len(w):
+                w.fill(1.0 / len(w))
+            return w
+        rho = float(np.min(c[finite]))
+        w[finite] = np.exp(np.clip(-(c[finite] - rho) / max(float(temperature), 1e-300), -745.0, 0.0))
+        total = float(np.sum(w))
+        if total <= 1e-12:
+            w[finite] = 1.0 / count
+        else:
+            w /= total
+        return w
 
     def _sample_icem(self, nominal: np.ndarray) -> np.ndarray:
         controls = self._sample_standard(nominal)
@@ -884,6 +1015,10 @@ class JointMPPIController:
         start, policy_nom, refined, sensitivity, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
         t_nominal = time.perf_counter()
         nominal = refined.controls
+        screen_population = None
+        screen_selected_idx = None
+        screen_cheap_costs = None
+        screen_diag: dict[str, float] = {}
         if self.sampling == SamplingOption.GUIDED:
             controls = self._sample_guided(nominal, adaptive_diagonal=False)
         elif self.sampling == SamplingOption.DIAG_LOWRANK:
@@ -893,23 +1028,91 @@ class JointMPPIController:
         elif self.sampling == SamplingOption.ICEM:
             controls = self._sample_icem(nominal)
         elif self.sampling == SamplingOption.SPIKE:
-            controls = self._sample_spike(nominal)
+            if self._screen_enabled:
+                screen_population = self._sample_spike(nominal)
+                t_sample = time.perf_counter()
+                controls, screen_selected_idx, screen_cheap_costs, screen_diag = self._screen_spike_population(
+                    start, nominal, screen_population, current_s
+                )
+            else:
+                controls = self._sample_spike(nominal)
         else:
             controls = self._sample_standard(nominal)
-        t_sample = time.perf_counter()
+        if not self._screen_enabled:
+            t_sample = time.perf_counter()
+        t_screen = time.perf_counter()
 
-        positions, costs, terminal_progress, failed = evaluate_control_batch(
-            self.robot,
-            start,
-            controls,
-            self.track,
-            current_s,
-            control_substeps=self.control_substeps,
-            nominal_controls=nominal,
-            cost_cfg=self.cost_cfg,
-            workers=self.cfg.rollout_workers,
-            native_batcher=self.native_batcher,
+        self._screen_step += 1
+        # Optional full-population diagnostic audit. On audit iterations the whole
+        # screen pool is evaluated at full fidelity, allowing the selected subset to
+        # be compared against the true full-pool MPPI population. Disabled by default.
+        audit_now = (
+            self._screen_enabled
+            and self.cfg.screen_audit_every > 0
+            and (self._screen_step % self.cfg.screen_audit_every == 0)
         )
+        audit_reference_first = None
+        if audit_now and screen_population is not None and screen_selected_idx is not None:
+            all_positions, all_costs, all_progress, all_failed = evaluate_control_batch(
+                self.robot, start, screen_population, self.track, current_s,
+                control_substeps=self.control_substeps, nominal_controls=nominal,
+                cost_cfg=self.cost_cfg, workers=self.cfg.rollout_workers,
+                native_batcher=self.native_batcher,
+            )
+            positions = np.asarray(all_positions)[screen_selected_idx].copy()
+            costs = np.asarray(all_costs)[screen_selected_idx].copy()
+            terminal_progress = np.asarray(all_progress)[screen_selected_idx].copy()
+            failed = np.asarray(all_failed, dtype=bool)[screen_selected_idx].copy()
+
+            full_costs = np.asarray(all_costs, dtype=np.float64)
+            if self.cfg.adaptive_temperature_lbps and NUMBA_AVAILABLE:
+                full_temp, _, full_ess, _, _, _, _ = lbps_optimize_fast(
+                    full_costs, float(self.cfg.lbps_delta),
+                    float(self.cfg.lambda_temperature),
+                    int(self.cfg.lbps_optimizer_iterations),
+                )
+            elif self.cfg.adaptive_temperature_lbps:
+                full_lbps = optimize_lbps_temperature(
+                    full_costs, delta=self.cfg.lbps_delta,
+                    fallback_temperature=self.cfg.lambda_temperature,
+                    iterations=self.cfg.lbps_optimizer_iterations,
+                )
+                full_temp, full_ess = full_lbps.temperature, full_lbps.ess
+            else:
+                full_temp = float(self.cfg.lambda_temperature)
+                wf = self._weights_copy(full_costs, full_temp)
+                full_ess = float(1.0 / max(np.sum(wf * wf), 1e-300))
+            full_w = self._weights_copy(full_costs, full_temp)
+            full_order = np.argsort(full_costs, kind='stable')
+            top = full_order[: self.cfg.num_rollouts]
+            selected_set = set(map(int, np.asarray(screen_selected_idx).tolist()))
+            overlap = sum(int(i) in selected_set for i in top) / max(len(top), 1)
+            captured_mass = float(np.sum(full_w[screen_selected_idx]))
+            top_mass = float(np.sum(full_w[top]))
+            full_candidate = np.einsum('n,nhu->hu', full_w, screen_population, optimize=False)
+            audit_reference_first = np.asarray(full_candidate[0] - nominal[0], dtype=np.float64).copy()
+            screen_diag.update({
+                'screen_audit': 1.0,
+                'screen_audit_full_ess': float(full_ess),
+                'screen_audit_top_recall': float(overlap),
+                'screen_audit_captured_weight_mass': captured_mass,
+                'screen_audit_oracle_top_mass': top_mass,
+            })
+        else:
+            positions, costs, terminal_progress, failed = evaluate_control_batch(
+                self.robot,
+                start,
+                controls,
+                self.track,
+                current_s,
+                control_substeps=self.control_substeps,
+                nominal_controls=nominal,
+                cost_cfg=self.cost_cfg,
+                workers=self.cfg.rollout_workers,
+                native_batcher=self.native_batcher,
+            )
+            if self._screen_enabled:
+                screen_diag['screen_audit'] = 0.0
         t_rollout = time.perf_counter()
         rollout_physics_ms = (
             float(self.native_batcher.last_rollout_physics_ms)
@@ -969,6 +1172,29 @@ class JointMPPIController:
             self._update_direction_memory(candidate, nominal)
         if self.sampling == SamplingOption.ICEM:
             self._update_icem_elites(controls, costs)
+
+        if self._screen_enabled and screen_selected_idx is not None and screen_cheap_costs is not None:
+            best_selected = int(np.argmin(costs)) if len(costs) else 0
+            n_exploit = int(self.cfg.screen_exploit)
+            selected_cheap = np.asarray(screen_cheap_costs)[screen_selected_idx]
+            screen_diag['screen_selected_cost_median'] = float(
+                np.median(selected_cheap[np.isfinite(selected_cheap)])
+            ) if np.any(np.isfinite(selected_cheap)) else math.inf
+            screen_diag['screen_full_best_from_explore'] = float(best_selected >= n_exploit)
+            cheap_order = np.argsort(np.asarray(screen_cheap_costs), kind='stable')
+            inverse_rank = np.empty_like(cheap_order)
+            inverse_rank[cheap_order] = np.arange(len(cheap_order))
+            screen_diag['screen_full_best_cheap_rank'] = float(
+                inverse_rank[int(screen_selected_idx[best_selected])] + 1
+            )
+            if audit_reference_first is not None:
+                a = np.asarray(candidate[0] - nominal[0], dtype=np.float64)
+                b = np.asarray(audit_reference_first, dtype=np.float64)
+                denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+                screen_diag['screen_audit_first_action_cosine'] = (
+                    float(np.dot(a, b) / denom) if denom > 1e-12 else math.nan
+                )
+            self._last_screen_diag = dict(screen_diag)
 
         if self.cfg.warm_start:
             self._previous_plan = np.asarray(candidate, dtype=np.float64).copy()
@@ -1057,6 +1283,7 @@ class JointMPPIController:
             "spike_synergies": int(self._spike_synergies.shape[0]),
             "spike_events_mean": float(self._last_spike_event_count_mean),
             **spike_diag,
+            **screen_diag,
             "nominal_cost": nominal_cost,
             "weighted_rollout_cost": weighted_rollout_cost,
             "best_finite_cost": best_finite_cost,
@@ -1071,7 +1298,8 @@ class JointMPPIController:
                 "nominal": 1e3 * (t_nominal - t_total),
                 **nominal_parts,
                 "sampling": 1e3 * (t_sample - t_nominal),
-                "rollouts": 1e3 * (t_rollout - t_sample),
+                "screening": 1e3 * (t_screen - t_sample),
+                "rollouts": 1e3 * (t_rollout - t_screen),
                 "rollout_physics": rollout_physics_ms,
                 "rollout_cost": rollout_cost_ms,
                 "rollout_fused": rollout_fused_ms,
