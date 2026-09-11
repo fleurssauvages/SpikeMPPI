@@ -10,6 +10,7 @@ import numpy as np
 from .lbps import optimize_lbps_temperature, weighted_control_sequence
 from .rollout import (
     RolloutCostConfig,
+    NominalRollout,
     NativeRolloutBatcher,
     evaluate_control_batch,
     rollout_policy_nominal,
@@ -17,6 +18,7 @@ from .rollout import (
     refine_policy_nominal,
 )
 from .fast_kernels import NUMBA_AVAILABLE, lbps_optimize_fast
+from .spike_kernels import StaticSpikeSampler, resolve_spike_sampler
 
 
 class ControllerVariant(str, Enum):
@@ -33,22 +35,14 @@ class SamplingOption(str, Enum):
     SPLINE = "spline"
     ICEM = "icem"
     SPIKE = "spike"
-    SPIKE_JOINT = "spike-joint"
 
 
-SPIKE_SAMPLING_OPTIONS = frozenset({
-    SamplingOption.SPIKE,
-    SamplingOption.SPIKE_JOINT,
-})
-
-SPIKE_SYNERGY_OPTIONS = frozenset({
-    SamplingOption.SPIKE,
-})
+BIO_EVENT_SAMPLING_OPTIONS = frozenset({SamplingOption.SPIKE})
 
 @dataclass
 class ControllerConfig:
     control_dt: float = 0.02
-    horizon: int = 50
+    horizon: int = 75
     num_rollouts: int = 32
     lambda_temperature: float = 1.0
     adaptive_temperature_lbps: bool = True
@@ -71,46 +65,13 @@ class ControllerConfig:
     spline_modes: int = 6
     icem_elites: int = 4
 
-    # Spike-MPPI: signed marked point-process exploration in a spatial motor
-    # basis.  The *sampling distribution at initialization is intentionally the
-    # same successful baseline used by the earlier implementation*: total rate
-    # lambda0, symmetric positive/negative rates, and a uniform distribution over
-    # recruitment marks.  Online plasticity no longer learns lambda, q and p as
-    # independent free maps.  Instead it learns three constrained latent values
-    # per event/synergy channel, pooled over the prediction horizon:
-    #
-    #   g : common excitability / log-rate modulation,
-    #   b : reciprocal antagonistic directional bias,
-    #   r : orderly recruitment bias from weak to strong marks.
-    #
-    # These latents deterministically generate the same marked-Poisson family.
-    # At g=b=r=0 the proposal is *exactly* the fixed sampler.  Reward-centred
-    # MPPI weights gate horizon-pooled likelihood-score eligibility terms while
-    # event generator.  A global homeostatic projection keeps the expected event
-    # budget fixed as g redistributes excitability across channels.
-    spike_synergies: int = 8
-    # ``spike`` uses the handcrafted Hadamard coordination basis;
-    # ``spike-joint`` is the actuator-local no-synergy ablation.
-    spike_online: bool = True
+    # Shared marked-Poisson/twitch physiology. ``spike`` is always the fixed
+    # direct-joint baseline: one independent neuron per actuator, identity wiring,
+    # and no online learning.
     spike_rate_hz: float = 16.0
-    spike_rate_min_factor: float = 0.50
-    spike_rate_max_factor: float = 2.0
-    spike_sign_min_prob: float = 0.10
     spike_recruitment_levels: int = 6
-    spike_mark_min_prob: float = 0.01
+    spike_sampler: str = "auto"
 
-    # Horizon-pooled three-factor plasticity.  Plasticity is channel-level, not
-    # time-bin-level: each event/synergy channel carries one excitability g, one
-    # antagonistic bias b and one recruitment bias r.  Local likelihood scores
-    # are summed across the prediction horizon, RMS-normalized and integrated by
-    # a persistent eligibility trace before updating these latents.
-    spike_gain_update: float = 0.05
-    spike_bias_update: float = 0.05
-    spike_recruitment_update: float = 0.03
-    spike_latent_decay: float = 0.005
-    spike_plasticity_momentum: float = 0.90
-    spike_recruitment_bias_max: float = 1.50
-    spike_gradient_clip: float = 3.0
 
     spike_twitch_rise_s: float = 0.016
     spike_twitch_decay_s: float = 0.064
@@ -152,6 +113,9 @@ class ControllerConfig:
     # Standard receding-horizon warm start. After the first update, shift the
     # previous optimized sequence instead of doing H synchronous policy calls.
     warm_start: bool = True
+    # Nominal geometry is diagnostic-only unless nominal refinement is enabled.
+    # Keep API compatibility; race.py disables it when the overlay is not used.
+    nominal_diagnostics: bool = True
 
     def __post_init__(self) -> None:
         self.horizon = max(1, int(self.horizon))
@@ -180,37 +144,11 @@ class ControllerConfig:
             raise ValueError("diag_lowrank_max must be >= diag_lowrank_min")
         self.spline_modes = max(4, int(self.spline_modes))
         self.icem_elites = max(0, int(self.icem_elites))
-        self.spike_synergies = max(1, int(self.spike_synergies))
-        self.spike_online = bool(self.spike_online)
-        if self.spike_rate_hz <= 0.0:
-            raise ValueError("spike_rate_hz must be positive")
-        if not 0.0 < self.spike_rate_min_factor <= 1.0:
-            raise ValueError("spike_rate_min_factor must lie in (0, 1]")
-        if self.spike_rate_max_factor < 1.0:
-            raise ValueError("spike_rate_max_factor must be >= 1")
-        if self.spike_rate_max_factor < self.spike_rate_min_factor:
-            raise ValueError("spike_rate_max_factor must be >= spike_rate_min_factor")
-        if not 0.0 <= self.spike_sign_min_prob < 0.5:
-            raise ValueError("spike_sign_min_prob must lie in [0, 0.5)")
+        if self.spike_sampler not in {"auto", "numpy", "numba"}:
+            raise ValueError("spike_sampler must be auto, numpy, or numba")
+        if not np.isfinite(self.spike_rate_hz) or self.spike_rate_hz <= 0:
+            raise ValueError("spike_rate_hz must be finite and positive")
         self.spike_recruitment_levels = max(1, int(self.spike_recruitment_levels))
-        if self.spike_mark_min_prob < 0.0:
-            raise ValueError("spike_mark_min_prob must be nonnegative")
-        if self.spike_recruitment_levels > 1 and self.spike_mark_min_prob >= 1.0 / self.spike_recruitment_levels:
-            raise ValueError("spike_mark_min_prob must be smaller than 1 / spike_recruitment_levels")
-        if self.spike_gain_update < 0.0:
-            raise ValueError("spike_gain_update must be nonnegative")
-        if self.spike_bias_update < 0.0:
-            raise ValueError("spike_bias_update must be nonnegative")
-        if self.spike_recruitment_update < 0.0:
-            raise ValueError("spike_recruitment_update must be nonnegative")
-        if not 0.0 <= self.spike_latent_decay < 1.0:
-            raise ValueError("spike_latent_decay must lie in [0, 1)")
-        if not 0.0 <= self.spike_plasticity_momentum < 1.0:
-            raise ValueError("spike_plasticity_momentum must lie in [0, 1)")
-        if self.spike_recruitment_bias_max <= 0.0:
-            raise ValueError("spike_recruitment_bias_max must be positive")
-        if self.spike_gradient_clip <= 0.0:
-            raise ValueError("spike_gradient_clip must be positive")
         if self.spike_twitch_rise_s <= 0.0:
             raise ValueError("spike_twitch_rise_s must be positive")
         if self.spike_twitch_decay_s <= self.spike_twitch_rise_s:
@@ -224,7 +162,6 @@ class ControllerConfig:
         if not -1.0 <= self.box_min_up <= 1.0:
             raise ValueError("box_min_up must lie in [-1, 1]")
         self.rollout_chunk_size = max(0, int(self.rollout_chunk_size))
-
 
 class JointMPPIController:
     """Native-MuJoCo policy-seeded direct-joint MPPI controller.
@@ -305,60 +242,53 @@ class JointMPPIController:
         self._diag_variance = np.ones((cfg.horizon, robot.nu), dtype=np.float64)
         self._icem_elites: np.ndarray | None = None
         self._spline_basis = self._make_bspline_basis(cfg.horizon, cfg.spline_modes)
-        # Two Spike spatial models are supported:
-        #   spike       -> handcrafted coordinated Hadamard synergy basis,
-        #   spike-joint -> actuator-local channels (no multi-joint synergy).
-        # The learned nominal/NMF dictionary is intentionally excluded from the
-        # main method and retained only as a future research direction.
-        if self.sampling == SamplingOption.SPIKE_JOINT:
-            self._spike_synergies = self._make_spike_joint_basis(robot.nu, cfg.spike_synergies)
-        else:
-            self._spike_synergies = self._make_spike_hadamard_basis(robot.nu, cfg.spike_synergies)
+        self._spike_sampler_backend = (
+            resolve_spike_sampler(cfg.spike_sampler)
+            if self.sampling == SamplingOption.SPIKE
+            else "unused"
+        )
+        self._spike_levels, self._spike_level_prior = self._make_recruitment_marks(
+            cfg.spike_recruitment_levels
+        )
         self._spike_twitch = self._make_spike_twitch_kernel(
             cfg.control_dt,
             cfg.spike_twitch_rise_s,
             cfg.spike_twitch_decay_s,
             cfg.spike_twitch_duration_s,
         )
-        self._spike_levels, self._spike_level_prior = self._make_recruitment_marks(
-            cfg.spike_recruitment_levels
-        )
         h = int(cfg.horizon)
-        m = int(self._spike_synergies.shape[0])
+        # ``spike`` is intentionally the former spike-joint baseline: exactly one
+        # independent channel per physical actuator and identity decoding.
+        self._spike_synergies = np.eye(robot.nu, dtype=np.float64)
+        m = int(robot.nu)
         spike_shape = (h, m)
-        half_base = 0.5 * float(cfg.spike_rate_hz)
+        self._spike_total_rate_hz = float(robot.nu) * float(cfg.spike_rate_hz)
+        per_channel_rate = self._spike_total_rate_hz / float(m)
+        half_base = 0.5 * per_channel_rate
         self._spike_pos_rate_map = np.full(spike_shape, half_base, dtype=np.float64)
         self._spike_neg_rate_map = np.full(spike_shape, half_base, dtype=np.float64)
-        self._spike_mark_prob_map = self._project_mark_probabilities(
-            np.broadcast_to(
-                self._spike_level_prior,
-                spike_shape + (len(self._spike_levels),),
-            ).copy()
-        )
-        # One latent triplet per event/synergy channel.  The proposal remains
-        # fully stochastic over time; only its slowly adapted statistics are
-        # pooled across the horizon.  Zero latents reproduce the fixed sampler.
-        latent_shape = (m,)
-        self._spike_gain_map = np.zeros(latent_shape, dtype=np.float64)
-        self._spike_bias_map = np.zeros(latent_shape, dtype=np.float64)
-        self._spike_recruitment_map = np.zeros(latent_shape, dtype=np.float64)
-        self._spike_recruitment_coordinate = np.linspace(
-            -1.0, 1.0, len(self._spike_levels), dtype=np.float64
-        )
-        self._last_spike_gain_gradient = np.zeros(latent_shape, dtype=np.float64)
-        self._last_spike_bias_gradient = np.zeros(latent_shape, dtype=np.float64)
-        self._last_spike_recruitment_gradient = np.zeros(latent_shape, dtype=np.float64)
-        self._spike_gain_trace = np.zeros(latent_shape, dtype=np.float64)
-        self._spike_bias_trace = np.zeros(latent_shape, dtype=np.float64)
-        self._spike_recruitment_trace = np.zeros(latent_shape, dtype=np.float64)
-        self._last_spike_reinforcement_std = 0.0
-        self._last_spike_stochastic_ess = math.nan
-
-        self._last_spike_pos_counts: np.ndarray | None = None
-        self._last_spike_neg_counts: np.ndarray | None = None
-        self._last_spike_level_counts: np.ndarray | None = None
+        self._spike_mark_prob_map = np.broadcast_to(
+            self._spike_level_prior, spike_shape + (len(self._spike_levels),)
+        ).copy()
+        for array in (self._spike_pos_rate_map, self._spike_neg_rate_map,
+                      self._spike_mark_prob_map):
+            array.flags.writeable = False
         self._last_spike_event_count_mean = 0.0
-        self._spike_noise_normalizer = self._compute_spike_noise_normalizer()
+        k2_prefix = np.cumsum(self._spike_twitch ** 2)
+        remaining = np.minimum(np.arange(h, 0, -1), len(k2_prefix))
+        self._spike_variance_weights = k2_prefix[remaining - 1] / float(h)
+        self._spike_global_noise_scale = self._compute_spike_global_noise_scale()
+        self._spike_generator = None
+        if self.sampling == SamplingOption.SPIKE:
+            self._spike_generator = StaticSpikeSampler(
+                self._spike_pos_rate_map, self._spike_neg_rate_map,
+                self._spike_mark_prob_map, self._spike_levels,
+                cfg.control_dt, cfg.num_rollouts, self._spike_twitch,
+                backend=self._spike_sampler_backend,
+            )
+
+        self._fixed_spike_diagnostics = self._make_fixed_spike_diagnostics()
+
         # Online MPPI is CPU-only. Prefer the allocation-light fused C++
         # evaluator, then stock mujoco.rollout, then the Python fallback.
         try:
@@ -405,27 +335,12 @@ class JointMPPIController:
             return f"spline latent sampling: cubic B-spline modes={self._spline_basis.shape[1]} per joint"
         if self.sampling == SamplingOption.ICEM:
             return f"iCEM-style elite reuse: shifted_elites={self.cfg.icem_elites}"
-        if self.sampling in SPIKE_SAMPLING_OPTIONS:
-            online = bool(self.cfg.spike_online)
-            mode = "online plasticity" if online else "fixed proposal"
-            update_desc = (
-                f"latent_updates=g:{self.cfg.spike_gain_update:g}/"
-                f"b:{self.cfg.spike_bias_update:g}/r:{self.cfg.spike_recruitment_update:g}, "
-                f"decay={self.cfg.spike_latent_decay:g}"
-                if online
-                else "updates=disabled"
-            )
-            if self.sampling == SamplingOption.SPIKE_JOINT:
-                structure = (
-                    "direct joint channels (no synergies), "
-                    f"channels={self._spike_synergies.shape[0]}"
-                )
-            else:
-                structure = f"handcrafted Hadamard synergies={self._spike_synergies.shape[0]}"
+        if self.sampling == SamplingOption.SPIKE:
             return (
-                "Spike-MPPI: signed marked-Poisson motor events + causal twitch decoding, "
-                f"{structure}, base_rate={self.cfg.spike_rate_hz:g}Hz, "
-                f"mode={mode}, {update_desc}"
+                "Spike-MPPI: fixed direct-joint signed marked-Poisson events + causal twitch; "
+                f"neurons={self.robot.nu}, base_rate={self.cfg.spike_rate_hz:g}Hz, "
+                "identity wiring, no learning, unchanged nominal, "
+                f"implementation={self._spike_sampler_backend}"
             )
         return "standard MPPI Gaussian sampling"
 
@@ -477,15 +392,25 @@ class JointMPPIController:
             shifted = np.empty_like(self._previous_plan)
             shifted[:-1] = self._previous_plan[1:]
             shifted[-1] = self._previous_plan[-1]
-            policy_rollout = rollout_control_nominal(
-                self.robot,
-                start,
-                shifted,
-                self.track,
-                current_s,
-                control_substeps=self.control_substeps,
-                native_batcher=self.nominal_batcher,
-            )
+            if not self.cfg.nominal_diagnostics and self.cfg.nominal_refine_iterations <= 0:
+                # Only the shifted controls enter sampling and rollout costs.
+                # Re-simulating H nominal steps here cannot change them. Omit
+                # that serial physics pass when no caller needs its geometry.
+                # Empty diagnostics are explicit, not stale/approximate paths.
+                shifted = self.robot.clip_ctrl(shifted)
+                policy_rollout = NominalRollout(
+                    shifted, [], np.empty((0, 2)), np.empty(0), np.empty(0)
+                )
+            else:
+                policy_rollout = rollout_control_nominal(
+                    self.robot,
+                    start,
+                    shifted,
+                    self.track,
+                    current_s,
+                    control_substeps=self.control_substeps,
+                    native_batcher=self.nominal_batcher,
+                )
         else:
             policy_rollout = rollout_policy_nominal(
                 self.robot,
@@ -519,8 +444,12 @@ class JointMPPIController:
         t_refine = time.perf_counter()
 
         endpoints = np.asarray(refined.positions, dtype=np.float64)
-        endpoint_s, _ = self.track.project(endpoints)
-        prior_mean, prior_cov = self.prior.sample(self.track, endpoint_s)
+        if len(endpoints):
+            endpoint_s, _ = self.track.project(endpoints)
+            prior_mean, prior_cov = self.prior.sample(self.track, endpoint_s)
+        else:
+            prior_mean = np.empty((0, 2), dtype=np.float64)
+            prior_cov = np.empty((0, 2, 2), dtype=np.float64)
         t_prior = time.perf_counter()
 
         nominal_timing_ms = {
@@ -671,89 +600,6 @@ class JointMPPIController:
         return controls
 
     @staticmethod
-    def _make_spike_hadamard_basis(nu: int, requested: int) -> np.ndarray:
-        """Construct a normalized coordinated actuator basis for SpikeMPPI-3.
-
-        Ant has 8 actuators arranged as four 2-DoF leg pairs in the standard
-        MuJoCo ordering.  For that morphology we use a Walsh-Hadamard basis
-        across legs crossed with a same/opposed within-leg basis.  Each event
-        therefore perturbs several actuators coherently rather than injecting
-        independent joint noise.
-
-        The dictionary may be overcomplete.  Orthogonality is not required:
-        independent, zero-mean marked Poisson channels have additive variance,
-        and ``_compute_spike_noise_normalizer`` explicitly uses the column
-        energy of this dictionary.  For Ant, requests above eight therefore
-        append leg-local same/opposed 2-DoF patterns to the eight global modes.
-
-        For other actuator counts we use an orthonormal DCT-II basis followed
-        by actuator-local modes, giving at most ``2 * nu`` normalized channels.
-        This keeps the dictionary deterministic and its energy predictable.
-        """
-        nu = max(1, int(nu))
-        m = min(max(1, int(requested)), 2 * nu)
-        if nu == 8:
-            leg = np.asarray(
-                [
-                    [1.0, 1.0, 1.0, 1.0],
-                    [1.0, -1.0, 1.0, -1.0],
-                    [1.0, 1.0, -1.0, -1.0],
-                    [1.0, -1.0, -1.0, 1.0],
-                ],
-                dtype=np.float64,
-            ) / 2.0
-            joint = np.asarray(
-                [[1.0, 1.0], [1.0, -1.0]], dtype=np.float64
-            ) / math.sqrt(2.0)
-            global_basis = np.kron(leg, joint)
-            if m <= nu:
-                return global_basis[:m].copy()
-
-            # Overcomplete extension: four same-direction and four
-            # opposed-direction within-leg corrections.  These add local
-            # corrective authority while the global Hadamard modes retain
-            # whole-body coordination.
-            local = []
-            for joint_mode in joint:
-                for leg_idx in range(4):
-                    v = np.zeros(nu, dtype=np.float64)
-                    v[2 * leg_idx : 2 * leg_idx + 2] = joint_mode
-                    local.append(v)
-            basis = np.vstack((global_basis, np.asarray(local, dtype=np.float64)))
-            return basis[:m].copy()
-
-        j = np.arange(nu, dtype=np.float64)[None, :]
-        k = np.arange(nu, dtype=np.float64)[:, None]
-        dct = np.cos(math.pi * (j + 0.5) * k / float(nu))
-        dct[0] *= 1.0 / math.sqrt(float(nu))
-        if nu > 1:
-            dct[1:] *= math.sqrt(2.0 / float(nu))
-        if m <= nu:
-            return dct[:m].copy()
-        basis = np.vstack((dct, np.eye(nu, dtype=np.float64)))
-        return basis[:m].copy()
-
-    # Backward-compatible alias for older code that called the original helper.
-    _make_spike_synergy_basis = _make_spike_hadamard_basis
-
-    @staticmethod
-    def _make_spike_joint_basis(nu: int, requested: int) -> np.ndarray:
-        """Construct the direct-joint ablation basis for ``spike-joint``.
-
-        Each marked-event channel affects exactly one actuator, so there are no
-        multi-joint synergy correlations.  The number of channels is matched to
-        the ordinary SpikeMPPI dictionary (up to ``2 * nu``).  If more than
-        ``nu`` channels are requested, actuator-local basis vectors are repeated
-        cyclically.  Thus Ant with the default 8 channels has one event channel per
-        actuator. Matching M across joint and Hadamard variants keeps
-        the event budget controlled while changing only the spatial structure.
-        """
-        nu = max(1, int(nu))
-        m = min(max(1, int(requested)), 2 * nu)
-        eye = np.eye(nu, dtype=np.float64)
-        return eye[np.arange(m, dtype=np.int64) % nu].copy()
-
-    @staticmethod
     def _make_spike_twitch_kernel(
         control_dt: float,
         rise_s: float,
@@ -794,207 +640,73 @@ class JointMPPIController:
 
         return amplitudes, prior
 
-    def _project_mark_probabilities(self, p: np.ndarray) -> np.ndarray:
-        """Normalize recruitment probabilities with an optional probability floor."""
-        x = np.maximum(np.asarray(p, dtype=np.float64), 0.0)
-        levels = int(x.shape[-1])
-        if levels <= 1:
-            return np.ones_like(x, dtype=np.float64)
-        total = np.sum(x, axis=-1, keepdims=True)
-        base = np.broadcast_to(self._spike_level_prior, x.shape)
-        x = np.divide(x, total, out=base.copy(), where=total > 1e-15)
-        floor = min(float(self.cfg.spike_mark_min_prob), (1.0 - 1e-12) / levels)
-        if floor > 0.0:
-            x = floor + (1.0 - levels * floor) * x
-        x /= np.maximum(np.sum(x, axis=-1, keepdims=True), 1e-15)
-        return x
+    def _compute_spike_global_noise_scale(self) -> float:
+        """Match only the *global* uniform-law motor power to the 8-neuron identity baseline.
 
-    def _compute_spike_noise_normalizer(self) -> np.ndarray:
-        """Per-actuator scale making adaptive SpikeMPPI shot noise unit variance.
-
-        SpikeMPPI-3 changes total firing intensity and the recruitment-mark
-        distribution over the horizon.  We therefore recompute the exact
-        horizon-averaged variance implied by the current point-process maps.
-        Positive/negative rate asymmetry does not change the variance because
-        the signed impulse is mean-centered before twitch filtering.
+        There is intentionally no per-joint variance matching.  Every sparse
+        primitive has unit row energy, so the fixed population event budget
+        determines total motor power.  This single scalar converts the common
+        twitch/event law to the configured joint-noise scale while preserving
+        natural anisotropy from primitive wiring and learned spike statistics.
         """
-        total_rate = np.asarray(self._spike_pos_rate_map + self._spike_neg_rate_map, dtype=np.float64)
+        total_rate = np.asarray(
+            self._spike_pos_rate_map + self._spike_neg_rate_map, dtype=np.float64
+        )
         mark_prob = np.asarray(self._spike_mark_prob_map, dtype=np.float64)
         mark_sq = self._spike_levels * self._spike_levels
         expected_mark_sq = np.sum(mark_prob * mark_sq[None, None, :], axis=-1)
         impulse_variance = float(self.cfg.control_dt) * total_rate * expected_mark_sq
+        channel_variance = self._spike_variance_weights @ impulse_variance
+        total_motor_variance = float(
+            np.sum(channel_variance * np.sum(self._spike_synergies ** 2, axis=1))
+        )
+        mean_motor_variance = total_motor_variance / float(max(self.robot.nu, 1))
+        return 1.0 / math.sqrt(max(mean_motor_variance, 1e-12))
 
-        h = int(self.cfg.horizon)
-        nu = int(self.robot.nu)
-        basis_sq = self._spike_synergies * self._spike_synergies
-        variance_hu = np.zeros((h, nu), dtype=np.float64)
-        max_lag = min(h, len(self._spike_twitch))
-        for lag in range(max_lag):
-            k2 = float(self._spike_twitch[lag]) ** 2
-            source = impulse_variance[: h - lag]
-            joint_variance = source @ basis_sq
-            variance_hu[lag:] += k2 * joint_variance
-        horizon_variance = np.mean(variance_hu, axis=0)
-        return 1.0 / np.sqrt(np.maximum(horizon_variance, 1e-12))
+    def _make_fixed_spike_diagnostics(self) -> dict[str, float]:
+        """Diagnostics for the fixed direct-joint Spike baseline."""
+        m = int(self.robot.nu)
+        levels = len(self._spike_levels)
+        total_rate = float(self._spike_total_rate_hz)
+        per_rate = total_rate / max(m, 1)
+        out = {
+            "spike_rate_hz_mean": per_rate, "spike_rate_hz_std": 0.0,
+            "spike_rate_hz_min": per_rate, "spike_rate_hz_max": per_rate,
+            "spike_pos_rate_hz_min": per_rate / 2, "spike_pos_rate_hz_max": per_rate / 2,
+            "spike_neg_rate_hz_min": per_rate / 2, "spike_neg_rate_hz_max": per_rate / 2,
+            "spike_sign_prob_min": 0.5, "spike_sign_prob_max": 0.5,
+            "spike_sign_entropy": 1.0,
+            "spike_recruitment_entropy": float(levels > 1),
+            "spike_mark_entropy_mean": float(levels > 1),
+            "spike_mark_prob_min": 1.0 / levels, "spike_mark_prob_max": 1.0 / levels,
+            "spike_mean_recruitment": float(np.mean(self._spike_levels)),
+            "spike_effective_synergies": float(m) if self.sampling == SamplingOption.SPIKE else math.nan,
+            "spike_synergy_entropy": float(m > 1) if self.sampling == SamplingOption.SPIKE else math.nan,
+            "spike_expected_events": self.cfg.control_dt * self.cfg.horizon * total_rate,
+            "spike_total_rate_hz": total_rate,
+            "spike_event_budget_fixed": 1.0,
+            "spike_firing_fixed": float(self.sampling == SamplingOption.SPIKE),
+        }
+        if self.sampling not in BIO_EVENT_SAMPLING_OPTIONS:
+            return {key: math.nan for key in out}
+        return out
 
     def _spike_diagnostics(self) -> dict[str, float]:
-        """Compact diagnostics of the current SpikeMPPI proposal.
-
-        The rate-derived synergy distribution measures where the fixed global
-        event budget is allocated.  exp(entropy) is the effective number of
-        active synergies: it is M for uniform activity and approaches 1 as the
-        proposal concentrates on a single synergy.
-        """
-        if self.sampling not in SPIKE_SAMPLING_OPTIONS:
-            return {
-                "spike_rate_hz_mean": math.nan,
-                "spike_rate_hz_std": math.nan,
-                "spike_sign_entropy": math.nan,
-                "spike_recruitment_entropy": math.nan,
-                "spike_mean_recruitment": math.nan,
-                "spike_effective_synergies": math.nan,
-                "spike_synergy_entropy": math.nan,
-                "spike_expected_events": math.nan,
-                "spike_gain_abs_mean": math.nan,
-                "spike_gain_std": math.nan,
-                "spike_bias_abs_mean": math.nan,
-                "spike_bias_std": math.nan,
-                "spike_recruitment_bias_abs_mean": math.nan,
-                "spike_recruitment_bias_std": math.nan,
-                "spike_gain_gradient_rms": math.nan,
-                "spike_bias_gradient_rms": math.nan,
-                "spike_recruitment_gradient_rms": math.nan,
-                "spike_reinforcement_std": math.nan,
-                "spike_stochastic_ess": math.nan,
-            }
-
-        total_rate = np.asarray(
-            self._spike_pos_rate_map + self._spike_neg_rate_map,
-            dtype=np.float64,
-        )
-        safe_total = np.maximum(total_rate, 1e-15)
-        q = np.clip(self._spike_pos_rate_map / safe_total, 1e-15, 1.0 - 1e-15)
-        sign_entropy = -(q * np.log(q) + (1.0 - q) * np.log(1.0 - q)) / math.log(2.0)
-
-        p = np.asarray(self._spike_mark_prob_map, dtype=np.float64)
-        p_safe = np.maximum(p, 1e-15)
-        level_norm = max(math.log(max(len(self._spike_levels), 2)), 1e-15)
-        recruitment_entropy = -np.sum(p * np.log(p_safe), axis=-1) / level_norm
-        mean_recruitment = np.sum(
-            p * self._spike_levels[None, None, :], axis=-1
-        )
-
-        # These two diagnostics are synergy-specific.  They are intentionally
-        # undefined for ``spike-joint`` rather than relabeling joint-channel
-        # concentration as a motor-synergy quantity.
-        if self.sampling in SPIKE_SYNERGY_OPTIONS:
-            synergy_activity = np.mean(total_rate, axis=0)
-            activity_sum = float(np.sum(synergy_activity))
-            if activity_sum > 1e-15:
-                synergy_prob = synergy_activity / activity_sum
-                synergy_prob_safe = np.maximum(synergy_prob, 1e-15)
-                synergy_entropy_raw = float(-np.sum(synergy_prob * np.log(synergy_prob_safe)))
-                effective_synergies = float(np.exp(synergy_entropy_raw))
-                synergy_entropy = synergy_entropy_raw / max(
-                    math.log(max(len(synergy_activity), 2)), 1e-15
-                )
-            else:
-                effective_synergies = 0.0
-                synergy_entropy = 0.0
-        else:
-            effective_synergies = math.nan
-            synergy_entropy = math.nan
-
-        return {
-            "spike_rate_hz_mean": float(np.mean(total_rate)),
-            "spike_rate_hz_std": float(np.std(total_rate)),
-            "spike_sign_entropy": float(np.mean(sign_entropy)),
-            "spike_recruitment_entropy": float(np.mean(recruitment_entropy)),
-            "spike_mean_recruitment": float(np.mean(mean_recruitment)),
-            "spike_effective_synergies": effective_synergies,
-            "spike_synergy_entropy": float(synergy_entropy),
-            "spike_expected_events": float(self.cfg.control_dt * np.sum(total_rate)),
-            "spike_gain_abs_mean": float(np.mean(np.abs(self._spike_gain_map))),
-            "spike_gain_std": float(np.std(self._spike_gain_map)),
-            "spike_bias_abs_mean": float(np.mean(np.abs(self._spike_bias_map))),
-            "spike_bias_std": float(np.std(self._spike_bias_map)),
-            "spike_recruitment_bias_abs_mean": float(np.mean(np.abs(self._spike_recruitment_map))),
-            "spike_recruitment_bias_std": float(np.std(self._spike_recruitment_map)),
-            "spike_gain_gradient_rms": float(np.sqrt(np.mean(self._last_spike_gain_gradient ** 2))),
-            "spike_bias_gradient_rms": float(np.sqrt(np.mean(self._last_spike_bias_gradient ** 2))),
-            "spike_recruitment_gradient_rms": float(np.sqrt(np.mean(self._last_spike_recruitment_gradient ** 2))),
-            "spike_reinforcement_std": float(self._last_spike_reinforcement_std),
-            "spike_stochastic_ess": float(self._last_spike_stochastic_ess),
-        }
+        return self._fixed_spike_diagnostics
 
     def _sample_spike(self, nominal: np.ndarray) -> np.ndarray:
-        """SpikeMPPI-3 signed marked-point-process candidate generation.
-
-        Positive and negative Poisson intensities and recruitment probabilities
-        are generated from one pooled latent triplet per event channel.  With
-        ``spike_online`` enabled these latents are adapted after each MPPI update;
-        with it disabled they remain at the fixed proposal.  The expected
-        signed impulse is subtracted from stochastic candidates so asymmetric
-        sign preferences do not shift the proposal mean away from the policy
-        nominal. A dynamic analytic variance normalization keeps ``joint_noise``
-        comparable as the proposal statistics vary.
-        """
-        n, h = self.cfg.num_rollouts, self.cfg.horizon
-        m = self._spike_synergies.shape[0]
-        levels = len(self._spike_levels)
-        dt = float(self.cfg.control_dt)
-        pos_rates = np.asarray(self._spike_pos_rate_map, dtype=np.float64)
-        neg_rates = np.asarray(self._spike_neg_rate_map, dtype=np.float64)
-        mark_prob = np.asarray(self._spike_mark_prob_map, dtype=np.float64)
-
-        signed_impulses = np.zeros((n, h, m), dtype=np.float64)
-        pos_counts = np.zeros((n, h, m), dtype=np.int32)
-        neg_counts = np.zeros((n, h, m), dtype=np.int32)
-        level_counts = np.zeros((n, h, m, levels), dtype=np.int32)
-
-        for level_idx, amplitude in enumerate(self._spike_levels):
-            p_level = mark_prob[:, :, level_idx]
-            mean_pos = pos_rates[None, :, :] * (dt * p_level[None, :, :])
-            mean_neg = neg_rates[None, :, :] * (dt * p_level[None, :, :])
-            plus = self.rng.poisson(mean_pos, size=(n, h, m))
-            minus = self.rng.poisson(mean_neg, size=(n, h, m))
-            signed_impulses += float(amplitude) * (plus - minus)
-            plus_i = plus.astype(np.int32, copy=False)
-            minus_i = minus.astype(np.int32, copy=False)
-            pos_counts += plus_i
-            neg_counts += minus_i
-            level_counts[:, :, :, level_idx] = plus_i + minus_i
-
-        # Center every stochastic rollout so asymmetric sign preferences change
-        # proposal shape without shifting the expected control away from nominal.
-        expected_mark = np.sum(
-            mark_prob * self._spike_levels[None, None, :], axis=-1
+        """Fixed spike-joint baseline: no contextual or online adaptation."""
+        if self._spike_generator is None:
+            raise RuntimeError("Spike generator is unavailable")
+        n = self.cfg.num_rollouts
+        z, _, event_total = self._spike_generator.sample_projected(
+            self.rng, self._spike_synergies, collect_channel_energy=False
         )
-        expected_signed = dt * (pos_rates - neg_rates) * expected_mark
-        signed_impulses -= expected_signed[None, :, :]
-
-        filtered = np.zeros_like(signed_impulses)
-        max_lag = min(h, len(self._spike_twitch))
-        for lag in range(max_lag):
-            k = float(self._spike_twitch[lag])
-            if lag == 0:
-                filtered += k * signed_impulses
-            else:
-                filtered[:, lag:, :] += k * signed_impulses[:, : h - lag, :]
-
-        z = np.einsum("nhm,mu->nhu", filtered, self._spike_synergies, optimize=True)
-        self._spike_noise_normalizer = self._compute_spike_noise_normalizer()
-        z *= self._spike_noise_normalizer[None, None, :]
-        noise = z * self._joint_std[None, None, :]
-        controls = nominal[None, :, :] + noise
+        z *= self._spike_global_noise_scale
+        z *= self._joint_std[None, None, :]
+        controls = nominal[None, :, :] + z
         np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
-
-        self._last_spike_pos_counts = pos_counts
-        self._last_spike_neg_counts = neg_counts
-        self._last_spike_level_counts = level_counts
-        self._last_spike_event_count_mean = float(
-            np.mean(np.sum(pos_counts + neg_counts, axis=(1, 2)))
-        ) if n > 0 else 0.0
+        self._last_spike_event_count_mean = float(event_total) / n
         return controls
 
     def _sample_icem(self, nominal: np.ndarray) -> np.ndarray:
@@ -1034,37 +746,6 @@ class JointMPPIController:
         y[:-1] = x[1:]
         y[-1] = tail
         return y
-
-    @staticmethod
-    def _bounded_mean_projection(
-        x: np.ndarray,
-        target_mean: float,
-        lower: float,
-        upper: float,
-    ) -> np.ndarray:
-        """Clip to [lower, upper] while preserving a feasible target mean.
-
-        After clipping, any missing/excess total mass is distributed across
-        entries in proportion to their remaining room to the relevant bound.
-        Because ``target_mean`` lies inside the bounds, this reaches the target
-        in one redistribution step up to floating-point roundoff.
-        """
-        y = np.clip(np.asarray(x, dtype=np.float64), float(lower), float(upper)).copy()
-        if y.size == 0:
-            return y
-        target_total = float(target_mean) * float(y.size)
-        delta = target_total - float(np.sum(y))
-        if delta > 1e-14:
-            room = float(upper) - y
-            capacity = float(np.sum(room))
-            if capacity > 1e-14:
-                y += delta * room / capacity
-        elif delta < -1e-14:
-            room = y - float(lower)
-            capacity = float(np.sum(room))
-            if capacity > 1e-14:
-                y -= (-delta) * room / capacity
-        return np.clip(y, float(lower), float(upper))
 
     def _update_direction_memory(self, candidate: np.ndarray, nominal: np.ndarray) -> None:
         if self.sampling not in {SamplingOption.GUIDED, SamplingOption.DIAG_LOWRANK}:
@@ -1134,180 +815,6 @@ class JointMPPIController:
         k = min(int(self.cfg.icem_elites), len(order))
         self._icem_elites = np.asarray(controls[order[:k]], dtype=np.float64).copy()
 
-    @staticmethod
-    def _sigmoid(x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float64)
-        out = np.empty_like(x)
-        pos = x >= 0.0
-        out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
-        ex = np.exp(x[~pos])
-        out[~pos] = ex / (1.0 + ex)
-        return out
-
-    def _sync_spike_distribution_from_latents(self) -> None:
-        """Map pooled channel latents to the time-resolved marked-Poisson proposal.
-
-        g_m redistributes a fixed total event budget across event/synergy channels,
-        b_m controls antagonistic sign preference and r_m tilts recruitment marks.
-        These statistics are constant over the current prediction horizon, while
-        individual Poisson events and twitch-filtered perturbations remain fully
-        time-varying and task agnostic.
-        """
-        base = float(self.cfg.spike_rate_hz)
-        lo = base * float(self.cfg.spike_rate_min_factor)
-        hi = base * float(self.cfg.spike_rate_max_factor)
-        h = int(self.cfg.horizon)
-
-        # Softmax-like homeostasis: change relative channel excitability while
-        # preserving mean firing rate and therefore the global event budget.
-        g = np.asarray(self._spike_gain_map, dtype=np.float64)
-        e = np.exp(np.clip(g - np.max(g), -40.0, 40.0))
-        total_m = base * float(len(g)) * e / max(float(np.sum(e)), 1e-15)
-        total_m = self._bounded_mean_projection(total_m, base, lo, hi)
-        self._spike_gain_map = np.log(np.maximum(total_m, 1e-15) / base)
-        # Center log-gains: only relative excitability is identifiable under the
-        # fixed-budget constraint.
-        self._spike_gain_map -= float(np.mean(self._spike_gain_map))
-
-        q_lo = float(self.cfg.spike_sign_min_prob)
-        q_m = self._sigmoid(2.0 * self._spike_bias_map)
-        q_m = np.clip(q_m, q_lo, 1.0 - q_lo)
-        self._spike_bias_map = 0.5 * np.log(q_m / (1.0 - q_m))
-
-        rmax = float(self.cfg.spike_recruitment_bias_max)
-        self._spike_recruitment_map = np.clip(self._spike_recruitment_map, -rmax, rmax)
-        logits = (
-            self._spike_recruitment_map[:, None]
-            * self._spike_recruitment_coordinate[None, :]
-        )
-        logits -= np.max(logits, axis=-1, keepdims=True)
-        p_m = np.exp(logits)
-        p_m /= np.maximum(np.sum(p_m, axis=-1, keepdims=True), 1e-15)
-        p_m = self._project_mark_probabilities(p_m)
-
-        total = np.broadcast_to(total_m[None, :], (h, len(total_m))).copy()
-        q = np.broadcast_to(q_m[None, :], total.shape)
-        p = np.broadcast_to(p_m[None, :, :], (h,) + p_m.shape).copy()
-        self._spike_pos_rate_map = total * q
-        self._spike_neg_rate_map = total * (1.0 - q)
-        self._spike_mark_prob_map = p
-
-    def _update_spike_distribution(
-        self,
-        costs: np.ndarray,
-        temperature: float,
-        ess: float,
-    ) -> None:
-        """Horizon-pooled reward-gated plasticity for Spike channel latents.
-
-        All ``num_rollouts`` candidates are stochastic.  For each rollout, local
-        marked-Poisson likelihood scores are summed across the full prediction
-        horizon, yielding one eligibility value per channel and latent family.
-        The score is multiplied by centered MPPI reinforcement, RMS/Fisher
-        normalized across rollouts, integrated through a persistent trace, and
-        finally applied to g_m, b_m and r_m.  Pooling converts H*M*3 adaptive
-        coordinates into only M*3 well-supported channel states.
-        """
-        if self.sampling not in SPIKE_SAMPLING_OPTIONS or not self.cfg.spike_online:
-            return
-        if (
-            self._last_spike_pos_counts is None
-            or self._last_spike_neg_counts is None
-            or self._last_spike_level_counts is None
-        ):
-            return
-
-        plus = np.asarray(self._last_spike_pos_counts, dtype=np.float64)
-        minus = np.asarray(self._last_spike_neg_counts, dtype=np.float64)
-        level_counts = np.asarray(self._last_spike_level_counts, dtype=np.float64)
-        if (
-            plus.shape[0] != len(costs)
-            or minus.shape != plus.shape
-            or level_counts.shape[0] != len(costs)
-            or plus.shape[0] == 0
-        ):
-            return
-
-        w = self._normalized_weights(costs, temperature)
-        ns = len(w)
-        if ns == 0:
-            return
-        # All rollouts are sampled from the proposal: no reserved deterministic
-        # nominal candidate and no nominal-mass attenuation.
-        delta = ns * np.asarray(w, dtype=np.float64) - 1.0
-        self._last_spike_reinforcement_std = float(np.std(delta))
-        self._last_spike_stochastic_ess = float(1.0 / max(np.sum(w * w), 1e-15))
-
-        total_counts = plus + minus
-        total_rate = np.asarray(
-            self._spike_pos_rate_map + self._spike_neg_rate_map,
-            dtype=np.float64,
-        )
-        q = np.asarray(
-            self._spike_pos_rate_map / np.maximum(total_rate, 1e-15),
-            dtype=np.float64,
-        )
-        p = np.asarray(self._spike_mark_prob_map, dtype=np.float64)
-        dt = float(self.cfg.control_dt)
-
-        # Local score terms, then horizon pooling -> (rollout, channel).
-        local_g = total_counts - total_rate[None, :, :] * dt
-        local_b = 2.0 * (
-            (1.0 - q)[None, :, :] * plus
-            - q[None, :, :] * minus
-        )
-        c = self._spike_recruitment_coordinate
-        mean_c = np.sum(p * c[None, None, :], axis=-1)
-        local_r = np.sum(
-            level_counts
-            * (c[None, None, None, :] - mean_c[None, :, :, None]),
-            axis=-1,
-        )
-        elig_g = np.sum(local_g, axis=1)
-        elig_b = np.sum(local_b, axis=1)
-        elig_r = np.sum(local_r, axis=1)
-
-        def normalized_gradient(elig: np.ndarray) -> np.ndarray:
-            raw = np.mean(delta[:, None] * elig, axis=0)
-            fisher_rms = np.sqrt(np.mean(elig * elig, axis=0) + 1e-8)
-            ghat = raw / fisher_rms
-            clip = float(self.cfg.spike_gradient_clip)
-            return np.clip(ghat, -clip, clip)
-
-        grad_g = normalized_gradient(elig_g)
-        grad_b = normalized_gradient(elig_b)
-        grad_r = normalized_gradient(elig_r)
-        self._last_spike_gain_gradient = grad_g.copy()
-        self._last_spike_bias_gradient = grad_b.copy()
-        self._last_spike_recruitment_gradient = grad_r.copy()
-
-        rho = float(self.cfg.spike_plasticity_momentum)
-        self._spike_gain_trace = rho * self._spike_gain_trace + (1.0 - rho) * grad_g
-        self._spike_bias_trace = rho * self._spike_bias_trace + (1.0 - rho) * grad_b
-        self._spike_recruitment_trace = (
-            rho * self._spike_recruitment_trace + (1.0 - rho) * grad_r
-        )
-
-        decay = float(self.cfg.spike_latent_decay)
-        self._spike_gain_map = (
-            (1.0 - decay) * self._spike_gain_map
-            + float(self.cfg.spike_gain_update) * self._spike_gain_trace
-        )
-        self._spike_bias_map = (
-            (1.0 - decay) * self._spike_bias_map
-            + float(self.cfg.spike_bias_update) * self._spike_bias_trace
-        )
-        self._spike_recruitment_map = (
-            (1.0 - decay) * self._spike_recruitment_map
-            + float(self.cfg.spike_recruitment_update) * self._spike_recruitment_trace
-        )
-
-        self._sync_spike_distribution_from_latents()
-
-    # Compatibility for code that called the earlier SpikeMPPI internal updater.
-    def _update_spike_rates(self, costs: np.ndarray, temperature: float, ess: float) -> None:
-        self._update_spike_distribution(costs, temperature, ess)
-
     def step(self, data, current_s: float) -> tuple[np.ndarray, dict[str, Any]]:
         t_total = time.perf_counter()
 
@@ -1361,7 +868,6 @@ class JointMPPIController:
         start, policy_nom, refined, sensitivity, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
         t_nominal = time.perf_counter()
         nominal = refined.controls
-
         if self.sampling == SamplingOption.GUIDED:
             controls = self._sample_guided(nominal, adaptive_diagonal=False)
         elif self.sampling == SamplingOption.DIAG_LOWRANK:
@@ -1370,7 +876,7 @@ class JointMPPIController:
             controls = self._sample_spline(nominal)
         elif self.sampling == SamplingOption.ICEM:
             controls = self._sample_icem(nominal)
-        elif self.sampling in SPIKE_SAMPLING_OPTIONS:
+        elif self.sampling == SamplingOption.SPIKE:
             controls = self._sample_spike(nominal)
         else:
             controls = self._sample_standard(nominal)
@@ -1441,7 +947,6 @@ class JointMPPIController:
         self._update_adaptive_diagonal(controls, nominal, costs, temperature, ess)
         self._update_direction_memory(candidate, nominal)
         self._update_icem_elites(controls, costs)
-        self._update_spike_distribution(costs, temperature, ess)
 
         if self.cfg.warm_start:
             self._previous_plan = np.asarray(candidate, dtype=np.float64).copy()
@@ -1519,19 +1024,10 @@ class JointMPPIController:
             "diag_variance_min": float(np.min(self._diag_variance)),
             "diag_variance_max": float(np.max(self._diag_variance)),
             "icem_elites": 0 if self._icem_elites is None else int(len(self._icem_elites)),
+            "spike_sampler_backend": self._spike_sampler_backend,
+            "nominal_geometry_evaluated": bool(len(refined.positions)),
             "spike_synergies": int(self._spike_synergies.shape[0]),
             "spike_events_mean": float(self._last_spike_event_count_mean),
-            "spike_rate_hz_min": float(np.min(self._spike_pos_rate_map + self._spike_neg_rate_map)),
-            "spike_rate_hz_max": float(np.max(self._spike_pos_rate_map + self._spike_neg_rate_map)),
-            "spike_pos_rate_hz_min": float(np.min(self._spike_pos_rate_map)),
-            "spike_pos_rate_hz_max": float(np.max(self._spike_pos_rate_map)),
-            "spike_neg_rate_hz_min": float(np.min(self._spike_neg_rate_map)),
-            "spike_neg_rate_hz_max": float(np.max(self._spike_neg_rate_map)),
-            "spike_sign_prob_min": float(np.min(self._spike_pos_rate_map / np.maximum(self._spike_pos_rate_map + self._spike_neg_rate_map, 1e-15))),
-            "spike_sign_prob_max": float(np.max(self._spike_pos_rate_map / np.maximum(self._spike_pos_rate_map + self._spike_neg_rate_map, 1e-15))),
-            "spike_mark_prob_min": float(np.min(self._spike_mark_prob_map)),
-            "spike_mark_prob_max": float(np.max(self._spike_mark_prob_map)),
-            "spike_mark_entropy_mean": float(np.mean(-np.sum(self._spike_mark_prob_map * np.log(np.maximum(self._spike_mark_prob_map, 1e-15)), axis=-1) / max(math.log(max(len(self._spike_levels), 2)), 1e-15))),
             **spike_diag,
             "nominal_cost": nominal_cost,
             "weighted_rollout_cost": weighted_rollout_cost,
@@ -1555,4 +1051,9 @@ class JointMPPIController:
                 "total": 1e3 * (t_update - t_total),
             },
         }
-        return candidate[0].copy(), info
+        # Previous "total" ended before diagnostics, underreporting latency.
+        action = candidate[0].copy()
+        t_done = time.perf_counter()
+        info["timing_ms"]["diagnostics"] = 1e3 * (t_done - t_update)
+        info["timing_ms"]["total"] = 1e3 * (t_done - t_total)
+        return action, info

@@ -70,7 +70,7 @@ def run_race(
     variant: ControllerVariant | str = ControllerVariant.MPPI,
     sampling: SamplingOption | str = SamplingOption.STANDARD,
     num_rollouts: int = 32,
-    horizon: int = 50,
+    horizon: int = 75,
     control_dt: float | None = None,
     lbps_delta: float = 0.95,
     nominal_refine_iterations: int = 0,
@@ -82,20 +82,8 @@ def run_race(
     diag_lowrank_max: float = 4.0,
     spline_modes: int = 6,
     icem_elites: int = 4,
-    spike_synergies: int = 8,
-    spike_online: bool = True,
     spike_rate_hz: float = 16.0,
-    spike_rate_min_factor: float = 0.50,
-    spike_rate_max_factor: float = 2.0,
-    spike_sign_min_prob: float = 0.10,
     spike_recruitment_levels: int = 6,
-    spike_mark_min_prob: float = 0.01,
-    spike_gain_update: float = 0.05,
-    spike_bias_update: float = 0.05,
-    spike_recruitment_update: float = 0.03,
-    spike_latent_decay: float = 0.005,
-    spike_recruitment_bias_max: float = 1.50,
-    spike_gradient_clip: float = 3.0,
     spike_twitch_rise_s: float = 0.016,
     spike_twitch_decay_s: float = 0.064,
     spike_twitch_duration_s: float = 0.200,
@@ -194,6 +182,9 @@ def run_race(
     )
     plant.set_task_target_body(environment.task_body_name)
     planner.set_task_target_body(environment.task_body_name)
+
+    # One Spike implementation only. When neuron count equals actuator count,
+    # the fixed primitive constructor is the identity exactly.
 
     # Fail loudly if the source MJCF compiler changes/overrides the requested
     # free task-body mass. Ant uses inertiafromgeom=true, so the
@@ -327,26 +318,17 @@ def run_race(
         diag_lowrank_max=float(diag_lowrank_max),
         spline_modes=int(spline_modes),
         icem_elites=int(icem_elites),
-        spike_synergies=int(spike_synergies),
-        spike_online=bool(spike_online),
         spike_rate_hz=float(spike_rate_hz),
-        spike_rate_min_factor=float(spike_rate_min_factor),
-        spike_rate_max_factor=float(spike_rate_max_factor),
-        spike_sign_min_prob=float(spike_sign_min_prob),
         spike_recruitment_levels=int(spike_recruitment_levels),
-        spike_mark_min_prob=float(spike_mark_min_prob),
-        spike_gain_update=float(spike_gain_update),
-        spike_bias_update=float(spike_bias_update),
-        spike_recruitment_update=float(spike_recruitment_update),
-        spike_latent_decay=float(spike_latent_decay),
-        spike_recruitment_bias_max=float(spike_recruitment_bias_max),
-        spike_gradient_clip=float(spike_gradient_clip),
         spike_twitch_rise_s=float(spike_twitch_rise_s),
         spike_twitch_decay_s=float(spike_twitch_decay_s),
         spike_twitch_duration_s=float(spike_twitch_duration_s),
         rollout_workers=int(rollout_workers),
         rollout_chunk_size=int(rollout_chunk_size),
         warm_start=bool(warm_start),
+        # Serial re-simulation of the shifted nominal is only needed by the
+        # controller overlay. Normal racing uses the shifted controls directly.
+        nominal_diagnostics=bool(controller_overlay),
         box_progress_weight=task_progress_weight,
         robot_progress_weight=task_robot_progress_weight,
         robot_box_approach_weight=task_approach_weight,
@@ -356,6 +338,7 @@ def run_race(
     controller = JointMPPIController(
         planner, track, prior, policy, cfg, variant=variant, sampling=sampling, seed=seed
     )
+
 
     current_s, _ = track.project(plant.task_xy())
     current_s = float(current_s)
@@ -488,17 +471,6 @@ def run_race(
                 "spike_effective_synergies",
                 "spike_synergy_entropy",
                 "spike_expected_events",
-                "spike_gain_abs_mean",
-                "spike_gain_std",
-                "spike_bias_abs_mean",
-                "spike_bias_std",
-                "spike_recruitment_bias_abs_mean",
-                "spike_recruitment_bias_std",
-                "spike_gain_gradient_rms",
-                "spike_bias_gradient_rms",
-                "spike_recruitment_gradient_rms",
-                "spike_reinforcement_std",
-                "spike_stochastic_ess",
             ):
                 value = info.get(key, math.nan)
                 try:
@@ -596,6 +568,10 @@ def run_race(
                 completed += 1
                 completed_this_step = True
                 lap_times.append((step + 1) * cfg.control_dt)
+                previous_lap_end = lap_times[-2] if len(lap_times) > 1 else 0.0
+                lap_elapsed = lap_times[-1] - previous_lap_end
+                # Lap timing is part of the normal race output, not verbose diagnostics.
+                print(f"Lap [{completed}/{laps}] {lap_elapsed:.2f}s", flush=True)
                 if verbose:
                     print(
                         f"lap {completed}/{laps}  sim_t={lap_times[-1]:.2f}s  "
@@ -712,17 +688,6 @@ def run_race(
             "spike_effective_synergies",
             "spike_synergy_entropy",
             "spike_expected_events",
-            "spike_gain_abs_mean",
-            "spike_gain_std",
-            "spike_bias_abs_mean",
-            "spike_bias_std",
-            "spike_recruitment_bias_abs_mean",
-            "spike_recruitment_bias_std",
-            "spike_gain_gradient_rms",
-            "spike_bias_gradient_rms",
-            "spike_recruitment_gradient_rms",
-            "spike_reinforcement_std",
-            "spike_stochastic_ess",
         )
         for key in aggregate_keys:
             vals = finite_values(key)
@@ -751,32 +716,20 @@ def run_race(
         if rate_vals.size:
             diagnostics_summary["spike_rate_hz_mean"] = float(np.mean(rate_vals))
 
-        if controller.sampling in {SamplingOption.SPIKE, SamplingOption.SPIKE_JOINT}:
-            if controller.sampling in {SamplingOption.SPIKE}:
-                eff = finite_values("spike_effective_synergies")
-                if eff.size:
-                    diagnostics_summary["spike_effective_synergies_initial"] = float(controller._spike_synergies.shape[0])
-                    diagnostics_summary["spike_effective_synergies_final"] = float(eff[-1])
-                    diagnostics_summary["spike_effective_synergies_delta"] = float(
-                        eff[-1] - controller._spike_synergies.shape[0]
-                    )
+        if controller.sampling == SamplingOption.SPIKE:
+            eff = finite_values("spike_effective_synergies")
+            if eff.size:
+                diagnostics_summary["spike_effective_synergies_initial"] = float(controller._spike_synergies.shape[0])
+                diagnostics_summary["spike_effective_synergies_final"] = float(eff[-1])
+                diagnostics_summary["spike_effective_synergies_delta"] = float(
+                    eff[-1] - controller._spike_synergies.shape[0]
+                )
             for key in (
                 "spike_rate_hz_std",
                 "spike_sign_entropy",
                 "spike_recruitment_entropy",
                 "spike_mean_recruitment",
                 "spike_synergy_entropy",
-                "spike_gain_abs_mean",
-                "spike_gain_std",
-                "spike_bias_abs_mean",
-                "spike_bias_std",
-                "spike_recruitment_bias_abs_mean",
-                "spike_recruitment_bias_std",
-                "spike_gain_gradient_rms",
-                "spike_bias_gradient_rms",
-                "spike_recruitment_gradient_rms",
-                "spike_reinforcement_std",
-                "spike_stochastic_ess",
             ):
                 vals = finite_values(key)
                 if vals.size:
@@ -882,7 +835,7 @@ def main() -> None:
         "--rollouts", type=int, default=32,
         help="number of stochastic MPPI trajectories; the nominal sequence is not reserved as a rollout",
     )
-    parser.add_argument("--horizon", type=int, default=50)
+    parser.add_argument("--horizon", type=int, default=75)
     parser.add_argument(
         "--dt",
         type=float,
@@ -903,26 +856,8 @@ def main() -> None:
     parser.add_argument("--spline-modes", type=int, default=6, help="number of cubic B-spline latent modes per actuator")
     parser.add_argument("--icem-elites", type=int, default=4, help="number of shifted previous elite control sequences reused by icem sampling")
     
-    parser.add_argument(
-        "--spike-synergies", type=int, default=8,
-        help="number of event channels used by spike and spike-joint",
-    )
-    parser.add_argument(
-        "--online",
-        "--spike-online",
-        dest="spike_online",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "enable horizon-pooled reward-gated Spike plasticity over channel excitability g, "
-            "directional bias b, and recruitment bias r; use --no-online for the fixed proposal"
-        ),
-    )
-    parser.add_argument("--spike-rate-hz", type=float, default=16.0, help="total base Poisson event rate per spike channel [Hz]")
-    parser.add_argument("--spike-recruitment-levels", type=int, default=6, help="number of discrete motor-unit recruitment amplitude marks")
-    parser.add_argument("--spike-gain-update", type=float, default=0.05, help="learning rate for pooled channel excitability g")
-    parser.add_argument("--spike-bias-update", type=float, default=0.05, help="learning rate for pooled antagonistic bias b")
-    parser.add_argument("--spike-recruitment-update", type=float, default=0.03, help="learning rate for pooled recruitment bias r")
+    parser.add_argument("--spike-rate-hz", type=float, default=16.0, help="joint-equivalent population event rate for Spike-MPPI")
+    parser.add_argument("--spike-recruitment-levels", type=int, default=6, help="fixed recruitment amplitudes for Spike-MPPI")
 
     parser.add_argument("--spike-twitch-rise", type=float, default=0.016, help="spike twitch rise time constant [s]")
     parser.add_argument("--spike-twitch-decay", type=float, default=0.064, help="spike twitch decay time constant [s]")
@@ -941,8 +876,7 @@ def main() -> None:
         help=(
             "MPPI candidate sampling: standard Gaussian, guided low-rank history, "
             "diag-lowrank adaptive covariance, spline latent sampling, iCEM-style elite reuse, "
-            "spike (handcrafted Hadamard synergies), or spike-joint (no synergy). "
-            "Spike online plasticity is controlled separately by --spike-online/--no-spike-online"
+            "or spike (fixed direct-joint Poisson/twitch baseline)."
         ),
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -1086,13 +1020,8 @@ def main() -> None:
         diag_lowrank_max=args.diag_lowrank_max,
         spline_modes=args.spline_modes,
         icem_elites=args.icem_elites,
-        spike_synergies=args.spike_synergies,
-        spike_online=args.spike_online,
         spike_rate_hz=args.spike_rate_hz,
         spike_recruitment_levels=args.spike_recruitment_levels,
-        spike_gain_update=args.spike_gain_update,
-        spike_bias_update=args.spike_bias_update,
-        spike_recruitment_update=args.spike_recruitment_update,
         spike_twitch_rise_s=args.spike_twitch_rise,
         spike_twitch_decay_s=args.spike_twitch_decay,
         spike_twitch_duration_s=args.spike_twitch_duration,

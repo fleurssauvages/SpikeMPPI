@@ -28,6 +28,13 @@ struct Job {
   double* costs = nullptr;
   double* progress = nullptr;
   bool* failed = nullptr;
+  double* realized_controls = nullptr;
+  const double* nominal_qpos = nullptr;
+  const double* nominal_qvel = nullptr;
+  bool feedback_tracking = false;
+  double feedback_gain = 0.0;
+  double feedback_kp = 0.0;
+  double feedback_kd = 0.0;
 
   int n = 0;
   int h = 0;
@@ -215,12 +222,34 @@ class FusedRolloutEvaluator {
     ctrl_low_.resize(model_->nu, -1.0);
     ctrl_high_.resize(model_->nu, 1.0);
     fd_epsilon_scale_.resize(model_->nu, 1.0);
+    actuator_qpos_adr_.assign(model_->nu, -1);
+    actuator_dof_adr_.assign(model_->nu, -1);
+    actuator_wrap_hinge_.assign(model_->nu, 0);
+    actuator_feedback_sign_.assign(model_->nu, 1.0);
     for (int k = 0; k < model_->nu; ++k) {
       if (model_->actuator_ctrllimited[k]) {
         ctrl_low_[k] = model_->actuator_ctrlrange[2 * k + 0];
         ctrl_high_[k] = model_->actuator_ctrlrange[2 * k + 1];
       }
       fd_epsilon_scale_[k] = std::max(1e-3, ctrl_high_[k] - ctrl_low_[k]);
+
+      // Native feedback tracks the nominal policy trajectory in actuated joint
+      // coordinates.  Ant-style motor transmissions are scalar hinge/slide
+      // joints; unsupported transmissions simply receive no tracking term.
+      if (model_->actuator_trntype[k] == mjTRN_JOINT) {
+        const int joint_id = model_->actuator_trnid[2 * k];
+        if (joint_id >= 0 && joint_id < model_->njnt) {
+          const int joint_type = model_->jnt_type[joint_id];
+          if (joint_type == mjJNT_HINGE || joint_type == mjJNT_SLIDE) {
+            actuator_qpos_adr_[k] = model_->jnt_qposadr[joint_id];
+            actuator_dof_adr_[k] = model_->jnt_dofadr[joint_id];
+            actuator_wrap_hinge_[k] =
+                (joint_type == mjJNT_HINGE && !model_->jnt_limited[joint_id]) ? 1 : 0;
+            const double gear = model_->actuator_gear[6 * k];
+            actuator_feedback_sign_[k] = gear < 0.0 ? -1.0 : 1.0;
+          }
+        }
+      }
     }
     data_.reserve(nthread_);
     for (int i = 0; i < nthread_; ++i) {
@@ -364,6 +393,128 @@ class FusedRolloutEvaluator {
 
     return py::make_tuple(std::move(positions), std::move(costs),
                           std::move(progress), std::move(failed));
+  }
+
+  py::tuple EvaluateFeedback(
+      py::array_t<double, py::array::c_style | py::array::forcecast> initial_state,
+      py::array_t<double, py::array::c_style | py::array::forcecast> residuals,
+      py::array_t<double, py::array::c_style | py::array::forcecast> nominal,
+      py::array_t<double, py::array::c_style | py::array::forcecast> ctrl_scale,
+      py::array_t<double, py::array::c_style | py::array::forcecast> params,
+      int control_substeps,
+      double feedback_gain,
+      double feedback_kp,
+      double feedback_kd) {
+    const auto state_info = initial_state.request();
+    const auto residual_info = residuals.request();
+    const auto nominal_info = nominal.request();
+    const auto scale_info = ctrl_scale.request();
+    const auto param_info = params.request();
+
+    if (state_info.ndim != 1 || state_info.shape[0] != nstate_) {
+      throw std::runtime_error("fused feedback initial_state has incorrect FULLPHYSICS size");
+    }
+    if (residual_info.ndim != 3) {
+      throw std::runtime_error("fused feedback residuals must have shape [N,H,nu]");
+    }
+    const int n = static_cast<int>(residual_info.shape[0]);
+    const int h = static_cast<int>(residual_info.shape[1]);
+    const int nu = static_cast<int>(residual_info.shape[2]);
+    if (n <= 0 || h <= 0 || nu != model_->nu) {
+      throw std::runtime_error("fused feedback residual dimensions do not match MuJoCo model");
+    }
+    if (nominal_info.ndim != 2 || nominal_info.shape[0] != h ||
+        nominal_info.shape[1] != nu) {
+      throw std::runtime_error("fused feedback nominal controls must have shape [H,nu]");
+    }
+    if (scale_info.ndim != 1 || scale_info.shape[0] != nu) {
+      throw std::runtime_error("fused feedback ctrl_scale must have shape [nu]");
+    }
+    if (param_info.ndim != 1 || param_info.shape[0] != 29) {
+      throw std::runtime_error("fused feedback evaluator expected 29 track/cost parameters");
+    }
+    if (!(feedback_gain >= 0.0) || !std::isfinite(feedback_gain) ||
+        !(feedback_kp >= 0.0) || !std::isfinite(feedback_kp) ||
+        !(feedback_kd >= 0.0) || !std::isfinite(feedback_kd)) {
+      throw std::runtime_error("fused feedback gains must be finite and nonnegative");
+    }
+
+    py::array_t<double> positions({static_cast<py::ssize_t>(n),
+                                   static_cast<py::ssize_t>(h),
+                                   static_cast<py::ssize_t>(2)});
+    py::array_t<double> realized({static_cast<py::ssize_t>(n),
+                                  static_cast<py::ssize_t>(h),
+                                  static_cast<py::ssize_t>(nu)});
+    py::array_t<double> costs({static_cast<py::ssize_t>(n)});
+    py::array_t<double> progress({static_cast<py::ssize_t>(n)});
+    py::array_t<bool> failed({static_cast<py::ssize_t>(n)});
+
+    const double* p = static_cast<const double*>(param_info.ptr);
+    const double* state_ptr = static_cast<const double*>(state_info.ptr);
+    const double* nominal_ptr = static_cast<const double*>(nominal_info.ptr);
+    const int substeps = std::max(1, control_substeps);
+
+    Job job;
+    job.initial_state = state_ptr;
+    // In feedback mode Job::controls contains feedforward residuals, not final controls.
+    job.controls = static_cast<const double*>(residual_info.ptr);
+    job.nominal = nominal_ptr;
+    job.ctrl_scale = static_cast<const double*>(scale_info.ptr);
+    job.positions = positions.mutable_data();
+    job.realized_controls = realized.mutable_data();
+    job.costs = costs.mutable_data();
+    job.progress = progress.mutable_data();
+    job.failed = failed.mutable_data();
+    job.feedback_tracking = true;
+    job.feedback_gain = feedback_gain;
+    job.feedback_kp = feedback_kp;
+    job.feedback_kd = feedback_kd;
+    job.n = n;
+    job.h = h;
+    job.nu = nu;
+    job.substeps = substeps;
+    job.root_qadr = root_qadr_;
+    job.task_qadr = task_qadr_;
+    job.origin_x = p[0];
+    job.origin_y = p[1];
+    job.rot00 = p[2];
+    job.rot01 = p[3];
+    job.rot10 = p[4];
+    job.rot11 = p[5];
+    job.canonical_start_x = p[6];
+    job.canonical_start_y = p[7];
+    job.radius = p[8];
+    job.left_arc_x = p[9];
+    job.right_arc_x = p[10];
+    job.center_y = p[11];
+    job.straight_length = p[12];
+    job.track_length = p[13];
+    job.allowed_sq = p[14];
+    job.min_height = p[15];
+    job.min_up = p[16];
+    job.upright_weight = p[17];
+    job.control_deviation_weight = p[18];
+    job.box_progress_weight = p[19];
+    job.robot_progress_weight = p[20];
+    job.robot_box_approach_weight = p[21];
+    job.box_max_lift = p[22];
+    job.box_min_up = p[23];
+    job.current_s = p[24];
+    job.current_root_s = p[25];
+    job.initial_task_root_distance = p[26];
+    job.initial_task_height = p[27];
+    job.start_time = p[28];
+
+    {
+      py::gil_scoped_release release;
+      BuildFeedbackReference(state_ptr, nominal_ptr, h, nu, substeps);
+      job.nominal_qpos = feedback_nominal_qpos_.data();
+      job.nominal_qvel = feedback_nominal_qvel_.data();
+      RunJob(job);
+    }
+
+    return py::make_tuple(std::move(positions), std::move(realized),
+                          std::move(costs), std::move(progress), std::move(failed));
   }
 
   py::tuple RolloutNominal(
@@ -692,6 +843,49 @@ class FusedRolloutEvaluator {
     return false;
   }
 
+  void BuildFeedbackReference(const double* initial_state, const double* nominal,
+                              int h, int nu, int substeps) {
+    feedback_nominal_qpos_.resize(
+        static_cast<std::size_t>(h) * static_cast<std::size_t>(model_->nq));
+    feedback_nominal_qvel_.resize(
+        static_cast<std::size_t>(h) * static_cast<std::size_t>(model_->nv));
+
+    mjData* d = data_[0];
+    mj_setState(model_, d, initial_state, mjSTATE_FULLPHYSICS);
+    mju_zero(d->qacc_warmstart, model_->nv);
+    for (int w = 0; w < mjNWARNING; ++w) {
+      d->warning[w].number = 0;
+    }
+
+    bool warning_stalled = false;
+    for (int t = 0; t < h; ++t) {
+      std::copy_n(
+          d->qpos, model_->nq,
+          feedback_nominal_qpos_.data() + static_cast<std::size_t>(t) * model_->nq);
+      std::copy_n(
+          d->qvel, model_->nv,
+          feedback_nominal_qvel_.data() + static_cast<std::size_t>(t) * model_->nv);
+
+      const double* u = nominal + static_cast<std::size_t>(t) * nu;
+      for (int k = 0; k < nu; ++k) {
+        d->ctrl[k] = static_cast<mjtNum>(
+            std::min(std::max(u[k], ctrl_low_[k]), ctrl_high_[k]));
+      }
+      if (!warning_stalled) {
+        for (int sub = 0; sub < substeps; ++sub) {
+          for (int w = 0; w < mjNWARNING; ++w) {
+            if (d->warning[w].number) {
+              warning_stalled = true;
+              break;
+            }
+          }
+          if (warning_stalled) break;
+          mj_step(model_, d);
+        }
+      }
+    }
+  }
+
   void CleanupData() {
     for (mjData* d : data_) {
       if (d) {
@@ -929,9 +1123,35 @@ class FusedRolloutEvaluator {
 
     const double half_track = 0.5 * j.track_length;
     for (int t = 0; t < j.h; ++t) {
-      const double* u = controls_i + static_cast<std::size_t>(t) * j.nu;
+      const double* candidate = controls_i + static_cast<std::size_t>(t) * j.nu;
+      const double* unom = j.nominal + static_cast<std::size_t>(t) * j.nu;
+      double* realized_t = j.realized_controls == nullptr
+          ? nullptr
+          : j.realized_controls + (static_cast<std::size_t>(i) * j.h + t) * j.nu;
       for (int k = 0; k < j.nu; ++k) {
-        d->ctrl[k] = static_cast<mjtNum>(u[k]);
+        double u = candidate[k];
+        if (j.feedback_tracking) {
+          u += unom[k];
+          const int qa = actuator_qpos_adr_[k];
+          const int va = actuator_dof_adr_[k];
+          if (qa >= 0 && va >= 0) {
+            double qerr = j.nominal_qpos[static_cast<std::size_t>(t) * model_->nq + qa]
+                - d->qpos[qa];
+            if (actuator_wrap_hinge_[k]) {
+              qerr = std::atan2(std::sin(qerr), std::cos(qerr));
+            }
+            const double verr =
+                j.nominal_qvel[static_cast<std::size_t>(t) * model_->nv + va]
+                - d->qvel[va];
+            u += j.feedback_gain * actuator_feedback_sign_[k]
+                * (j.feedback_kp * qerr + j.feedback_kd * verr);
+          }
+        }
+        u = std::min(std::max(u, ctrl_low_[k]), ctrl_high_[k]);
+        d->ctrl[k] = static_cast<mjtNum>(u);
+        if (realized_t != nullptr) {
+          realized_t[k] = u;
+        }
       }
       // Match stock mujoco.rollout warning semantics.  It stops stepping after
       // a MuJoCo warning and repeats the last state for the rest of the rollout.
@@ -1026,9 +1246,8 @@ class FusedRolloutEvaluator {
       prev_time = d->time;
 
       double du_sq_sum = 0.0;
-      const double* unom = j.nominal + static_cast<std::size_t>(t) * j.nu;
       for (int k = 0; k < j.nu; ++k) {
-        const double scaled = (u[k] - unom[k]) / j.ctrl_scale[k];
+        const double scaled = (static_cast<double>(d->ctrl[k]) - unom[k]) / j.ctrl_scale[k];
         du_sq_sum += scaled * scaled;
       }
       control_cost += j.control_deviation_weight * (du_sq_sum / std::max(1, j.nu));
@@ -1044,6 +1263,15 @@ class FusedRolloutEvaluator {
       for (int t = last_t + 1; t < j.h; ++t) {
         positions_i[2 * t + 0] = x;
         positions_i[2 * t + 1] = y;
+      }
+      if (j.realized_controls != nullptr) {
+        const double* last_u = j.realized_controls
+            + (static_cast<std::size_t>(i) * j.h + last_t) * j.nu;
+        for (int t = last_t + 1; t < j.h; ++t) {
+          double* out_u = j.realized_controls
+              + (static_cast<std::size_t>(i) * j.h + t) * j.nu;
+          std::copy_n(last_u, j.nu, out_u);
+        }
       }
     }
 
@@ -1075,6 +1303,12 @@ class FusedRolloutEvaluator {
   std::vector<double> ctrl_low_;
   std::vector<double> ctrl_high_;
   std::vector<double> fd_epsilon_scale_;
+  std::vector<int> actuator_qpos_adr_;
+  std::vector<int> actuator_dof_adr_;
+  std::vector<unsigned char> actuator_wrap_hinge_;
+  std::vector<double> actuator_feedback_sign_;
+  std::vector<double> feedback_nominal_qpos_;
+  std::vector<double> feedback_nominal_qvel_;
 
   bool nominal_cache_valid_ = false;
   int nominal_h_ = 0;
@@ -1113,6 +1347,12 @@ PYBIND11_MODULE(_fused_mujoco, m) {
            py::arg("initial_state"), py::arg("controls"),
            py::arg("nominal_controls"), py::arg("ctrl_scale"),
            py::arg("params"), py::arg("control_substeps"))
+      .def("evaluate_feedback", &FusedRolloutEvaluator::EvaluateFeedback,
+           py::arg("initial_state"), py::arg("residuals"),
+           py::arg("nominal_controls"), py::arg("ctrl_scale"),
+           py::arg("params"), py::arg("control_substeps"),
+           py::arg("feedback_gain"), py::arg("feedback_kp"),
+           py::arg("feedback_kd"))
       .def("rollout_nominal", &FusedRolloutEvaluator::RolloutNominal,
            py::arg("initial_state"), py::arg("controls"),
            py::arg("control_substeps"))

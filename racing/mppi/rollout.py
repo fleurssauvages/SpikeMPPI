@@ -439,12 +439,20 @@ class NativeRolloutBatcher:
         # robot advancement and reduction of robot-box distance.  Compute the
         # initial potentials once so fused/native/Python cost paths agree.
         pushing = self._task_qadr != self._root_qadr
-        qpos0 = np.asarray(start_snapshot.qpos, dtype=np.float64)
-        root_xy0 = qpos0[int(self._root_qadr):int(self._root_qadr) + 2]
-        task_xy0 = qpos0[int(self._task_qadr):int(self._task_qadr) + 2]
-        current_root_s = float(track.project(root_xy0)[0])
-        initial_task_root_distance = float(np.linalg.norm(task_xy0 - root_xy0))
-        initial_task_height = float(self.robot.task_rest_height) if pushing else 0.0
+        if pushing:
+            qpos0 = np.asarray(start_snapshot.qpos, dtype=np.float64)
+            root_xy0 = qpos0[int(self._root_qadr):int(self._root_qadr) + 2]
+            task_xy0 = qpos0[int(self._task_qadr):int(self._task_qadr) + 2]
+            current_root_s = float(track.project(root_xy0)[0])
+            initial_task_root_distance = float(np.linalg.norm(task_xy0 - root_xy0))
+            initial_task_height = float(self.robot.task_rest_height)
+        else:
+            # For ordinary racing the task body is the robot root, and current_s
+            # is already its projected progress. Avoid a duplicate track projection
+            # and root/task distance calculation on every MPPI update.
+            current_root_s = float(current_s)
+            initial_task_root_distance = 0.0
+            initial_task_height = 0.0
 
         if self.fused_evaluator is not None:
             required = (
