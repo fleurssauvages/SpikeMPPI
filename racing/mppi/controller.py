@@ -7,7 +7,7 @@ import math
 import time
 import numpy as np
 
-from .lbps import optimize_lbps_temperature, weighted_control_sequence
+from .lbps import optimize_lbps_temperature
 from .rollout import (
     RolloutCostConfig,
     NominalRollout,
@@ -224,6 +224,7 @@ class JointMPPIController:
         # Backwards-compatible alias used by candidate rollout helper arguments.
         self.native_batcher = None
         self._previous_plan: np.ndarray | None = None
+        self._weight_workspace = np.empty(cfg.num_rollouts, dtype=np.float64)
         self._ctrl_low, self._ctrl_high = robot.control_bounds(cfg.unlimited_control_span)
         # Actuator-scale normalization used only by benchmark/control-quality
         # diagnostics. Keep this independent of --joint-noise so normalized
@@ -699,15 +700,16 @@ class JointMPPIController:
         if self._spike_generator is None:
             raise RuntimeError("Spike generator is unavailable")
         n = self.cfg.num_rollouts
-        z, _, event_total = self._spike_generator.sample_projected(
-            self.rng, self._spike_synergies, collect_channel_energy=False
-        )
+        z, event_total = self._spike_generator.sample_projected_identity(self.rng)
         z *= self._spike_global_noise_scale
         z *= self._joint_std[None, None, :]
-        controls = nominal[None, :, :] + z
-        np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
+        # ``z`` is borrowed sampler workspace and is fully overwritten on the
+        # next draw. Reuse it as the candidate-control batch rather than
+        # allocating another N x H x nu array every 20 ms.
+        z += nominal[None, :, :]
+        np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
         self._last_spike_event_count_mean = float(event_total) / n
-        return controls
+        return z
 
     def _sample_icem(self, nominal: np.ndarray) -> np.ndarray:
         controls = self._sample_standard(nominal)
@@ -723,20 +725,35 @@ class JointMPPIController:
         controls[:k] = shifted
         return controls
 
-    @staticmethod
-    def _normalized_weights(costs: np.ndarray, temperature: float) -> np.ndarray:
+    def _normalized_weights(self, costs: np.ndarray, temperature: float) -> np.ndarray:
+        """Return normalized MPPI weights in a persistent N-element buffer.
+
+        The same weights drive the control update, diagnostics, and (for the
+        diagonal-low-rank sampler) covariance adaptation. Computing the
+        exponential weights once avoids two or three duplicate passes per tick.
+        The returned array is borrowed until the next controller step.
+        """
         c = np.asarray(costs, dtype=np.float64).reshape(-1)
+        if self._weight_workspace.shape != c.shape:
+            self._weight_workspace = np.empty_like(c)
+        w = self._weight_workspace
         finite = np.isfinite(c)
-        w = np.zeros_like(c)
-        if not np.any(finite):
+        w.fill(0.0)
+        finite_count = int(np.count_nonzero(finite))
+        if finite_count == 0:
             if len(w):
-                w[:] = 1.0 / len(w)
+                w.fill(1.0 / len(w))
             return w
         rho = float(np.min(c[finite]))
-        w[finite] = np.exp(np.clip(-(c[finite] - rho) / max(float(temperature), 1e-300), -745.0, 0.0))
+        w[finite] = np.exp(
+            np.clip(
+                -(c[finite] - rho) / max(float(temperature), 1e-300),
+                -745.0, 0.0,
+            )
+        )
         total = float(np.sum(w))
         if total <= 1e-12:
-            w[finite] = 1.0 / np.count_nonzero(finite)
+            w[finite] = 1.0 / finite_count
         else:
             w /= total
         return w
@@ -772,13 +789,12 @@ class JointMPPIController:
         self,
         controls: np.ndarray,
         nominal: np.ndarray,
-        costs: np.ndarray,
-        temperature: float,
+        weights: np.ndarray,
         ess: float,
     ) -> None:
         if self.sampling != SamplingOption.DIAG_LOWRANK:
             return
-        w = self._normalized_weights(costs, temperature)
+        w = weights
         denom = np.maximum(self._joint_std, 1e-12)
         delta = (np.asarray(controls) - np.asarray(nominal)[None, :, :]) / denom[None, None, :]
         mean = np.einsum("n,nhu->hu", w, delta)
@@ -942,11 +958,17 @@ class JointMPPIController:
                 ess = 0.0
             lbps_score = math.nan
 
-        candidate = weighted_control_sequence(costs, controls, temperature)
+        # Compute MPPI weights once and reuse them for the weighted sequence,
+        # diagnostics, and any sampler-specific adaptation.
+        diag_weights = self._normalized_weights(costs, temperature)
+        candidate = np.einsum("n,nhu->hu", diag_weights, controls, optimize=False)
         np.clip(candidate, self._ctrl_low, self._ctrl_high, out=candidate)
-        self._update_adaptive_diagonal(controls, nominal, costs, temperature, ess)
-        self._update_direction_memory(candidate, nominal)
-        self._update_icem_elites(controls, costs)
+        if self.sampling == SamplingOption.DIAG_LOWRANK:
+            self._update_adaptive_diagonal(controls, nominal, diag_weights, ess)
+        if self.sampling in {SamplingOption.GUIDED, SamplingOption.DIAG_LOWRANK}:
+            self._update_direction_memory(candidate, nominal)
+        if self.sampling == SamplingOption.ICEM:
+            self._update_icem_elites(controls, costs)
 
         if self.cfg.warm_start:
             self._previous_plan = np.asarray(candidate, dtype=np.float64).copy()
@@ -960,14 +982,14 @@ class JointMPPIController:
         # Optimization-quality diagnostics use only the sampled rollout
         # population.  The nominal sequence is the proposal center but is not
         # evaluated as an extra rollout, so nominal-cost deltas are undefined.
-        diag_weights = self._normalized_weights(costs, temperature)
         finite_cost = np.isfinite(costs)
         nominal_cost = math.nan
+        costs_arr = np.asarray(costs, dtype=np.float64)
         if np.any(finite_cost):
             weighted_rollout_cost = float(
-                np.sum(diag_weights[finite_cost] * np.asarray(costs)[finite_cost])
+                np.sum(diag_weights[finite_cost] * costs_arr[finite_cost])
             )
-            best_finite_cost = float(np.min(np.asarray(costs)[finite_cost]))
+            best_finite_cost = float(np.min(costs_arr[finite_cost]))
         else:
             weighted_rollout_cost = math.nan
             best_finite_cost = math.nan
@@ -1021,8 +1043,14 @@ class JointMPPIController:
             "sampling_option": self.sampling.value,
             "proposal": self.sampling.value,  # backward-compatible info key
             "proposal_rank": int(self._last_proposal_rank),
-            "diag_variance_min": float(np.min(self._diag_variance)),
-            "diag_variance_max": float(np.max(self._diag_variance)),
+            "diag_variance_min": (
+                float(np.min(self._diag_variance))
+                if self.sampling == SamplingOption.DIAG_LOWRANK else 1.0
+            ),
+            "diag_variance_max": (
+                float(np.max(self._diag_variance))
+                if self.sampling == SamplingOption.DIAG_LOWRANK else 1.0
+            ),
             "icem_elites": 0 if self._icem_elites is None else int(len(self._icem_elites)),
             "spike_sampler_backend": self._spike_sampler_backend,
             "nominal_geometry_evaluated": bool(len(refined.positions)),

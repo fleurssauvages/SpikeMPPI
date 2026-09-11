@@ -88,6 +88,7 @@ class NativeRolloutBatcher:
         self.fused_requested = bool(fused)
         self._fused_verified = False
         self._fused_params: np.ndarray | None = None
+        self._fused_param_owner: tuple[int, int] | None = None
         self._verify_fused = os.environ.get('RACING_FUSED_VERIFY', '1').strip().lower() not in {'0', 'false', 'no'}
 
         # ``skip_checks`` and caller-provided output arrays are supported by
@@ -462,7 +463,10 @@ class NativeRolloutBatcher:
             )
             if not all(hasattr(track, name) for name in required):
                 raise RuntimeError('fused rollout currently supports StadiumTrack only')
-            initial = np.ascontiguousarray(self.snapshot_to_state(start_snapshot), dtype=np.float64)
+            # The fused evaluator is synchronous, so it can read the persistent
+            # FULLPHYSICS packing buffer directly; avoid copying the same state
+            # once more on every controller tick.
+            initial = self.snapshot_to_state(start_snapshot, out=self._state_pack)
             nominal = np.ascontiguousarray(nominal_controls, dtype=np.float64)
             allowed = max(
                 0.0, 0.5 * float(track.road_width) - float(cost_cfg.hard_collision_clearance)
@@ -470,26 +474,35 @@ class NativeRolloutBatcher:
             if self._fused_params is None:
                 self._fused_params = np.empty(29, dtype=np.float64)
             params = self._fused_params
-            params[:] = [
-                float(track._origin[0]), float(track._origin[1]),
-                float(track._rot[0, 0]), float(track._rot[0, 1]),
-                float(track._rot[1, 0]), float(track._rot[1, 1]),
-                float(track._canonical_start[0]), float(track._canonical_start[1]),
-                float(track.centerline_radius), float(track.left_arc_x),
-                float(track.right_arc_x), float(track.center_y),
-                float(track.straight_length), float(track.length),
-                allowed * allowed,
-                float(cost_cfg.fall_height_fraction) * max(self.robot.initial_root_height, 1e-6),
-                float(cost_cfg.min_root_up), float(cost_cfg.upright_weight),
-                float(cost_cfg.control_deviation_weight),
-                float(cost_cfg.box_progress_weight),
-                float(cost_cfg.robot_progress_weight),
-                float(cost_cfg.robot_box_approach_weight),
-                float(cost_cfg.box_max_lift), float(cost_cfg.box_min_up),
-                float(current_s), float(current_root_s),
-                float(initial_task_root_distance), float(initial_task_height),
-                float(start_snapshot.time),
-            ]
+
+            # Track geometry and cost coefficients are static for a race. Cache
+            # their first 24 entries and update only the five state-dependent
+            # values on the hot path. Refresh if a caller swaps track/cost objects.
+            owner = (id(track), id(cost_cfg))
+            if self._fused_param_owner != owner:
+                params[:24] = [
+                    float(track._origin[0]), float(track._origin[1]),
+                    float(track._rot[0, 0]), float(track._rot[0, 1]),
+                    float(track._rot[1, 0]), float(track._rot[1, 1]),
+                    float(track._canonical_start[0]), float(track._canonical_start[1]),
+                    float(track.centerline_radius), float(track.left_arc_x),
+                    float(track.right_arc_x), float(track.center_y),
+                    float(track.straight_length), float(track.length),
+                    allowed * allowed,
+                    float(cost_cfg.fall_height_fraction) * max(self.robot.initial_root_height, 1e-6),
+                    float(cost_cfg.min_root_up), float(cost_cfg.upright_weight),
+                    float(cost_cfg.control_deviation_weight),
+                    float(cost_cfg.box_progress_weight),
+                    float(cost_cfg.robot_progress_weight),
+                    float(cost_cfg.robot_box_approach_weight),
+                    float(cost_cfg.box_max_lift), float(cost_cfg.box_min_up),
+                ]
+                self._fused_param_owner = owner
+            params[24] = float(current_s)
+            params[25] = float(current_root_s)
+            params[26] = float(initial_task_root_distance)
+            params[27] = float(initial_task_height)
+            params[28] = float(start_snapshot.time)
             t_fused = time.perf_counter()
             positions, costs, terminal_progress, failed = self.fused_evaluator.evaluate(
                 initial, batch, nominal, self._ctrl_scale, params, substeps
@@ -511,7 +524,7 @@ class NativeRolloutBatcher:
 
                 # 1) Continuous reference: stock vectorized MuJoCo rollout.
                 expanded_verify = self._expand_controls(batch, substeps)
-                initial_verify = self.snapshot_to_state(start_snapshot)[None, :]
+                initial_verify = self.snapshot_to_state(start_snapshot, out=self._state_pack)[None, :]
                 verify_states = self.rollout_states(initial_verify, expanded_verify)
                 verify_sampled = verify_states[:, substeps - 1::substeps, :]
                 ref_pos = np.asarray(self._task_xy_from_state(verify_sampled), dtype=np.float64)

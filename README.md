@@ -28,15 +28,7 @@ The locomotion policy trainer is adapted from Margolis et al., **Rapid Locomotio
 
 ## Spike-MPPI
 
-Spike-MPPI replaces direct Gaussian control noise with a **marked point-process proposal**. For rollout \(i\), horizon step \(t\), and motor synergy \(m\), positive and negative spike counts are sampled from learned intensities. Each event also carries a recruitment level. The event train is convolved with a causal twitch kernel and projected through a multi-joint synergy dictionary before being added to the policy-seeded nominal control. After the rollouts are evaluated, the usual MPPI weights update the proposal state online. Spike-MPPI learns:
-
-* **firing intensity** — when and which synergy should be explored;
-* **sign preference** — whether positive or negative events are more useful;
-* **recruitment distribution** — which event magnitudes are favored.
-
-The signed proposal is mean-centered and dynamically variance-normalized, so adapting the spike statistics changes the **structure, skew and temporal organization** of exploration without simply increasing its RMS magnitude. The learned proposal state is shifted with the receding horizon in the same way as the warm-started control sequence.
-
-The rounded spike defaults are centered on the flat-ground HPO regime: 8 synergies, 16 Hz base firing rate (about 128 expected events over the default 1 s horizon), 0.02 rate adaptation, 0.5 rate prior, rate factors in `[0.5, 5.0]`, 6 recruitment levels, and a 16/64/200 ms rise/decay/duration twitch.
+Spike-MPPI replaces direct Gaussian control noise with a **marked point-process proposal**. For rollout \(i\), horizon step \(t\), and motor synergy \(m\), positive and negative spike counts are sampled from learned intensities. Each event also carries a recruitment level.
 
 ## Results
 
@@ -236,9 +228,8 @@ The main pipeline is:
 
 1. Train a velocity-conditioned Ant locomotion policy with PPO and a Grid Adaptive Curriculum.
 2. Use the learned policy as the nominal controller for a 2-D stadium task.
-3. Refine the nominal online with Spike-MPPI or a comparison sampler.
-4. Evaluate transfer to new terrain, new tasks, leg-length mismatch, and model-parameter mismatch.
-5. Save exact MuJoCo states for deterministic replay and GIF export.
+3. Evaluate transfer to new terrain, new tasks, leg-length mismatch, and model-parameter mismatch.
+4. Save exact MuJoCo states for deterministic replay and GIF export.
 
 The MPPI controller acts directly on Ant's eight actuator controls. The pretrained policy remains the source of nominal locomotion behavior; Spike-MPPI searches around that behavior rather than replacing the policy.
 
@@ -540,12 +531,9 @@ Primary spike parameters:
 
 | Option | Default | Meaning |
 | --- | ---: | --- |
-| `--spike-synergies N` | `8` | Number of motor-synergy channels. Ant supports an overcomplete dictionary when larger values are requested. |
 | `--spike-rate-hz FLOAT` | `16.0` | Base event rate per synergy. With 8 synergies and the default 1 s horizon this gives about 128 expected events/rollout. |
 | `--spike-rate-update FLOAT` | `0.02` | Online firing-rate adaptation rate. |
 | `--spike-rate-prior FLOAT` | `0.5` | Prior strength pulling learned rates toward the base rate. |
-| `--spike-rate-min-factor FLOAT` | `0.5` | Minimum firing-rate factor relative to the base rate. |
-| `--spike-rate-max-factor FLOAT` | `5.0` | Maximum firing-rate factor relative to the base rate. |
 | `--spike-recruitment-levels N` | `6` | Number of discrete recruitment amplitudes. |
 | `--spike-twitch-rise SEC` | `0.016` | Twitch rise time. |
 | `--spike-twitch-decay SEC` | `0.064` | Twitch decay time. |
@@ -896,51 +884,13 @@ To load a saved empirical prior:
 | `--dt SEC` | policy dt | Control period. |
 | `--lbps-delta FLOAT` | `0.95` | Adaptive-temperature target. |
 | `--joint-noise FLOAT` | `0.5` | Actuator-range MPPI exploration scale. |
-| `--spike-synergies N` | `8` | Motor-synergy channels used by Spike-MPPI. |
-| `--spike-rate-hz FLOAT` | `16.0` | Base spike-event rate per synergy. |
-| `--spike-rate-update FLOAT` | `0.02` | Online firing-rate adaptation rate. |
-| `--spike-rate-prior FLOAT` | `0.5` | Prior strength toward the base firing rate. |
-| `--spike-rate-min-factor FLOAT` | `0.5` | Minimum normalized firing-rate factor. |
-| `--spike-rate-max-factor FLOAT` | `5.0` | Maximum normalized firing-rate factor. |
-| `--spike-recruitment-levels N` | `6` | Number of recruitment amplitudes. |
-| `--spike-twitch-rise SEC` | `0.016` | Twitch rise time. |
-| `--spike-twitch-decay SEC` | `0.064` | Twitch decay time. |
-| `--spike-twitch-duration SEC` | `0.200` | Twitch duration. |
-| `--spike-sign-update FLOAT` | `0.10` | Sign-preference adaptation rate. |
-| `--spike-mark-update FLOAT` | `0.10` | Recruitment-distribution adaptation rate. |
-| `--guided-rank N` | `6` | History-subspace rank used by `guided` and `diag-lowrank`. |
-| `--guided-fraction FLOAT` | `0.50` | Low-rank proposal fraction used by `guided` and `diag-lowrank`. |
-| `--diag-lowrank-rate FLOAT` | `0.08` | EMA rate for adaptive time/joint variances. |
-| `--diag-lowrank-min FLOAT` | `0.25` | Minimum normalized adaptive diagonal variance factor. |
-| `--diag-lowrank-max FLOAT` | `4.0` | Maximum normalized adaptive diagonal variance factor. |
-| `--spline-modes N` | `6` | Cubic B-spline latent modes per actuator. |
-| `--icem-elites N` | `4` | Shifted previous elites reused by the `icem` proposal. |
-| `--nominal-refine-iters N` | `0` | Optional policy-nominal refinement. |
-| `--seed N` | `1` | Controller random seed. |
-| `--workers N` | `16` | Persistent native rollout worker threads; `0` selects automatically. |
-| `--rollout-chunk-size N` | `0` | Worker-pool chunk size; `0` selects automatically. |
-| `--warm-start / --no-warm-start` | enabled | Shift the previous optimized sequence between MPPI updates. |
 | `--plant-integrator {model,euler,implicitfast}` | `model` | Physical-plant integrator; `model` preserves the source XML setting. |
 | `--planner-mode {rk4,fast-rk4,implicitfast}` | `rk4` | Planner physics profile. `fast-rk4` uses one RK4 step per control interval; `implicitfast` uses the source timestep. Both fast modes use the cheaper solver/contact profile. |
 | `--task {run,push_box,tow_sled}` | `run` | Test-time task. |
 | `--terrain {flat,ramps,stairs,rocky,mixed}` | `flat` | Test-time terrain. |
-| `--terrain-seed N` | `1` | Deterministic rocky/mixed terrain seed. |
-| `--terrain-scale FLOAT` | `1.0` | Terrain obstacle/ramp scale. |
 | `--leg-mismatch {none,same_side,diagonal}` | `none` | Known Ant leg-length mismatch. |
-| `--short-leg-scale FLOAT` | `0.75` | Short-leg scale when geometry mismatch is enabled. |
-| `--long-leg-scale FLOAT` | `1.25` | Long-leg scale when geometry mismatch is enabled. |
-| `--friction-scale FLOAT` | `1.0` | Plant friction scale. |
-| `--mass-scale FLOAT` | `1.0` | Plant mass scale. |
-| `--motor-scale FLOAT` | `1.0` | Plant actuator-strength scale. |
-| `--slope-deg FLOAT` | `0.0` | Plant ground slope. |
 | `--profile` | off | Print compact controller timing statistics. |
-| `--disable-gc` | off | Disable Python cyclic GC during the race loop to reduce timing jitter. |
-| `--max-steps N` | none | Optional control-step limit. |
 | `--headless` | off | Disable viewer. |
-| `--viewer-ui` | off | Show MuJoCo left/right viewer panels. |
-| `--controller-overlay` | off | Enable the controller overlay. |
-| `--save PATH` | `racing/results/last_run.npz` | Save exact trajectory for replay. |
-| `--no-save` | off | Disable replay-file saving. |
 
 For all options:
 
@@ -1111,8 +1061,6 @@ python -m racing.experiments.replay \
 * The first controller update warms JAX/native/controller paths and can be much slower than steady state. It is printed for diagnostics but excluded from profiling and HPO latency statistics.
 
 * MPPI warm start is enabled by default.
-
-* Online MPPI rollouts are CPU MuJoCo. The controller automatically prefers the fused C++ evaluator, then stock `mujoco.rollout`, then the Python compatibility path.
 
 * `--planner-mode rk4` is the fidelity-oriented planner profile: explicit RK4, source planner timestep, and source solver/contact settings.
 

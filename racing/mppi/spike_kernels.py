@@ -204,6 +204,41 @@ def _twitch_into(impulses, kernel, filtered):
 
 
 @njit(cache=True, nogil=True, fastmath=False)
+def _static_project_homogeneous_identity(rng, block_means, amplitudes,
+                                         motor_impulses):
+    """Exact fixed-Spike fast path for identity motor wiring.
+
+    The production ``spike`` sampler has one channel per actuator and an
+    identity dictionary. The generic projector therefore checked all ``nu``
+    wiring entries for every sparse event even though exactly one is nonzero.
+    This specialization keeps the identical flattened Poisson process and RNG
+    draw order, but writes the event directly to its matching motor channel.
+    """
+    motor_impulses[:] = 0.0
+    n, h, nu = motor_impulses.shape
+    cells = n * h * nu
+    total = 0
+    for level in range(len(amplitudes)):
+        amp = amplitudes[level]
+        for sign in range(2):
+            lam = block_means[level, sign]
+            if lam <= 0.0:
+                continue
+            signed_amp = amp if sign == 0 else -amp
+            pos = rng.exponential(1.0 / lam)
+            while pos < cells:
+                idx = int(pos)
+                j = idx % nu
+                q = idx // nu
+                t = q % h
+                i = q // h
+                motor_impulses[i, t, j] += signed_amp
+                total += 1
+                pos += rng.exponential(1.0 / lam)
+    return total
+
+
+@njit(cache=True, nogil=True, fastmath=False)
 def _static_project_homogeneous(rng, block_means, amplitudes, wiring,
                                 motor_impulses, channel_energy):
     """Exact homogeneous marked-Poisson sampling with event skipping.
@@ -547,6 +582,34 @@ class StaticSpikeSampler:
                                        self.temporal_level_counts, self.temporal_mean_motor,
                                        self.plus, self.minus)
                    if a is not None)
+
+    def sample_projected_identity(self, rng):
+        """Specialized production path for one fixed neuron per actuator.
+
+        Returns borrowed twitch-decoded motor storage and the scalar event
+        count. It is distribution-equivalent to ``sample_projected(rng, I)``
+        and preserves the event RNG sequence exactly.
+        """
+        target_shape = (self.n, self.h, self.m)
+        if self.motor_impulses is None or self.motor_impulses.shape != target_shape:
+            self.motor_impulses = np.zeros(target_shape, dtype=np.float64)
+            self.motor_filtered = np.zeros(target_shape, dtype=np.float64)
+
+        if self.backend == "numba" and self.homogeneous_blocks is not None and not self.center:
+            total = _static_project_homogeneous_identity(
+                rng, self.homogeneous_blocks, self.amplitudes, self.motor_impulses
+            )
+            _twitch_into(self.motor_impulses, self.kernel, self.motor_filtered)
+            self.last_event_total = int(total)
+            return self.motor_filtered, self.last_event_total
+
+        # Non-production/general-law fallback remains the established generic
+        # implementation; constructing I here is outside the Numba hot path.
+        identity = np.eye(self.m, dtype=np.float64)
+        out, _, total = self.sample_projected(
+            rng, identity, collect_channel_energy=False
+        )
+        return out, int(total)
 
     def sample_projected(self, rng, wiring, *, collect_channel_energy=False):
         """Sample neuron events, project to motors, then apply the common twitch.
