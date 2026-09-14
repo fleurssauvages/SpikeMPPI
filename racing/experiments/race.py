@@ -84,6 +84,7 @@ def run_race(
     icem_elites: int = 4,
     spike_rate_hz: float = 16.0,
     spike_recruitment_levels: int = 6,
+    spike_scale_mode: str = "variance",
     spike_twitch_rise_s: float = 0.016,
     spike_twitch_decay_s: float = 0.064,
     spike_twitch_duration_s: float = 0.200,
@@ -323,6 +324,7 @@ def run_race(
         icem_elites=int(icem_elites),
         spike_rate_hz=float(spike_rate_hz),
         spike_recruitment_levels=int(spike_recruitment_levels),
+        spike_scale_mode=str(spike_scale_mode),
         spike_twitch_rise_s=float(spike_twitch_rise_s),
         spike_twitch_decay_s=float(spike_twitch_decay_s),
         spike_twitch_duration_s=float(spike_twitch_duration_s),
@@ -709,6 +711,10 @@ def run_race(
             "spike_effective_synergies",
             "spike_synergy_entropy",
             "spike_expected_events",
+            "spike_noise_scale",
+            "spike_variance_match_scale",
+            "spike_expected_rms_ratio",
+            "spike_peak_scale_mode",
             "screen_pool_size",
             "screen_horizon",
             "screen_exploit_count",
@@ -896,22 +902,29 @@ def main() -> None:
     
     parser.add_argument("--spike-rate-hz", type=float, default=16.0, help="joint-equivalent population event rate for Spike-MPPI")
     parser.add_argument("--spike-recruitment-levels", type=int, default=6, help="fixed recruitment amplitudes for Spike-MPPI")
+    parser.add_argument(
+        "--spike-scale", choices=("variance", "peak"), default="variance",
+        help=(
+            "Spike-MPPI amplitude convention: variance matches expected exploration power to standard MPPI; "
+            "peak makes one isolated full-recruitment twitch peak at --joint-noise"
+        ),
+    )
 
     parser.add_argument("--spike-twitch-rise", type=float, default=0.016, help="spike twitch rise time constant [s]")
     parser.add_argument("--spike-twitch-decay", type=float, default=0.064, help="spike twitch decay time constant [s]")
     parser.add_argument("--spike-twitch-duration", type=float, default=0.200, help="finite twitch-kernel support [s]")
     parser.add_argument(
         "--screen-pool", type=int, default=0,
-        help="with --sampling spike, pre-screen this many Spike candidates over the full planning horizon; 0 disables screening",
+        help="with --sampling standard or spike, pre-screen this many candidates over the full planning horizon; 0 disables screening",
     )
     parser.add_argument(
         "--screen-exploit", type=int, default=0,
-        help="with --sampling spike and --screen-pool > 0, fill this many full-rollout slots from the best screen scores; remaining slots stay random; 0 disables screening",
+        help="with screening enabled, fill this many full-rollout slots from the best screen scores; remaining slots stay random; 0 disables screening",
     )
     parser.add_argument(
         "--audit", type=int, default=0, metavar="N",
         help=(
-            "with Spike screening enabled, evaluate the entire screen pool at full fidelity every N MPC updates "
+            "with screening enabled, evaluate the entire screen pool at full fidelity every N MPC updates "
             "and report extraction diagnostics; 0 disables auditing (default)"
         ),
     )
@@ -929,8 +942,8 @@ def main() -> None:
         help=(
             "MPPI candidate sampling: standard Gaussian, guided low-rank history, "
             "diag-lowrank adaptive covariance, spline latent sampling, iCEM-style elite reuse, "
-            "or spike (fixed direct-joint Poisson/twitch sampling; optional full-horizon "
-            "screening is enabled with --screen-pool/--screen-exploit)."
+            "or spike (fixed direct-joint Poisson/twitch sampling). Optional full-horizon "
+            "screening is available for standard and spike with --screen-pool/--screen-exploit."
         ),
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -1076,6 +1089,7 @@ def main() -> None:
         icem_elites=args.icem_elites,
         spike_rate_hz=args.spike_rate_hz,
         spike_recruitment_levels=args.spike_recruitment_levels,
+        spike_scale_mode=args.spike_scale,
         spike_twitch_rise_s=args.spike_twitch_rise,
         spike_twitch_decay_s=args.spike_twitch_decay,
         spike_twitch_duration_s=args.spike_twitch_duration,
@@ -1136,7 +1150,7 @@ def main() -> None:
         f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s"
     )
     ds = result.diagnostics_summary
-    if result.sampling_option == SamplingOption.SPIKE.value and "screen_pool_size_median" in ds:
+    if result.sampling_option in {SamplingOption.STANDARD.value, SamplingOption.SPIKE.value} and "screen_pool_size_median" in ds:
         parts = []
         if "screen_ms_median" in ds:
             parts.append(f"preview={ds['screen_ms_median']:.2f}ms")
@@ -1155,7 +1169,7 @@ def main() -> None:
         if "screen_audit_count" in ds:
             parts.append(f"audits={int(ds['screen_audit_count'])}")
         if parts:
-            print("SpikeScreen " + " ".join(parts))
+            print("Screen " + " ".join(parts))
     lap_times_s = [float(v) for v in result.lap_times]
     lap_durations_s = [
         lap_times_s[i] - (lap_times_s[i - 1] if i else 0.0)

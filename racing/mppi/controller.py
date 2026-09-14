@@ -71,20 +71,25 @@ class ControllerConfig:
     spike_rate_hz: float = 16.0
     spike_recruitment_levels: int = 6
     spike_sampler: str = "auto"
+    # ``variance`` keeps Spike-MPPI exploration power matched to standard
+    # Gaussian MPPI. ``peak`` makes one isolated full-recruitment twitch peak
+    # at exactly the configured per-joint noise scale. Overlapping events can
+    # still sum above that level, so ``peak`` is not a hard noise bound.
+    spike_scale_mode: str = "variance"
 
 
     spike_twitch_rise_s: float = 0.016
     spike_twitch_decay_s: float = 0.064
     spike_twitch_duration_s: float = 0.200
 
-    # Optional full-horizon multi-fidelity screening for the ordinary ``spike``
-    # sampler. Both values at zero recover the exact standard Spike-MPPI path.
-    # When enabled, ``screen_pool_size`` Spike candidates are ranked with the
-    # existing full-horizon implicitfast preview and only ``num_rollouts`` are
-    # evaluated at full fidelity.
+    # Optional full-horizon multi-fidelity screening for standard Gaussian or
+    # Spike-MPPI sampling. Both values at zero recover the unscreened path.
+    # When enabled, ``screen_pool_size`` candidates are ranked with the existing
+    # full-horizon implicitfast preview and only ``num_rollouts`` are evaluated
+    # at full fidelity.
     screen_pool_size: int = 0
     screen_exploit: int = 0
-    # Optional diagnostic audit cadence for screened Spike populations.
+    # Optional diagnostic audit cadence for screened candidate populations.
     # 0 disables the expensive full-population audit; N>0 audits every N MPC steps.
     screen_audit_every: int = 0
 
@@ -157,6 +162,8 @@ class ControllerConfig:
         self.icem_elites = max(0, int(self.icem_elites))
         if self.spike_sampler not in {"auto", "numpy", "numba"}:
             raise ValueError("spike_sampler must be auto, numpy, or numba")
+        if self.spike_scale_mode not in {"variance", "peak"}:
+            raise ValueError("spike_scale_mode must be variance or peak")
         if not np.isfinite(self.spike_rate_hz) or self.spike_rate_hz <= 0:
             raise ValueError("spike_rate_hz must be finite and positive")
         self.spike_recruitment_levels = max(1, int(self.spike_recruitment_levels))
@@ -216,13 +223,18 @@ class JointMPPIController:
         self.cfg = cfg
         self.variant = ControllerVariant(variant)
         self.sampling = SamplingOption(sampling)
+        screen_requested = cfg.screen_pool_size > 0 and cfg.screen_exploit > 0
         self._screen_enabled = (
-            self.sampling == SamplingOption.SPIKE
-            and cfg.screen_pool_size > 0
-            and cfg.screen_exploit > 0
+            self.variant == ControllerVariant.MPPI
+            and self.sampling in {SamplingOption.STANDARD, SamplingOption.SPIKE}
+            and screen_requested
         )
-        if (cfg.screen_pool_size > 0 or cfg.screen_exploit > 0) and self.sampling != SamplingOption.SPIKE:
-            raise ValueError("--screen-pool/--screen-exploit are only valid with --sampling spike")
+        if screen_requested and self.variant != ControllerVariant.MPPI:
+            raise ValueError("--screen-pool/--screen-exploit require --variant mppi")
+        if screen_requested and self.sampling not in {SamplingOption.STANDARD, SamplingOption.SPIKE}:
+            raise ValueError(
+                "--screen-pool/--screen-exploit are only valid with --sampling standard or spike"
+            )
         if self.variant == ControllerVariant.NOMINAL and self.sampling != SamplingOption.STANDARD:
             raise ValueError("non-standard --sampling options require --variant mppi")
         self.rng = np.random.default_rng(int(seed))
@@ -307,7 +319,12 @@ class JointMPPIController:
         k2_prefix = np.cumsum(self._spike_twitch ** 2)
         remaining = np.minimum(np.arange(h, 0, -1), len(k2_prefix))
         self._spike_variance_weights = k2_prefix[remaining - 1] / float(h)
-        self._spike_global_noise_scale = self._compute_spike_global_noise_scale()
+        self._spike_variance_match_scale = self._compute_spike_global_noise_scale()
+        self._spike_global_noise_scale = (
+            1.0
+            if cfg.spike_scale_mode == "peak"
+            else self._spike_variance_match_scale
+        )
         self._spike_generator = None
         if self.sampling in BIO_EVENT_SAMPLING_OPTIONS:
             spike_n = cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts
@@ -379,14 +396,21 @@ class JointMPPIController:
                     "signed marked-Poisson events + causal twitch; "
                     f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
                     f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
-                    "preview=implicitfast, full update unchanged, "
+                    f"scale={self.cfg.spike_scale_mode}, preview=implicitfast, full update unchanged, "
                     f"implementation={self._spike_sampler_backend}"
                 )
             return (
                 "Spike-MPPI: fixed direct-joint signed marked-Poisson events + causal twitch; "
                 f"neurons={self.robot.nu}, base_rate={self.cfg.spike_rate_hz:g}Hz, "
-                "identity wiring, no learning, unchanged nominal, "
+                f"scale={self.cfg.spike_scale_mode}, identity wiring, no learning, unchanged nominal, "
                 f"implementation={self._spike_sampler_backend}"
+            )
+        if self.sampling == SamplingOption.STANDARD and self._screen_enabled:
+            return (
+                "standard MPPI Gaussian sampling with full-horizon screening: "
+                f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
+                f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
+                "preview=implicitfast, full update unchanged"
             )
         return "standard MPPI Gaussian sampling"
 
@@ -515,8 +539,9 @@ class JointMPPIController:
             nominal_timing_ms,
         )
 
-    def _sample_standard(self, nominal: np.ndarray) -> np.ndarray:
-        n, h, nu = self.cfg.num_rollouts, self.cfg.horizon, self.robot.nu
+    def _sample_standard(self, nominal: np.ndarray, *, count: int | None = None) -> np.ndarray:
+        n = self.cfg.num_rollouts if count is None else max(1, int(count))
+        h, nu = self.cfg.horizon, self.robot.nu
         std = self._joint_std
         if (
             self._standard_workspace is None
@@ -631,19 +656,22 @@ class JointMPPIController:
             expected_trace = (1.0 - alpha) * d + alpha * r
             z *= math.sqrt(d / max(expected_trace, 1e-12))
 
-        noise = z * self._joint_std[None, None, :]
-        controls = nominal[None, :, :] + noise
-        np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
-        return controls
+        # ``z`` is no longer needed after proposal construction. Reuse it for
+        # controls to avoid allocating separate noise and control tensors.
+        np.multiply(z, self._joint_std[None, None, :], out=z)
+        np.add(nominal[None, :, :], z, out=z)
+        np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
+        return z
 
     def _sample_spline(self, nominal: np.ndarray) -> np.ndarray:
         n, h, nu = self.cfg.num_rollouts, self.cfg.horizon, self.robot.nu
         m = self._spline_basis.shape[1]
         coeff = self.rng.standard_normal((n, m, nu))
         z = np.einsum("tm,nmu->ntu", self._spline_basis, coeff, optimize=True)
-        controls = nominal[None, :, :] + z * self._joint_std[None, None, :]
-        np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
-        return controls
+        np.multiply(z, self._joint_std[None, None, :], out=z)
+        np.add(nominal[None, :, :], z, out=z)
+        np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
+        return z
 
     @staticmethod
     def _make_spike_twitch_kernel(
@@ -732,6 +760,12 @@ class JointMPPIController:
             "spike_total_rate_hz": total_rate,
             "spike_event_budget_fixed": 1.0,
             "spike_firing_fixed": float(self.sampling in BIO_EVENT_SAMPLING_OPTIONS),
+            "spike_noise_scale": float(self._spike_global_noise_scale),
+            "spike_variance_match_scale": float(self._spike_variance_match_scale),
+            "spike_expected_rms_ratio": float(
+                self._spike_global_noise_scale / max(self._spike_variance_match_scale, 1e-12)
+            ),
+            "spike_peak_scale_mode": float(self.cfg.spike_scale_mode == "peak"),
         }
         if self.sampling not in BIO_EVENT_SAMPLING_OPTIONS:
             return {key: math.nan for key in out}
@@ -756,21 +790,21 @@ class JointMPPIController:
         self._last_spike_event_count_mean = float(event_total) / n
         return z
 
-    def _screen_spike_population(
+    def _screen_population(
         self,
         start,
         nominal: np.ndarray,
         population: np.ndarray,
         current_s: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
-        """Rank a large fixed-law Spike population with a cheap MuJoCo preview.
+        """Rank a large candidate population with a cheap MuJoCo preview.
 
         The first ``screen_exploit`` full-fidelity slots take the lowest
         preview costs. Remaining slots are sampled uniformly from the rest to
         retain coverage when the coarse model misranks candidates.
         """
         if self.native_batcher is None or not hasattr(self.native_batcher, 'evaluate_screen'):
-            raise RuntimeError('Spike screening requires the rebuilt fused screening evaluator')
+            raise RuntimeError('screening requires the rebuilt fused screening evaluator')
         hs = int(self.cfg.horizon)
         preview = np.ascontiguousarray(population[:, :hs, :], dtype=np.float64)
         nominal_preview = np.ascontiguousarray(nominal[:hs], dtype=np.float64)
@@ -849,11 +883,12 @@ class JointMPPIController:
         k = min(int(self.cfg.icem_elites), controls.shape[0], self._icem_elites.shape[0])
         if k <= 0:
             return controls
-        shifted = np.empty_like(self._icem_elites[:k])
-        shifted[:, :-1] = self._icem_elites[:k, 1:]
-        shifted[:, -1] = self._icem_elites[:k, -1]
-        np.clip(shifted, self._ctrl_low, self._ctrl_high, out=shifted)
-        controls[:k] = shifted
+        # The sampled first k rows are discarded for elite reuse anyway, so
+        # write the shifted elites directly into them instead of allocating an
+        # intermediate k x H x nu tensor and copying it back.
+        controls[:k, :-1] = self._icem_elites[:k, 1:]
+        controls[:k, -1] = self._icem_elites[:k, -1]
+        np.clip(controls[:k], self._ctrl_low, self._ctrl_high, out=controls[:k])
         return controls
 
     def _normalized_weights(self, costs: np.ndarray, temperature: float) -> np.ndarray:
@@ -1028,17 +1063,19 @@ class JointMPPIController:
         elif self.sampling == SamplingOption.ICEM:
             controls = self._sample_icem(nominal)
         elif self.sampling == SamplingOption.SPIKE:
-            if self._screen_enabled:
-                screen_population = self._sample_spike(nominal)
-                t_sample = time.perf_counter()
-                controls, screen_selected_idx, screen_cheap_costs, screen_diag = self._screen_spike_population(
-                    start, nominal, screen_population, current_s
-                )
-            else:
-                controls = self._sample_spike(nominal)
+            controls = self._sample_spike(nominal)
         else:
-            controls = self._sample_standard(nominal)
-        if not self._screen_enabled:
+            controls = self._sample_standard(
+                nominal,
+                count=self.cfg.screen_pool_size if self._screen_enabled else None,
+            )
+        if self._screen_enabled:
+            screen_population = controls
+            t_sample = time.perf_counter()
+            controls, screen_selected_idx, screen_cheap_costs, screen_diag = self._screen_population(
+                start, nominal, screen_population, current_s
+            )
+        else:
             t_sample = time.perf_counter()
         t_screen = time.perf_counter()
 
