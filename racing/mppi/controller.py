@@ -71,6 +71,9 @@ class ControllerConfig:
     spike_rate_hz: float = 16.0
     spike_recruitment_levels: int = 6
     spike_sampler: str = "auto"
+    # ``auto`` uses the bit-equivalent sparse twitch decoder only when its
+    # expected impulse occupancy is low enough to be faster than the dense FIR.
+    spike_twitch_decoder: str = "auto"
     # ``variance`` keeps Spike-MPPI exploration power matched to standard
     # Gaussian MPPI. ``peak`` makes one isolated full-recruitment twitch peak
     # at exactly the configured per-joint noise scale. Overlapping events can
@@ -129,6 +132,17 @@ class ControllerConfig:
     # Standard receding-horizon warm start. After the first update, shift the
     # previous optimized sequence instead of doing H synchronous policy calls.
     warm_start: bool = True
+
+    # Optional reduced-rate / event-triggered MPPI execution.  Zero preserves
+    # the original behavior: run a full MPPI update every control tick.
+    # ``mppi_update_hz`` is the periodic update rate; between updates the
+    # shifted cached plan is executed.  ``mppi_update_threshold`` is a
+    # dimensionless normalized full-horizon MPPI correction RMS: if the last
+    # full update was at least this large, the next tick is forced to update
+    # early rather than waiting for the periodic cadence.
+    mppi_update_hz: float = 0.0
+    mppi_update_threshold: float = 0.0
+
     # Nominal geometry is diagnostic-only unless nominal refinement is enabled.
     # Keep API compatibility; race.py disables it when the overlay is not used.
     nominal_diagnostics: bool = True
@@ -162,6 +176,8 @@ class ControllerConfig:
         self.icem_elites = max(0, int(self.icem_elites))
         if self.spike_sampler not in {"auto", "numpy", "numba"}:
             raise ValueError("spike_sampler must be auto, numpy, or numba")
+        if self.spike_twitch_decoder not in {"auto", "dense", "sparse-exact"}:
+            raise ValueError("spike_twitch_decoder must be auto, dense, or sparse-exact")
         if self.spike_scale_mode not in {"variance", "peak"}:
             raise ValueError("spike_scale_mode must be variance or peak")
         if not np.isfinite(self.spike_rate_hz) or self.spike_rate_hz <= 0:
@@ -191,6 +207,10 @@ class ControllerConfig:
         if not -1.0 <= self.box_min_up <= 1.0:
             raise ValueError("box_min_up must lie in [-1, 1]")
         self.rollout_chunk_size = max(0, int(self.rollout_chunk_size))
+        if not np.isfinite(self.mppi_update_hz) or self.mppi_update_hz < 0.0:
+            raise ValueError("mppi_update_hz must be finite and nonnegative")
+        if not np.isfinite(self.mppi_update_threshold) or self.mppi_update_threshold < 0.0:
+            raise ValueError("mppi_update_threshold must be finite and nonnegative")
 
 class JointMPPIController:
     """Native-MuJoCo policy-seeded direct-joint MPPI controller.
@@ -333,9 +353,29 @@ class JointMPPIController:
                 self._spike_mark_prob_map, self._spike_levels,
                 cfg.control_dt, spike_n, self._spike_twitch,
                 backend=self._spike_sampler_backend,
+                twitch_decoder=cfg.spike_twitch_decoder,
             )
         self._screen_step = 0
         self._last_screen_diag: dict[str, float] = {}
+
+        control_hz = 1.0 / float(cfg.control_dt)
+        if cfg.mppi_update_hz <= 0.0 or cfg.mppi_update_hz >= control_hz:
+            self._mppi_update_interval = 1
+        else:
+            ratio = control_hz / cfg.mppi_update_hz
+            lo = max(1, int(math.floor(ratio)))
+            hi = max(1, int(math.ceil(ratio)))
+            self._mppi_update_interval = min(
+                (lo, hi),
+                key=lambda n: abs(control_hz / n - cfg.mppi_update_hz),
+            )
+        self._mppi_effective_update_hz = control_hz / self._mppi_update_interval
+        if self._mppi_update_interval > 1 and not cfg.warm_start:
+            raise ValueError("reduced-rate MPPI (--mppi-update-hz) requires warm_start")
+        # Number of completed control ticks since the most recent full MPPI
+        # update. Initialize as due so the first MPPI action is always optimized.
+        self._steps_since_mppi_update = self._mppi_update_interval
+        self._last_mppi_plan_update_rms_norm = math.inf
 
         self._fixed_spike_diagnostics = self._make_fixed_spike_diagnostics()
 
@@ -397,13 +437,15 @@ class JointMPPIController:
                     f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
                     f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
                     f"scale={self.cfg.spike_scale_mode}, preview=implicitfast, full update unchanged, "
-                    f"implementation={self._spike_sampler_backend}"
+                    f"implementation={self._spike_sampler_backend}, "
+                    f"twitch_decoder={getattr(self._spike_generator, 'identity_twitch_decoder', 'unused')}"
                 )
             return (
                 "Spike-MPPI: fixed direct-joint signed marked-Poisson events + causal twitch; "
                 f"neurons={self.robot.nu}, base_rate={self.cfg.spike_rate_hz:g}Hz, "
                 f"scale={self.cfg.spike_scale_mode}, identity wiring, no learning, unchanged nominal, "
-                f"implementation={self._spike_sampler_backend}"
+                f"implementation={self._spike_sampler_backend}, "
+                f"twitch_decoder={getattr(self._spike_generator, 'identity_twitch_decoder', 'unused')}"
             )
         if self.sampling == SamplingOption.STANDARD and self._screen_enabled:
             return (
@@ -997,6 +1039,138 @@ class JointMPPIController:
         k = min(int(self.cfg.icem_elites), len(order))
         self._icem_elites = np.asarray(controls[order[:k]], dtype=np.float64).copy()
 
+    def _shift_cached_plan_one_step(self) -> np.ndarray:
+        """Advance the cached optimized plan exactly as the warm-start path does."""
+        if self._previous_plan is None:
+            raise RuntimeError("cannot shift an empty MPPI plan")
+        shifted = np.empty_like(self._previous_plan)
+        shifted[:-1] = self._previous_plan[1:]
+        shifted[-1] = self._previous_plan[-1]
+        np.clip(shifted, self._ctrl_low, self._ctrl_high, out=shifted)
+        return shifted
+
+    def _advance_sampler_state_without_update(self) -> None:
+        """Keep time-indexed proposal memories aligned on a skipped MPC tick."""
+        if self.sampling in {SamplingOption.GUIDED, SamplingOption.DIAG_LOWRANK}:
+            shifted_history = []
+            for old in self._direction_history:
+                old_h = np.asarray(old, dtype=np.float64).reshape(
+                    self.cfg.horizon, self.robot.nu
+                )
+                shifted_history.append(
+                    self._shift_horizon_array(
+                        old_h, tail=np.zeros(self.robot.nu, dtype=np.float64)
+                    ).reshape(-1)
+                )
+            self._direction_history = shifted_history
+        if self.sampling == SamplingOption.DIAG_LOWRANK:
+            self._diag_variance = self._shift_horizon_array(
+                self._diag_variance, tail=np.ones(self.robot.nu, dtype=np.float64)
+            )
+        if self.sampling == SamplingOption.ICEM and self._icem_elites is not None:
+            shifted = np.empty_like(self._icem_elites)
+            shifted[:, :-1] = self._icem_elites[:, 1:]
+            shifted[:, -1] = self._icem_elites[:, -1]
+            self._icem_elites = shifted
+
+    def _mppi_update_due(self) -> tuple[bool, str]:
+        """Return whether to run MPPI now and why. No model/policy calls occur."""
+        if self._previous_plan is None:
+            return True, "initial"
+        if not self.cfg.warm_start or self._mppi_update_interval <= 1:
+            return True, "full-rate"
+        cadence_due = self._steps_since_mppi_update >= self._mppi_update_interval - 1
+        threshold_due = (
+            self.cfg.mppi_update_threshold > 0.0
+            and np.isfinite(self._last_mppi_plan_update_rms_norm)
+            and self._last_mppi_plan_update_rms_norm >= self.cfg.mppi_update_threshold
+        )
+        if threshold_due and not cadence_due:
+            return True, "threshold"
+        if cadence_due:
+            return True, "cadence"
+        return False, "cached"
+
+    def _skip_mppi_update(self, data, t_total: float) -> tuple[np.ndarray, dict[str, Any]]:
+        """Execute one shifted cached-plan action without sampling or rollouts."""
+        t_shift0 = time.perf_counter()
+        candidate = self._shift_cached_plan_one_step()
+        self._previous_plan = candidate.copy()
+        self._advance_sampler_state_without_update()
+        self._steps_since_mppi_update += 1
+        t_shift1 = time.perf_counter()
+
+        action = candidate[0].copy()
+        task_xy = np.asarray(self.robot.task_xy(data), dtype=np.float64).reshape(1, 2)
+        spike_diag = self._spike_diagnostics()
+        info = {
+            "planned_control_sequence": candidate,
+            "policy_nominal": candidate,
+            "nominal": candidate,
+            "nominal_positions": np.empty((0, 2), dtype=np.float64),
+            "prior_mean": np.empty((0, 2), dtype=np.float64),
+            "spatial_covariance": np.empty((0, 2, 2), dtype=np.float64),
+            "temperature": math.nan,
+            "ess": math.nan,
+            "lbps_score": math.nan,
+            "finite_rollouts": 0,
+            "collision_rollouts": 0,
+            "best_rollout": task_xy,
+            "best_cost": math.nan,
+            "best_terminal_progress": math.nan,
+            "rollout_backend": self.rollout_backend_name,
+            "sampling_option": self.sampling.value,
+            "proposal": self.sampling.value,
+            "proposal_rank": int(self._last_proposal_rank),
+            "spike_sampler_backend": self._spike_sampler_backend,
+            "spike_twitch_decoder": (
+                getattr(self._spike_generator, "identity_twitch_decoder", "unused")
+                if self._spike_generator is not None else "unused"
+            ),
+            "nominal_geometry_evaluated": False,
+            "spike_synergies": int(self._spike_synergies.shape[0]),
+            "spike_events_mean": 0.0,
+            **spike_diag,
+            "nominal_cost": math.nan,
+            "weighted_rollout_cost": math.nan,
+            "best_finite_cost": math.nan,
+            "nominal_weighted_improvement": math.nan,
+            "nominal_weighted_improvement_rel": math.nan,
+            "nominal_best_improvement": math.nan,
+            "nominal_best_improvement_rel": math.nan,
+            "applied_residual_l2": math.nan,
+            "applied_residual_rms_norm": math.nan,
+            "applied_saturation_fraction": float(
+                np.mean(
+                    (action <= self._ctrl_low + 1e-6 * np.maximum(self._ctrl_high - self._ctrl_low, 1.0))
+                    | (action >= self._ctrl_high - 1e-6 * np.maximum(self._ctrl_high - self._ctrl_low, 1.0))
+                )
+            ),
+            "mppi_update_performed": 0.0,
+            "mppi_update_reason": "cached",
+            "mppi_update_interval_steps": int(self._mppi_update_interval),
+            "mppi_update_effective_hz": float(self._mppi_effective_update_hz),
+            "mppi_steps_since_update": int(self._steps_since_mppi_update),
+            "mppi_plan_update_rms_norm": float(self._last_mppi_plan_update_rms_norm),
+            "timing_ms": {
+                "nominal": 1e3 * (t_shift1 - t_shift0),
+                "policy": 0.0,
+                "warm_start": 1e3 * (t_shift1 - t_shift0),
+                "sensitivity": 0.0,
+                "prior": 0.0,
+                "sampling": 0.0,
+                "screening": 0.0,
+                "rollouts": 0.0,
+                "rollout_physics": 0.0,
+                "rollout_cost": 0.0,
+                "rollout_fused": 0.0,
+                "update": 0.0,
+                "diagnostics": 0.0,
+                "total": 1e3 * (time.perf_counter() - t_total),
+            },
+        }
+        return action, info
+
     def step(self, data, current_s: float) -> tuple[np.ndarray, dict[str, Any]]:
         t_total = time.perf_counter()
 
@@ -1046,6 +1220,10 @@ class JointMPPIController:
                     "total": 1e3 * (time.perf_counter() - t_total),
                 },
             }
+
+        update_due, update_reason = self._mppi_update_due()
+        if not update_due:
+            return self._skip_mppi_update(data, t_total)
 
         start, policy_nom, refined, sensitivity, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
         t_nominal = time.perf_counter()
@@ -1203,6 +1381,10 @@ class JointMPPIController:
         diag_weights = self._normalized_weights(costs, temperature)
         candidate = np.einsum("n,nhu->hu", diag_weights, controls, optimize=False)
         np.clip(candidate, self._ctrl_low, self._ctrl_high, out=candidate)
+        plan_delta_norm = (candidate - nominal) / np.maximum(self._ctrl_scale, 1e-12)[None, :]
+        mppi_plan_update_rms_norm = float(np.sqrt(np.mean(plan_delta_norm * plan_delta_norm)))
+        self._last_mppi_plan_update_rms_norm = mppi_plan_update_rms_norm
+        self._steps_since_mppi_update = 0
         if self.sampling == SamplingOption.DIAG_LOWRANK:
             self._update_adaptive_diagonal(controls, nominal, diag_weights, ess)
         if self.sampling in {SamplingOption.GUIDED, SamplingOption.DIAG_LOWRANK}:
@@ -1316,6 +1498,16 @@ class JointMPPIController:
             ),
             "icem_elites": 0 if self._icem_elites is None else int(len(self._icem_elites)),
             "spike_sampler_backend": self._spike_sampler_backend,
+            "spike_twitch_decoder": (
+                getattr(self._spike_generator, "identity_twitch_decoder", "unused")
+                if self._spike_generator is not None else "unused"
+            ),
+            "mppi_update_performed": 1.0,
+            "mppi_update_reason": update_reason,
+            "mppi_update_interval_steps": int(self._mppi_update_interval),
+            "mppi_update_effective_hz": float(self._mppi_effective_update_hz),
+            "mppi_steps_since_update": int(self._steps_since_mppi_update),
+            "mppi_plan_update_rms_norm": float(mppi_plan_update_rms_norm),
             "nominal_geometry_evaluated": bool(len(refined.positions)),
             "spike_synergies": int(self._spike_synergies.shape[0]),
             "spike_events_mean": float(self._last_spike_event_count_mean),

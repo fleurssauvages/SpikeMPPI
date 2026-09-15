@@ -85,6 +85,7 @@ def run_race(
     spike_rate_hz: float = 16.0,
     spike_recruitment_levels: int = 6,
     spike_scale_mode: str = "variance",
+    spike_twitch_decoder: str = "auto",
     spike_twitch_rise_s: float = 0.016,
     spike_twitch_decay_s: float = 0.064,
     spike_twitch_duration_s: float = 0.200,
@@ -100,6 +101,8 @@ def run_race(
     rollout_workers: int = 16,
     rollout_chunk_size: int = 0,
     warm_start: bool = True,
+    mppi_update_hz: float = 0.0,
+    mppi_update_threshold: float = 0.0,
     plant_integrator: str = "model",
     planner_mode: str = "rk4",
     profile_controller: bool = False,
@@ -325,6 +328,7 @@ def run_race(
         spike_rate_hz=float(spike_rate_hz),
         spike_recruitment_levels=int(spike_recruitment_levels),
         spike_scale_mode=str(spike_scale_mode),
+        spike_twitch_decoder=str(spike_twitch_decoder),
         spike_twitch_rise_s=float(spike_twitch_rise_s),
         spike_twitch_decay_s=float(spike_twitch_decay_s),
         spike_twitch_duration_s=float(spike_twitch_duration_s),
@@ -334,6 +338,8 @@ def run_race(
         rollout_workers=int(rollout_workers),
         rollout_chunk_size=int(rollout_chunk_size),
         warm_start=bool(warm_start),
+        mppi_update_hz=float(mppi_update_hz),
+        mppi_update_threshold=float(mppi_update_threshold),
         # Serial re-simulation of the shifted nominal is only needed by the
         # controller overlay. Normal racing uses the shifted controls directly.
         nominal_diagnostics=bool(controller_overlay),
@@ -409,6 +415,15 @@ def run_race(
         )
         if controller.variant == ControllerVariant.MPPI:
             print(f"sampling: {controller.sampling_description}")
+            if controller._mppi_update_interval > 1:
+                trigger = (
+                    f", threshold={cfg.mppi_update_threshold:g}"
+                    if cfg.mppi_update_threshold > 0.0 else ""
+                )
+                print(
+                    f"MPPI cadence: every {controller._mppi_update_interval} control ticks "
+                    f"({controller._mppi_effective_update_hz:g} Hz){trigger}"
+                )
         if environment.leg_mismatch != "none":
             scale_text = ", ".join(f"{name}={scale:g}x" for name, scale in leg_scales.items())
             print(
@@ -479,6 +494,11 @@ def run_race(
                 "spike_effective_synergies",
                 "spike_synergy_entropy",
                 "spike_expected_events",
+                "mppi_update_performed",
+                "mppi_update_interval_steps",
+                "mppi_update_effective_hz",
+                "mppi_steps_since_update",
+                "mppi_plan_update_rms_norm",
             "screen_pool_size",
             "screen_horizon",
             "screen_exploit_count",
@@ -715,6 +735,11 @@ def run_race(
             "spike_variance_match_scale",
             "spike_expected_rms_ratio",
             "spike_peak_scale_mode",
+            "mppi_update_performed",
+            "mppi_update_interval_steps",
+            "mppi_update_effective_hz",
+            "mppi_steps_since_update",
+            "mppi_plan_update_rms_norm",
             "screen_pool_size",
             "screen_horizon",
             "screen_exploit_count",
@@ -746,6 +771,11 @@ def run_race(
         diagnostics_summary["task_progress_rate_mps"] = float(
             cumulative / max(len(diagnostic_rows) * cfg.control_dt, 1e-12)
         )
+        update_flags = finite_values("mppi_update_performed")
+        if update_flags.size:
+            update_fraction = float(np.mean(update_flags))
+            diagnostics_summary["mppi_full_update_fraction"] = update_fraction
+            diagnostics_summary["mppi_actual_update_hz"] = update_fraction / max(cfg.control_dt, 1e-12)
 
         # Cleaner paper-facing aliases for per-step quantities whose internal
         # names already contain ``mean``.
@@ -909,6 +939,13 @@ def main() -> None:
             "peak makes one isolated full-recruitment twitch peak at --joint-noise"
         ),
     )
+    parser.add_argument(
+        "--spike-twitch-decoder", choices=("auto", "dense", "sparse-exact"), default="auto",
+        help=(
+            "twitch FIR implementation; auto uses the bit-equivalent sparse decoder only "
+            "when expected impulse occupancy is low enough to be faster"
+        ),
+    )
 
     parser.add_argument("--spike-twitch-rise", type=float, default=0.016, help="spike twitch rise time constant [s]")
     parser.add_argument("--spike-twitch-decay", type=float, default=0.064, help="spike twitch decay time constant [s]")
@@ -958,6 +995,21 @@ def main() -> None:
     parser.add_argument(
         "--warm-start", action=argparse.BooleanOptionalAction, default=True,
         help="shift the optimized sequence between updates (default: enabled; use --no-warm-start for the original behavior)",
+    )
+    parser.add_argument(
+        "--mppi-update-hz", type=float, default=0.0,
+        help=(
+            "periodic full-MPPI update rate in Hz; 0 keeps the original every-control-tick "
+            "behavior. Between updates the shifted cached plan is executed"
+        ),
+    )
+    parser.add_argument(
+        "--mppi-update-threshold", type=float, default=0.0,
+        help=(
+            "optional normalized full-horizon MPPI correction RMS threshold. With reduced-rate "
+            "MPPI, a previous update at or above this threshold forces an early update next tick; "
+            "0 disables the trigger"
+        ),
     )
     parser.add_argument(
         "--plant-integrator", choices=["model", "euler", "implicitfast"], default="model",
@@ -1090,6 +1142,7 @@ def main() -> None:
         spike_rate_hz=args.spike_rate_hz,
         spike_recruitment_levels=args.spike_recruitment_levels,
         spike_scale_mode=args.spike_scale,
+        spike_twitch_decoder=args.spike_twitch_decoder,
         spike_twitch_rise_s=args.spike_twitch_rise,
         spike_twitch_decay_s=args.spike_twitch_decay,
         spike_twitch_duration_s=args.spike_twitch_duration,
@@ -1105,6 +1158,8 @@ def main() -> None:
         rollout_workers=args.workers,
         rollout_chunk_size=args.rollout_chunk_size,
         warm_start=args.warm_start,
+        mppi_update_hz=args.mppi_update_hz,
+        mppi_update_threshold=args.mppi_update_threshold,
         plant_integrator=args.plant_integrator,
         planner_mode=args.planner_mode,
         profile_controller=args.profile,

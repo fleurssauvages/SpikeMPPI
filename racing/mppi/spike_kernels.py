@@ -8,8 +8,10 @@ mark law, or changed twitch kernel. See NumPy's random_poisson_mult at:
 https://github.com/numpy/numpy/blob/main/numpy/random/src/distributions/distributions.c
 
 Only implementation changes: compile scalar work, avoid broadcast temporaries,
-and omit event-history arrays when firing plasticity is disabled. The NumPy
-reference path remains selectable with --spike-sampler numpy.
+omit event-history arrays when firing plasticity is disabled, and optionally use
+a bit-equivalent sparse twitch FIR when impulse occupancy is low enough to make
+it faster. The NumPy reference path remains selectable with --spike-sampler
+numpy.
 """
 from __future__ import annotations
 
@@ -199,8 +201,45 @@ def _twitch_into(impulses, kernel, filtered):
                     filtered[i, t, j] += k * impulses[i, t - lag, j]
 
 
+@njit(cache=True, nogil=True, fastmath=False)
+def _collect_nonzero_flat_indices(impulses, indices, remaining):
+    """Collect occupied cells in dense traversal order plus valid FIR length."""
+    n, h, m = impulses.shape
+    count = 0
+    flat = 0
+    for i in range(n):
+        for t in range(h):
+            remain = h - t
+            for j in range(m):
+                if impulses[i, t, j] != 0.0:
+                    indices[count] = flat
+                    remaining[count] = remain
+                    count += 1
+                flat += 1
+    return count
 
 
+@njit(cache=True, nogil=True, fastmath=False)
+def _twitch_sparse_exact_into(impulses, kernel, filtered, indices, remaining):
+    """Sparse FIR numerically identical to ``_twitch_into``.
+
+    Lag stays outermost and occupied source cells retain the dense
+    rollout/time/channel order. Flat source/output indexing avoids divisions in
+    the hot sparse loop. Only multiplications by exact zero are omitted.
+    """
+    filtered[:] = 0.0
+    n, h, m = impulses.shape
+    count = _collect_nonzero_flat_indices(impulses, indices, remaining)
+    src = impulses.reshape(impulses.size)
+    dst = filtered.reshape(filtered.size)
+    for lag in range(min(h, len(kernel))):
+        k = kernel[lag]
+        offset = lag * m
+        for q in range(count):
+            if lag < remaining[q]:
+                idx = indices[q]
+                dst[idx + offset] += k * src[idx]
+    return count
 
 
 @njit(cache=True, nogil=True, fastmath=False)
@@ -484,7 +523,7 @@ class StaticSpikeSampler:
     """
 
     def __init__(self, pos_rate, neg_rate, mark_prob, amplitudes, dt, n, kernel,
-                 *, backend="numpy"):
+                 *, backend="numpy", twitch_decoder="auto"):
         pos = np.asarray(pos_rate, dtype=np.float64)
         neg = np.asarray(neg_rate, dtype=np.float64)
         probs = np.asarray(mark_prob, dtype=np.float64)
@@ -505,7 +544,10 @@ class StaticSpikeSampler:
             raise ValueError("invalid dt, rollout count, amplitudes or kernel")
         if backend not in {"numpy", "numba"}:
             raise ValueError("backend must be numpy or numba")
+        if twitch_decoder not in {"auto", "dense", "sparse-exact"}:
+            raise ValueError("twitch_decoder must be auto, dense, or sparse-exact")
         self.backend = backend
+        self.twitch_decoder = twitch_decoder
         self.dt = float(dt)
         self.amplitudes = amplitudes.copy()
         self.kernel = kernel.copy()
@@ -531,6 +573,20 @@ class StaticSpikeSampler:
             if np.array_equal(self.means, np.broadcast_to(ref, self.means.shape))
             else None
         )
+        # Exact sparse FIR is beneficial only when impulse occupancy is low.
+        # The decoder itself is bit-equivalent to the dense FIR; ``auto`` only
+        # chooses the faster implementation from the known homogeneous rate.
+        if self.homogeneous_blocks is None:
+            self.expected_impulse_occupancy = 1.0
+        else:
+            cell_mean = float(np.sum(self.homogeneous_blocks))
+            self.expected_impulse_occupancy = 1.0 - math.exp(-cell_mean)
+        self.identity_twitch_decoder = (
+            "sparse-exact"
+            if twitch_decoder == "sparse-exact"
+            or (twitch_decoder == "auto" and self.expected_impulse_occupancy <= 0.10)
+            else "dense"
+        )
         self.n = int(n)
         self.h = int(pos.shape[0])
         self.m = int(pos.shape[1])
@@ -546,6 +602,10 @@ class StaticSpikeSampler:
             self._ensure_channel_workspace()
         self.motor_impulses = None
         self.motor_filtered = None
+        # Flat occupied-cell workspace for the exact sparse twitch decoder.
+        # It is allocated lazily only by the fixed identity Spike hot path.
+        self.motor_nonzero_indices = None
+        self.motor_nonzero_remaining = None
         self.channel_energy = np.empty((self.n, self.m), dtype=np.float64)
         self.event_counts = None
         self.positive_counts = None
@@ -574,7 +634,8 @@ class StaticSpikeSampler:
     def workspace_nbytes(self):
         """Persistent buffers only, excludes small fixed plans and NumPy draws."""
         return sum(a.nbytes for a in (self.impulses, self.filtered, self.motor_impulses,
-                                       self.motor_filtered, self.channel_energy,
+                                       self.motor_filtered, self.motor_nonzero_indices,
+                                       self.motor_nonzero_remaining, self.channel_energy,
                                        self.event_counts, self.positive_counts, self.level_counts,
                                        self.rate_cdf, self.mark_cdf,
                                        self.temporal_rate_cdf, self.temporal_mark_cdf,
@@ -594,12 +655,24 @@ class StaticSpikeSampler:
         if self.motor_impulses is None or self.motor_impulses.shape != target_shape:
             self.motor_impulses = np.zeros(target_shape, dtype=np.float64)
             self.motor_filtered = np.zeros(target_shape, dtype=np.float64)
+            self.motor_nonzero_indices = None
+            self.motor_nonzero_remaining = None
 
         if self.backend == "numba" and self.homogeneous_blocks is not None and not self.center:
             total = _static_project_homogeneous_identity(
                 rng, self.homogeneous_blocks, self.amplitudes, self.motor_impulses
             )
-            _twitch_into(self.motor_impulses, self.kernel, self.motor_filtered)
+            if self.identity_twitch_decoder == "sparse-exact":
+                cells = self.n * self.h * self.m
+                if self.motor_nonzero_indices is None or len(self.motor_nonzero_indices) != cells:
+                    self.motor_nonzero_indices = np.empty(cells, dtype=np.int64)
+                    self.motor_nonzero_remaining = np.empty(cells, dtype=np.int64)
+                _twitch_sparse_exact_into(
+                    self.motor_impulses, self.kernel, self.motor_filtered,
+                    self.motor_nonzero_indices, self.motor_nonzero_remaining,
+                )
+            else:
+                _twitch_into(self.motor_impulses, self.kernel, self.motor_filtered)
             self.last_event_total = int(total)
             return self.motor_filtered, self.last_event_total
 
