@@ -20,7 +20,7 @@ class GeometricPrior(SpatialPrior):
             t = np.asarray(track.tangent(float(s)), dtype=np.float64)
             tx, ty = float(t[0]), float(t[1])
             # n=(-ty, tx); expand the two rank-one terms without temporary
-            # outer products. This path is used once per PPO nominal step.
+            # outer products. This path is used by nominal geometry diagnostics.
             cov = np.asarray([
                 [ts2 * tx * tx + ns2 * ty * ty, (ts2 - ns2) * tx * ty],
                 [(ts2 - ns2) * tx * ty, ts2 * ty * ty + ns2 * tx * tx],

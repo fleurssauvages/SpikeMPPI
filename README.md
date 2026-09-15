@@ -1,11 +1,10 @@
-# Spike-MPPI: motoneuron-inspired online policy refinement with MPPI
+# Spike-MPPI: motoneuron-inspired MPPI
 
 <p align="center"><strong>
 <a href="#spike-mppi">Spike-MPPI</a> ·
 <a href="#results">Results</a> ·
 <a href="#overview">Overview</a> ·
 <a href="#requirements">Requirements</a> ·
-<a href="#training-the-ant-locomotion-policy">Training</a> ·
 <a href="#racing">Racing</a> ·
 <a href="#terrain-transfer">Terrain Transfer</a> ·
 <a href="#task-transfer">Task Transfer</a> ·
@@ -15,16 +14,11 @@
 <a href="#references">References</a>
 </strong></p>
 
-This project studies **online refinement of a pretrained Ant locomotion policy with Model Predictive Path Integral control (MPPI)** in MuJoCo. A velocity-conditioned PPO policy provides the nominal joint-level behavior, while MPPI improves that behavior online without retraining the policy.
+This project studies **Ant locomotion with Model Predictive Path Integral control (MPPI)** in MuJoCo.
 
 The main novelty of this repository is **Spike-MPPI**, a motoneuron-inspired MPPI sampling method. Instead of perturbing the nominal control sequence with independent Gaussian noise, Spike-MPPI samples sparse marked motor events, maps them through coordinated actuator synergies, and converts them into smooth control perturbations with causal twitch kernels. The proposal distribution itself adapts online from MPPI rollout weights by learning when a synergy should fire, which sign is useful, and which recruitment amplitudes are favored.
 
-The same pretrained policy and controller are evaluated across stadium racing, novel terrain, new tasks, morphology changes, and plant-model mismatch. The remaining MPPI samplers in this repository are retained primarily as controlled comparison baselines.
-
-The locomotion policy trainer is adapted from Margolis et al., **Rapid Locomotion via Reinforcement Learning** (RSS 2022 / IJRR).
-
-* Paper: https://doi.org/10.1177/02783649231224053
-* Released reference code: https://github.com/Improbable-AI/rapid-locomotion-rl
+The same controller is evaluated across stadium racing, novel terrain, new tasks, morphology changes, and plant-model mismatch. The remaining MPPI samplers in this repository are retained primarily as controlled comparison baselines.
 
 ## Spike-MPPI
 
@@ -36,22 +30,14 @@ Spike-MPPI replaces direct Gaussian control noise with a **marked point-process 
 
 <table align="center">
   <tr>
-    <th align="center">Nominal</th>
     <th align="center">MPPI</th>
+    <th align="center">Spike-MPPI</th>
   </tr>
   <tr>
-    <td align="center">
-      <img src="assets/nominal.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
-    </td>
     <td align="center">
       <img src="assets/mppi.gif" width="460" alt="MPPI racing on the obstacle-free track">
     </td>
-  </tr>
-  <tr>
-    <th colspan="2" align="center">Spike-MPPI</th>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
+    <td align="center">
       <img src="assets/spike.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
     </td>
   </tr>
@@ -61,46 +47,30 @@ Spike-MPPI replaces direct Gaussian control noise with a **marked point-process 
 
 <table align="center">
   <tr>
-    <th align="center">Nominal</th>
     <th align="center">MPPI</th>
+    <th align="center">Spike-MPPI</th>
   </tr>
   <tr>
     <td align="center">
-      <img src="assets/nominal_rocky.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/mppi_rocky.gif" width="460" alt="MPPI on rocky terrain">
     </td>
     <td align="center">
-      <img src="assets/mppi_rocky.gif" width="460" alt="MPPI racing on the obstacle-free track">
-    </td>
-  </tr>
-  <tr>
-    <th colspan="2" align="center">Spike-MPPI</th>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="assets/spike_rocky.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_rocky.gif" width="460" alt="Spike-MPPI on rocky terrain">
     </td>
   </tr>
 </table>
 
 <table align="center">
   <tr>
-    <th align="center">Nominal</th>
     <th align="center">MPPI</th>
+    <th align="center">Spike-MPPI</th>
   </tr>
   <tr>
     <td align="center">
-      <img src="assets/nominal_mixed.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/mppi_mixed.gif" width="460" alt="MPPI on mixed terrain">
     </td>
     <td align="center">
-      <img src="assets/mppi_mixed.gif" width="460" alt="MPPI racing on the obstacle-free track">
-    </td>
-  </tr>
-  <tr>
-    <th colspan="2" align="center">Spike-MPPI</th>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="assets/spike_mixed.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_mixed.gif" width="460" alt="Spike-MPPI on mixed terrain">
     </td>
   </tr>
 </table>
@@ -109,46 +79,30 @@ Spike-MPPI replaces direct Gaussian control noise with a **marked point-process 
 
 <table align="center">
   <tr>
-    <th align="center">Nominal</th>
     <th align="center">MPPI</th>
+    <th align="center">Spike-MPPI</th>
   </tr>
   <tr>
     <td align="center">
-      <img src="assets/nominal_box.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/mppi_box.gif" width="460" alt="MPPI pushing a box">
     </td>
     <td align="center">
-      <img src="assets/mppi_box.gif" width="460" alt="MPPI racing on the obstacle-free track">
-    </td>
-  </tr>
-  <tr>
-    <th colspan="2" align="center">Spike-MPPI</th>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="assets/spike_box.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_box.gif" width="460" alt="Spike-MPPI pushing a box">
     </td>
   </tr>
 </table>
 
 <table align="center">
   <tr>
-    <th align="center">Nominal</th>
     <th align="center">MPPI</th>
+    <th align="center">Spike-MPPI</th>
   </tr>
   <tr>
     <td align="center">
-      <img src="assets/nominal_sled.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/mppi_sled.gif" width="460" alt="MPPI towing a sled">
     </td>
     <td align="center">
-      <img src="assets/mppi_sled.gif" width="460" alt="MPPI racing on the obstacle-free track">
-    </td>
-  </tr>
-  <tr>
-    <th colspan="2" align="center">Spike-MPPI</th>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="assets/spike_sled.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_sled.gif" width="460" alt="Spike-MPPI towing a sled">
     </td>
   </tr>
 </table>
@@ -157,46 +111,30 @@ Spike-MPPI replaces direct Gaussian control noise with a **marked point-process 
 
 <table align="center">
   <tr>
-    <th align="center">Nominal</th>
     <th align="center">MPPI</th>
+    <th align="center">Spike-MPPI</th>
   </tr>
   <tr>
     <td align="center">
-      <img src="assets/nominal_diagonal.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/mppi_diagonal.gif" width="460" alt="MPPI with diagonal leg-length mismatch">
     </td>
     <td align="center">
-      <img src="assets/mppi_diagonal.gif" width="460" alt="MPPI racing on the obstacle-free track">
-    </td>
-  </tr>
-  <tr>
-    <th colspan="2" align="center">Spike-MPPI</th>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="assets/spike_diagonal.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_diagonal.gif" width="460" alt="Spike-MPPI with diagonal leg-length mismatch">
     </td>
   </tr>
 </table>
 
 <table align="center">
   <tr>
-    <th align="center">Nominal</th>
     <th align="center">MPPI</th>
+    <th align="center">Spike-MPPI</th>
   </tr>
   <tr>
     <td align="center">
-      <img src="assets/nominal_sameside.gif" width="460" alt="Nominal policy racing on the obstacle-free track">
+      <img src="assets/mppi_sameside.gif" width="460" alt="MPPI with same-side leg-length mismatch">
     </td>
     <td align="center">
-      <img src="assets/mppi_sameside.gif" width="460" alt="MPPI racing on the obstacle-free track">
-    </td>
-  </tr>
-  <tr>
-    <th colspan="2" align="center">Spike-MPPI</th>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="assets/spike_sameside.gif" width="460" alt="Spike-MPPI racing on the obstacle-free track">
+      <img src="assets/spike_sameside.gif" width="460" alt="Spike-MPPI with same-side leg-length mismatch">
     </td>
   </tr>
 </table>
@@ -206,12 +144,11 @@ Spike-MPPI replaces direct Gaussian control noise with a **marked point-process 
 
 ## Overview
 
-The project supports one robot, **Ant**, and two controller variants:
+The project supports one robot, **Ant**, and MPPI control:
 
 | Controller variant | Description |
 | --- | --- |
-| `nominal` | Execute the pretrained velocity-conditioned policy directly. |
-| `mppi` | Refine a policy-seeded control sequence online with MPPI. Candidate generation is selected independently with `--sampling`. |
+| `mppi` | Optimize a control sequence online with MPPI. Candidate generation is selected independently with `--sampling`. |
 
 Spike-MPPI is the primary sampling contribution. Other samplers are included as baselines and ablations:
 
@@ -226,12 +163,10 @@ Spike-MPPI is the primary sampling contribution. Other samplers are included as 
 
 The main pipeline is:
 
-1. Train a velocity-conditioned Ant locomotion policy with PPO and a Grid Adaptive Curriculum.
-2. Use the learned policy as the nominal controller for a 2-D stadium task.
-3. Evaluate transfer to new terrain, new tasks, leg-length mismatch, and model-parameter mismatch.
-4. Save exact MuJoCo states for deterministic replay and GIF export.
+1. Evaluate transfer to new terrain, new tasks, leg-length mismatch, and model-parameter mismatch.
+2. Save exact MuJoCo states for deterministic replay and GIF export.
 
-The MPPI controller acts directly on Ant's eight actuator controls. The pretrained policy remains the source of nominal locomotion behavior; Spike-MPPI searches around that behavior rather than replacing the policy.
+The MPPI controller acts directly on Ant's eight actuator controls.
 
 ---
 
@@ -291,8 +226,6 @@ RACING_FUSED_VERIFY=0 python -m racing.experiments.race ...
 
 * MuJoCo **3.3+**.
 
-* A GPU is strongly recommended for PPO training.
-
 * The fused C++ rollout evaluator currently targets Linux/macOS and requires a C++17 compiler.
 
 * If the fused extension is unavailable, online MPPI falls back automatically to stock `mujoco.rollout` and then to the Python compatibility path.
@@ -305,33 +238,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip wheel setuptools
 ```
 
-### 2. Install JAX for your accelerator
-
-Install the appropriate JAX build before the remaining project requirements.
-
-CPU:
-
-```bash
-python -m pip install -U jax
-```
-
-NVIDIA GPU with CUDA 13 wheels:
-
-```bash
-python -m pip install -U "jax[cuda13]"
-```
-
-NVIDIA GPU with CUDA 12 wheels:
-
-```bash
-python -m pip install -U "jax[cuda12]"
-```
-
-See the current JAX installation guide for other configurations:
-
-https://docs.jax.dev/en/latest/installation.html
-
-### 3. Install project dependencies
+### 2. Install project dependencies
 
 From the repository root:
 
@@ -339,33 +246,7 @@ From the repository root:
 python -m pip install -r requirements.txt
 ```
 
-Useful upstream references:
-
-* MuJoCo MJX: https://mujoco.readthedocs.io/en/latest/mjx.html
-
-* MuJoCo Warp: https://mujoco.readthedocs.io/en/latest/mjwarp/index.html
-
-* MuJoCo Playground: https://github.com/google-deepmind/mujoco_playground
-
-Verify the environment:
-
-```bash
-python - <<'PY'
-import jax
-import mujoco
-from mujoco import mjx
-import mujoco_playground
-print("JAX backend:", jax.default_backend())
-print("JAX devices:", jax.devices())
-print("MuJoCo:", mujoco.__version__)
-print("MJX import: OK")
-print("MuJoCo Playground import: OK")
-PY
-```
-
-For GPU training, `jax.default_backend()` should normally report `gpu`.
-
-### 4. Build the fused C++ rollout backend
+### 3. Build the fused C++ rollout backend
 
 This step is optional but recommended for real-time MPPI.
 
@@ -392,101 +273,6 @@ PY
 
 ---
 
-## Training the Ant locomotion policy
-
-The main trainer is:
-
-```bash
-python -m racing.policies.train_velocity_policy
-```
-
-The standard Ant checkpoint directory is:
-
-```text
-racing/policies/checkpoints/ant_rapid
-```
-
-This is also the checkpoint loaded by racing when `--policy auto` is used.
-
-### Fixed-budget training
-
-```bash
-python -m racing.policies.train_velocity_policy \
-  --robot ant \
-  --impl warp \
-  --num-envs 4096 \
-  --steps 400000000 \
-  --phase-steps 20000000 \
-  --contacts-per-env 8 \
-  --njmax 512 \
-  --output racing/policies/checkpoints/ant_rapid
-```
-
-The default control period is 0.02 s / 50 Hz. The curriculum starts around `v_x = +/-1 m/s` and yaw rate `+/-1 rad/s`, using 0.5-unit grid spacing, then expands through native-MuJoCo frontier evaluation.
-
-### PPO defaults
-
-| Setting                  |             Default |
-| ------------------------ | ------------------: |
-| Environments             |                4096 |
-| Total training steps     |         400,000,000 |
-| Curriculum phase         |    20,000,000 steps |
-| Discount                 |                0.99 |
-| GAE lambda               |                0.95 |
-| PPO rollout length       |                  21 |
-| PPO epochs per rollout   |                   5 |
-| Minibatches              |                   4 |
-| Batch size               |                1024 |
-| Entropy cost             |                0.01 |
-| PPO clip epsilon         |                 0.2 |
-| Learning rate            |                1e-3 |
-| Max gradient norm        |                 1.0 |
-| Policy network           | 512, 256, 128 / ELU |
-| Value network            | 512, 256, 128 / ELU |
-| Initial action noise std |                 1.0 |
-
-### Continue until the certified straight-speed envelope stalls
-
-```bash
-python -m racing.policies.train_velocity_policy \
-  --robot ant \
-  --impl warp \
-  --num-envs 4096 \
-  --phase-steps 20000000 \
-  --contacts-per-env 8 \
-  --njmax 512 \
-  --output racing/policies/checkpoints/ant_rapid \
-  --resume \
-  --until-failure \
-  --stall-patience 4 \
-  --max-phases 100
-```
-
-Optionally set an absolute ceiling:
-
-```text
---max-forward-speed 10.0
-```
-
-### Resume a fixed-budget run
-
-```bash
-python -m racing.policies.train_velocity_policy \
-  --robot ant \
-  --output racing/policies/checkpoints/ant_rapid \
-  --resume
-```
-
-### Test the trained policy
-
-```bash
-python -m racing.policies.test_velocity_policy \
-  --robot ant \
-  --policy racing/policies/checkpoints/ant_rapid
-```
-
----
-
 ## Racing
 
 The main entry point is:
@@ -497,17 +283,6 @@ python -m racing.experiments.race
 
 A run saves exact MuJoCo state history to `racing/results/last_run.npz` by default.
 
-### Nominal policy
-
-```bash
-python -m racing.experiments.race \
-  --robot ant \
-  --policy auto \
-  --variant nominal
-```
-
-`nominal` executes one closed-loop policy action per control tick and does not perform MPPI rollout optimization.
-
 ### Spike-MPPI
 
 The main controller configuration is:
@@ -515,7 +290,6 @@ The main controller configuration is:
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
   --variant mppi \
   --sampling spike \
   --rollouts 32 \
@@ -523,7 +297,7 @@ python -m racing.experiments.race \
   --profile
 ```
 
-`--sampling spike` keeps the policy-seeded nominal, MuJoCo rollout physics, task cost, LBPS temperature selection, actuator clipping and exponentially weighted MPPI control update unchanged. Only the stochastic proposal is replaced.
+`--sampling spike` keeps the nominal, MuJoCo rollout physics, task cost, LBPS temperature selection, actuator clipping and exponentially weighted MPPI control update unchanged. Only the stochastic proposal is replaced.
 
 At each update, Spike-MPPI samples signed, marked events in a motor-synergy space. Causal twitch kernels transform those sparse events into smooth horizon-length actuator perturbations. MPPI rollout weights then adapt the firing-rate map, positive/negative preference and recruitment-level distribution online. The learned proposal is warm-started by shifting these statistics with the receding horizon.
 
@@ -549,7 +323,7 @@ For the flat-ground HPO result, `--joint-noise 0.3` is a useful starting point; 
 
 ### Comparison MPPI samplers
 
-The samplers below are retained for controlled comparisons. `--sampling` changes **only candidate generation inside MPPI**, so comparisons can keep the nominal policy, rollout count, horizon, task objective and physics fixed.
+The samplers below are retained for controlled comparisons. `--sampling` changes **only candidate generation inside MPPI**, so comparisons can keep the nominal, rollout count, horizon, task objective and physics fixed.
 
 The non-standard comparison samplers are implementation-specific adaptations inspired by the cited methods; they are not exact reproductions of Guided ES, CMA-ES, Model Tensor Planning or iCEM.
 
@@ -670,7 +444,6 @@ The default planner uses full RK4 with the source MuJoCo timestep and solver/con
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
   --variant mppi \
   --rollouts 32 \
   --horizon 50 \
@@ -706,12 +479,11 @@ plant=model:2x0.01s  planner_mode=fast-rk4:1x0.02s
 
 ## Terrain transfer
 
-The PPO policy remains the same flat-ground pretrained controller while the MuJoCo plant/planner terrain changes at test time.
+The MuJoCo plant/planner terrain changes at test time.
 
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
   --variant mppi \
   --terrain ramps
 ```
@@ -737,14 +509,13 @@ Useful controls:
 
 ## Task transfer
 
-The same pretrained running policy can be used for additional flat-ground tasks.
+Additional flat-ground tasks are supported.
 
 ### Push a box
 
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
   --variant mppi \
   --task push_box
 ```
@@ -771,7 +542,6 @@ Useful box parameters include:
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
   --variant mppi \
   --task tow_sled
 ```
@@ -798,14 +568,13 @@ Useful sled parameters include:
 
 ## Ant geometry transfer
 
-Known leg-length mismatches can be applied to both the physical plant and planning model while keeping the PPO policy nominal-pretrained.
+Known leg-length mismatches can be applied to both the physical plant and planning model.
 
 Same-side mismatch:
 
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
   --variant mppi \
   --leg-mismatch same_side
 ```
@@ -815,7 +584,6 @@ Diagonal mismatch:
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
   --variant mppi \
   --leg-mismatch diagonal
 ```
@@ -836,7 +604,6 @@ The physical plant can be perturbed without giving those perturbations directly 
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
   --variant mppi \
   --friction-scale 0.8 \
   --mass-scale 1.15 \
@@ -874,14 +641,12 @@ To load a saved empirical prior:
 | Option | Default | Description |
 | --- | --- | --- |
 | `--robot ant` | `ant` | The only supported racing robot. |
-| `--policy SPEC` | `auto` | Loads `racing/policies/checkpoints/ant_rapid` automatically or accepts an explicit checkpoint/specification. |
-| `--policy-speed MPS` | none | Optional maximum racing-speed cap. |
 | `--laps N` | `1` | Requested laps. |
-| `--variant {nominal,mppi}` | `mppi` | Controller family: direct nominal-policy execution or MPPI refinement. |
+| `--variant mppi` | `mppi` | MPPI controller. |
 | `--sampling {spike,standard,guided,diag-lowrank,spline,icem}` | `standard` | Candidate-generation strategy used by MPPI. `spike` is the primary method in this repository. |
 | `--rollouts N` | `32` | MPPI candidate trajectories per update. |
 | `--horizon N` | `50` | MPPI horizon in control steps. |
-| `--dt SEC` | policy dt | Control period. |
+| `--dt SEC` | control dt | Control period. |
 | `--lbps-delta FLOAT` | `0.95` | Adaptive-temperature target. |
 | `--joint-noise FLOAT` | `0.5` | Actuator-range MPPI exploration scale. |
 | `--plant-integrator {model,euler,implicitfast}` | `model` | Physical-plant integrator; `model` preserves the source XML setting. |
@@ -943,7 +708,7 @@ For CPU rollout tuning, benchmark `--workers` and `--rollout-chunk-size` on the 
 
 ## Replay
 
-Replay restores exact saved MuJoCo states. It does **not** rerun PPO or MPPI.
+Replay restores exact saved MuJoCo states. It does **not** rerun MPPI.
 
 ```bash
 python -m racing.experiments.replay \
@@ -992,42 +757,17 @@ python -m racing.experiments.replay \
 
 ## Typical end-to-end workflow
 
-### 1. Train
-
-```bash
-python -m racing.policies.train_velocity_policy \
-  --robot ant \
-  --impl warp \
-  --num-envs 4096 \
-  --phase-steps 20000000 \
-  --contacts-per-env 8 \
-  --output racing/policies/checkpoints/ant_rapid \
-  --until-failure \
-  --stall-patience 4 \
-  --max-phases 100
-```
-
-### 2. Build the fused evaluator
+### 1. Build the fused evaluator
 
 ```bash
 python racing/setup_native.py build_ext --inplace
 ```
 
-### 3. Run the nominal baseline
+### 2. Run Spike-MPPI
 
 ```bash
 python -m racing.experiments.race \
   --robot ant \
-  --policy auto \
-  --variant nominal
-```
-
-### 4. Run Spike-MPPI
-
-```bash
-python -m racing.experiments.race \
-  --robot ant \
-  --policy auto \
   --variant mppi \
   --sampling spike \
   --rollouts 32 \
@@ -1037,14 +777,14 @@ python -m racing.experiments.race \
   --profile
 ```
 
-### 5. Replay
+### 3. Replay
 
 ```bash
 python -m racing.experiments.replay \
   --file racing/results/last_run.npz
 ```
 
-### 6. Export a GIF
+### 4. Export a GIF
 
 ```bash
 python -m racing.experiments.replay \
@@ -1058,7 +798,7 @@ python -m racing.experiments.replay \
 
 * Use the same `--seed`, horizon, rollout count, `--joint-noise`, plant/planner physics settings, task, and terrain when comparing MPPI sampling options.
 
-* The first controller update warms JAX/native/controller paths and can be much slower than steady state. It is printed for diagnostics but excluded from profiling and HPO latency statistics.
+* The first controller update warms native/controller paths and can be much slower than steady state. It is printed for diagnostics but excluded from profiling and HPO latency statistics.
 
 * MPPI warm start is enabled by default.
 
@@ -1085,5 +825,3 @@ The non-standard sampling options above are implementation-specific adaptations 
 [3] Le, A. T., Nguyen, K., Vu, M. N., Carvalho, J., & Peters, J. **Model Tensor Planning**. Transactions on Machine Learning Research, 2025. https://arxiv.org/abs/2505.01059
 
 [4] Pinneri, C., Sawant, S., Blaes, S., Achterhold, J., Stueckler, J., Rolinek, M., & Martius, G. **Sample-efficient Cross-Entropy Method for Real-time Planning**. Proceedings of the 2020 Conference on Robot Learning, PMLR 155:1049-1065, 2021. https://proceedings.mlr.press/v155/pinneri21a.html
-
-[5] Margolis, G. B., Yang, G., Paigwar, K., Chen, T., & Agrawal, P. **Rapid Locomotion via Reinforcement Learning**. International Journal of Robotics Research. https://doi.org/10.1177/02783649231224053

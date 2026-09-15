@@ -264,7 +264,7 @@ def replay(
     camera_elevation: float = DEFAULT_REPLAY_ELEVATION,
     camera_distance_scale: float = DEFAULT_REPLAY_DISTANCE_SCALE,
 ) -> None:
-    """Replay the saved MuJoCo states without rerunning MPPI or the policy."""
+    """Replay saved MuJoCo states without rerunning MPPI."""
     record, robot, track, qpos, qvel, state_time, act, controls = _prepare_replay(path)
 
     speed = float(speed)

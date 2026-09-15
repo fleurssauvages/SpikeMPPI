@@ -14,8 +14,7 @@ PROFILE_INITIAL_STEPS_EXCLUDED = 1
 
 from racing.robots.model_params import ModelParameterScales
 from racing.environments import RaceEnvironmentConfig
-from racing.mppi import ControllerConfig, ControllerVariant, SamplingOption, JointMPPIController
-from racing.policies import make_policy
+from racing.mppi import ControllerConfig, SamplingOption, JointMPPIController
 from racing.priors import EmpiricalPrior, GeometricPrior, SpatialPrior
 from racing.robots import make_robot
 from racing.tracks import (
@@ -65,9 +64,6 @@ def run_race(
     robot_name: str,
     laps: int = 1,
     prior: Optional[SpatialPrior] = None,
-    policy_spec: str | None = None,
-    policy_speed: float | None = None,
-    variant: ControllerVariant | str = ControllerVariant.MPPI,
     sampling: SamplingOption | str = SamplingOption.STANDARD,
     num_rollouts: int = 32,
     horizon: int = 75,
@@ -82,10 +78,9 @@ def run_race(
     diag_lowrank_max: float = 4.0,
     spline_modes: int = 6,
     icem_elites: int = 4,
-    spike_rate_hz: float = 16.0,
+    spike_rate_hz: float = 8.0,
     spike_recruitment_levels: int = 6,
     spike_scale_mode: str = "variance",
-    spike_twitch_decoder: str = "auto",
     spike_twitch_rise_s: float = 0.016,
     spike_twitch_decay_s: float = 0.064,
     spike_twitch_duration_s: float = 0.200,
@@ -101,8 +96,6 @@ def run_race(
     rollout_workers: int = 16,
     rollout_chunk_size: int = 0,
     warm_start: bool = True,
-    mppi_update_hz: float = 0.0,
-    mppi_update_threshold: float = 0.0,
     plant_integrator: str = "model",
     planner_mode: str = "rk4",
     profile_controller: bool = False,
@@ -141,20 +134,14 @@ def run_race(
     sled_max_lift: float = 0.12,
     sled_min_up: float = 0.70,
 ) -> RaceResult:
-    """Race a classic MuJoCo robot using a policy-seeded joint-space controller.
+    """Race a classic MuJoCo robot using direct-joint MPPI.
 
-    The locomotion policy provides either the closed-loop nominal controller or
-    the warm-start nominal sequence used by standard joint-space MPPI.
-
-    ``plant`` is the rendered/physical environment and may be configured with
-    fixed test-time perturbations. Known task/terrain/morphology changes are also
-    compiled into ``planner``. Plant and planner integrators are selectable
-    independently; both remain fixed for the duration of a run. Planner mode
-    also selects the matching contact-solver profile.
+    MPPI starts from a zero control horizon and, by default, warm-starts each
+    subsequent update from the shifted previous optimized sequence. Plant and
+    planner models may be configured independently for mismatch experiments.
     """
     # Build the track from the untouched robot reset pose, then compile task/terrain
-    # additions into both plant and planner models.  PPO remains a flat-ground
-    # pretrained policy, while MPPI is given the true test-time task geometry.
+    # additions into both plant and planner models.
     probe = make_robot(robot_name)
     if probe.nu <= 0:
         raise ValueError(f"{probe.name} has no MuJoCo actuators (model.nu=0)")
@@ -232,13 +219,10 @@ def run_race(
     plant.apply_model_parameters(plant_params)
     planner.apply_model_parameters(ModelParameterScales())
 
-    # Resolve the controller period before configuring planner physics.  The
-    # fast-rk4 planner deliberately takes one RK4 step per control interval,
-    # whereas rk4/implicitfast retain the source model timestep.
+    # Resolve the controller period before configuring planner physics.
     prior = prior or GeometricPrior()
-    policy = make_policy(policy_spec, race_speed=policy_speed, robot_name=robot_name)
     if control_dt is None:
-        control_dt = float(getattr(policy, "control_dt", 0.02))
+        control_dt = 0.02
     control_dt = float(control_dt)
     if control_dt <= 0.0:
         raise ValueError("control_dt must be positive")
@@ -293,7 +277,6 @@ def run_race(
         planner.model.opt.noslip_iterations = 0
 
     planner.mujoco.mj_forward(planner.model, planner.data)
-    policy.reset(planner, planner.data)
 
     # Reuse the same fast rollout/fused cost ABI for pushing and towing. The task
     # body is the box or sled respectively. Towing does not need an
@@ -328,7 +311,6 @@ def run_race(
         spike_rate_hz=float(spike_rate_hz),
         spike_recruitment_levels=int(spike_recruitment_levels),
         spike_scale_mode=str(spike_scale_mode),
-        spike_twitch_decoder=str(spike_twitch_decoder),
         spike_twitch_rise_s=float(spike_twitch_rise_s),
         spike_twitch_decay_s=float(spike_twitch_decay_s),
         spike_twitch_duration_s=float(spike_twitch_duration_s),
@@ -338,8 +320,6 @@ def run_race(
         rollout_workers=int(rollout_workers),
         rollout_chunk_size=int(rollout_chunk_size),
         warm_start=bool(warm_start),
-        mppi_update_hz=float(mppi_update_hz),
-        mppi_update_threshold=float(mppi_update_threshold),
         # Serial re-simulation of the shifted nominal is only needed by the
         # controller overlay. Normal racing uses the shifted controls directly.
         nominal_diagnostics=bool(controller_overlay),
@@ -350,7 +330,7 @@ def run_race(
         box_min_up=task_min_up,
     )
     controller = JointMPPIController(
-        planner, track, prior, policy, cfg, variant=variant, sampling=sampling, seed=seed
+        planner, track, prior, cfg, sampling=sampling, seed=seed
     )
 
 
@@ -404,31 +384,22 @@ def run_race(
 
     if verbose:
         print(
-            f"controller={controller.variant.value}  sampling={controller.sampling.value}  "
+            f"controller=mppi  sampling={controller.sampling.value}  "
             f"robot={plant.name}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
             f"planner={controller.rollout_backend_name}  "
             f"plant={plant_integrator}:{plant_control_substeps}x{plant.physics_dt:g}s  "
             f"planner_mode={planner_mode}:{controller.control_substeps}x{planner.physics_dt:g}s  "
-            f"warm_start={cfg.warm_start}  task={environment.task} terrain={environment.terrain} "
+            f"warm_start={cfg.warm_start}  "
+            f"task={environment.task} terrain={environment.terrain} "
             f"leg_mismatch={environment.leg_mismatch}"
         )
-        if controller.variant == ControllerVariant.MPPI:
-            print(f"sampling: {controller.sampling_description}")
-            if controller._mppi_update_interval > 1:
-                trigger = (
-                    f", threshold={cfg.mppi_update_threshold:g}"
-                    if cfg.mppi_update_threshold > 0.0 else ""
-                )
-                print(
-                    f"MPPI cadence: every {controller._mppi_update_interval} control ticks "
-                    f"({controller._mppi_effective_update_hz:g} Hz){trigger}"
-                )
+        print(f"sampling: {controller.sampling_description}")
         if environment.leg_mismatch != "none":
             scale_text = ", ".join(f"{name}={scale:g}x" for name, scale in leg_scales.items())
             print(
                 f"known Ant leg morphology: pattern={environment.leg_mismatch}  {scale_text}; "
-                "plant/planner geometry=modified, PPO checkpoint=nominal pretrained policy"
+                "plant/planner geometry=modified consistently"
             )
         if environment.task == "push_box":
             shape_desc = f"footprint={environment.box_size:g}m height={environment.box_height:g}m"
@@ -494,11 +465,6 @@ def run_race(
                 "spike_effective_synergies",
                 "spike_synergy_entropy",
                 "spike_expected_events",
-                "mppi_update_performed",
-                "mppi_update_interval_steps",
-                "mppi_update_effective_hz",
-                "mppi_steps_since_update",
-                "mppi_plan_update_rms_norm",
             "screen_pool_size",
             "screen_horizon",
             "screen_exploit_count",
@@ -545,8 +511,6 @@ def run_race(
                 else:
                     status = "OK" if total_ms <= deadline_ms else "MISS"
                 nominal_detail = []
-                if tm.get("policy", 0.0) > 0.005:
-                    nominal_detail.append(f"policy {tm['policy']:.2f}")
                 if tm.get("warm_start", 0.0) > 0.005:
                     nominal_detail.append(f"warm {tm['warm_start']:.2f}")
                 if tm.get("prior", 0.0) > 0.005:
@@ -560,8 +524,8 @@ def run_race(
                     if tm.get("rollout_cost", 0.0) > 0.005:
                         rollout_detail.append(f"cost {tm['rollout_cost']:.2f}")
 
-                profile_label = controller.variant.value.upper()
-                if controller.variant == ControllerVariant.MPPI and controller.sampling != SamplingOption.STANDARD:
+                profile_label = "MPPI"
+                if controller.sampling != SamplingOption.STANDARD:
                     profile_label += f"/{controller.sampling.value.upper()}"
                 print(
                     f"{profile_label} [{step + 1:5d}]  "
@@ -686,8 +650,8 @@ def run_race(
         else:
             metrics.extend((("physics", "rollout_physics"), ("cost", "rollout_cost")))
         metrics.extend((("update", "update"), ("total", "total")))
-        profile_label = controller.variant.value.upper()
-        if controller.variant == ControllerVariant.MPPI and controller.sampling != SamplingOption.STANDARD:
+        profile_label = "MPPI"
+        if controller.sampling != SamplingOption.STANDARD:
             profile_label += f"/{controller.sampling.value.upper()}"
         if verbose:
             print(
@@ -735,11 +699,6 @@ def run_race(
             "spike_variance_match_scale",
             "spike_expected_rms_ratio",
             "spike_peak_scale_mode",
-            "mppi_update_performed",
-            "mppi_update_interval_steps",
-            "mppi_update_effective_hz",
-            "mppi_steps_since_update",
-            "mppi_plan_update_rms_norm",
             "screen_pool_size",
             "screen_horizon",
             "screen_exploit_count",
@@ -771,11 +730,6 @@ def run_race(
         diagnostics_summary["task_progress_rate_mps"] = float(
             cumulative / max(len(diagnostic_rows) * cfg.control_dt, 1e-12)
         )
-        update_flags = finite_values("mppi_update_performed")
-        if update_flags.size:
-            update_fraction = float(np.mean(update_flags))
-            diagnostics_summary["mppi_full_update_fraction"] = update_fraction
-            diagnostics_summary["mppi_actual_update_hz"] = update_fraction / max(cfg.control_dt, 1e-12)
 
         # Cleaner paper-facing aliases for per-step quantities whose internal
         # names already contain ``mean``.
@@ -811,7 +765,7 @@ def run_race(
 
     return RaceResult(
         robot_name=plant.name,
-        controller_variant=controller.variant.value,
+        controller_variant="mppi",
         sampling_option=controller.sampling.value,
         control_dt=float(cfg.control_dt),
         plant_integrator=plant_integrator,
@@ -895,14 +849,8 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Policy-seeded direct-joint MuJoCo racing")
+    parser = argparse.ArgumentParser(description="Direct-joint MuJoCo MPPI racing")
     parser.add_argument("--robot", default="ant", choices=["ant"], help="Ant stadium racing")
-    parser.add_argument(
-        "--policy",
-        default="auto",
-        help="auto uses racing/policies/checkpoints/<robot>_rapid; also accepts a checkpoint directory, neutral, or module:function",
-    )
-    parser.add_argument("--policy-speed", type=float, default=None, help="optional cap on the learned maximum racing speed; omitted uses the curriculum envelope")
     parser.add_argument("--prior", default=None, help="Empirical prior .npz; geometric when omitted")
     parser.add_argument("--laps", type=int, default=1)
     parser.add_argument(
@@ -914,7 +862,7 @@ def main() -> None:
         "--dt",
         type=float,
         default=None,
-        help="MPPI/policy control dt; defaults to trained policy dt when available",
+        help="MPPI control period in seconds (default: 0.02)",
     )
     parser.add_argument("--lbps-delta", type=float, default=0.95)
     parser.add_argument("--nominal-refine-iters", type=int, default=0)
@@ -930,20 +878,13 @@ def main() -> None:
     parser.add_argument("--spline-modes", type=int, default=6, help="number of cubic B-spline latent modes per actuator")
     parser.add_argument("--icem-elites", type=int, default=4, help="number of shifted previous elite control sequences reused by icem sampling")
     
-    parser.add_argument("--spike-rate-hz", type=float, default=16.0, help="joint-equivalent population event rate for Spike-MPPI")
+    parser.add_argument("--spike-rate-hz", type=float, default=8.0, help="per-actuator event rate for Spike-MPPI (default: 8 Hz)")
     parser.add_argument("--spike-recruitment-levels", type=int, default=6, help="fixed recruitment amplitudes for Spike-MPPI")
     parser.add_argument(
         "--spike-scale", choices=("variance", "peak"), default="variance",
         help=(
             "Spike-MPPI amplitude convention: variance matches expected exploration power to standard MPPI; "
             "peak makes one isolated full-recruitment twitch peak at --joint-noise"
-        ),
-    )
-    parser.add_argument(
-        "--spike-twitch-decoder", choices=("auto", "dense", "sparse-exact"), default="auto",
-        help=(
-            "twitch FIR implementation; auto uses the bit-equivalent sparse decoder only "
-            "when expected impulse occupancy is low enough to be faster"
         ),
     )
 
@@ -967,12 +908,6 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--variant",
-        choices=[v.value for v in ControllerVariant],
-        default=ControllerVariant.MPPI.value,
-        help="controller: nominal policy execution or MPPI refinement",
-    )
-    parser.add_argument(
         "--sampling",
         choices=[v.value for v in SamplingOption],
         default=SamplingOption.STANDARD.value,
@@ -995,21 +930,6 @@ def main() -> None:
     parser.add_argument(
         "--warm-start", action=argparse.BooleanOptionalAction, default=True,
         help="shift the optimized sequence between updates (default: enabled; use --no-warm-start for the original behavior)",
-    )
-    parser.add_argument(
-        "--mppi-update-hz", type=float, default=0.0,
-        help=(
-            "periodic full-MPPI update rate in Hz; 0 keeps the original every-control-tick "
-            "behavior. Between updates the shifted cached plan is executed"
-        ),
-    )
-    parser.add_argument(
-        "--mppi-update-threshold", type=float, default=0.0,
-        help=(
-            "optional normalized full-horizon MPPI correction RMS threshold. With reduced-rate "
-            "MPPI, a previous update at or above this threshold forces an early update next tick; "
-            "0 disables the trigger"
-        ),
     )
     parser.add_argument(
         "--plant-integrator", choices=["model", "euler", "implicitfast"], default="model",
@@ -1067,17 +987,17 @@ def main() -> None:
 
     parser.add_argument(
         "--task", choices=["run", "push_box", "tow_sled"], default="run",
-        help="run tracks robot progress; push_box tracks the pushed object; tow_sled tracks a cable-towed sled; all reuse the same pretrained running policy",
+        help="run tracks robot progress; push_box tracks the pushed object; tow_sled tracks a cable-towed sled",
     )
     parser.add_argument(
         "--terrain", choices=["flat", "ramps", "stairs", "rocky", "mixed"], default="flat",
-        help="known test-time terrain on the upper straight and second turn; PPO stays flat-ground pretrained; push_box/tow_sled require flat",
+        help="known test-time terrain on the upper straight and second turn; push_box/tow_sled require flat",
     )
     parser.add_argument("--terrain-seed", type=int, default=1, help="deterministic rocky/mixed terrain seed")
     parser.add_argument("--terrain-scale", type=float, default=1.0, help="scale obstacle heights/ramp rise")
     parser.add_argument(
         "--leg-mismatch", choices=["none", "same_side", "diagonal"], default="none",
-        help="known Ant leg-length transfer for simple flat racing; plant/planner use modified geometry while PPO remains nominal-pretrained",
+        help="known Ant leg-length transfer for simple flat racing; plant/planner use the modified geometry",
     )
     parser.add_argument(
         "--short-leg-scale", type=float, default=0.75,
@@ -1122,9 +1042,6 @@ def main() -> None:
         robot_name=args.robot,
         laps=args.laps,
         prior=prior,
-        policy_spec=args.policy,
-        policy_speed=args.policy_speed,
-        variant=args.variant,
         sampling=args.sampling,
         num_rollouts=args.rollouts,
         horizon=args.horizon,
@@ -1142,7 +1059,6 @@ def main() -> None:
         spike_rate_hz=args.spike_rate_hz,
         spike_recruitment_levels=args.spike_recruitment_levels,
         spike_scale_mode=args.spike_scale,
-        spike_twitch_decoder=args.spike_twitch_decoder,
         spike_twitch_rise_s=args.spike_twitch_rise,
         spike_twitch_decay_s=args.spike_twitch_decay,
         spike_twitch_duration_s=args.spike_twitch_duration,
@@ -1158,8 +1074,6 @@ def main() -> None:
         rollout_workers=args.workers,
         rollout_chunk_size=args.rollout_chunk_size,
         warm_start=args.warm_start,
-        mppi_update_hz=args.mppi_update_hz,
-        mppi_update_threshold=args.mppi_update_threshold,
         plant_integrator=args.plant_integrator,
         planner_mode=args.planner_mode,
         profile_controller=args.profile,

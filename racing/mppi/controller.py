@@ -13,17 +13,11 @@ from .rollout import (
     NominalRollout,
     NativeRolloutBatcher,
     evaluate_control_batch,
-    rollout_policy_nominal,
     rollout_control_nominal,
-    refine_policy_nominal,
+    refine_control_nominal,
 )
 from .fast_kernels import NUMBA_AVAILABLE, lbps_optimize_fast
 from .spike_kernels import StaticSpikeSampler, resolve_spike_sampler
-
-
-class ControllerVariant(str, Enum):
-    NOMINAL = "nominal"
-    MPPI = "mppi"
 
 
 class SamplingOption(str, Enum):
@@ -68,12 +62,9 @@ class ControllerConfig:
     # Shared marked-Poisson/twitch physiology. ``spike`` is always the fixed
     # direct-joint baseline: one independent neuron per actuator, identity wiring,
     # and no online learning.
-    spike_rate_hz: float = 16.0
+    spike_rate_hz: float = 8.0
     spike_recruitment_levels: int = 6
     spike_sampler: str = "auto"
-    # ``auto`` uses the bit-equivalent sparse twitch decoder only when its
-    # expected impulse occupancy is low enough to be faster than the dense FIR.
-    spike_twitch_decoder: str = "auto"
     # ``variance`` keeps Spike-MPPI exploration power matched to standard
     # Gaussian MPPI. ``peak`` makes one isolated full-recruitment twitch peak
     # at exactly the configured per-joint noise scale. Overlapping events can
@@ -129,20 +120,9 @@ class ControllerConfig:
     rollout_workers: int = 16
     rollout_chunk_size: int = 0
 
-    # Standard receding-horizon warm start. After the first update, shift the
-    # previous optimized sequence instead of doing H synchronous policy calls.
+    # Standard receding-horizon warm start. The first update starts from a zero
+    # control horizon; later updates shift and reuse the previous MPPI solution.
     warm_start: bool = True
-
-    # Optional reduced-rate / event-triggered MPPI execution.  Zero preserves
-    # the original behavior: run a full MPPI update every control tick.
-    # ``mppi_update_hz`` is the periodic update rate; between updates the
-    # shifted cached plan is executed.  ``mppi_update_threshold`` is a
-    # dimensionless normalized full-horizon MPPI correction RMS: if the last
-    # full update was at least this large, the next tick is forced to update
-    # early rather than waiting for the periodic cadence.
-    mppi_update_hz: float = 0.0
-    mppi_update_threshold: float = 0.0
-
     # Nominal geometry is diagnostic-only unless nominal refinement is enabled.
     # Keep API compatibility; race.py disables it when the overlay is not used.
     nominal_diagnostics: bool = True
@@ -176,8 +156,6 @@ class ControllerConfig:
         self.icem_elites = max(0, int(self.icem_elites))
         if self.spike_sampler not in {"auto", "numpy", "numba"}:
             raise ValueError("spike_sampler must be auto, numpy, or numba")
-        if self.spike_twitch_decoder not in {"auto", "dense", "sparse-exact"}:
-            raise ValueError("spike_twitch_decoder must be auto, dense, or sparse-exact")
         if self.spike_scale_mode not in {"variance", "peak"}:
             raise ValueError("spike_scale_mode must be variance or peak")
         if not np.isfinite(self.spike_rate_hz) or self.spike_rate_hz <= 0:
@@ -207,21 +185,16 @@ class ControllerConfig:
         if not -1.0 <= self.box_min_up <= 1.0:
             raise ValueError("box_min_up must lie in [-1, 1]")
         self.rollout_chunk_size = max(0, int(self.rollout_chunk_size))
-        if not np.isfinite(self.mppi_update_hz) or self.mppi_update_hz < 0.0:
-            raise ValueError("mppi_update_hz must be finite and nonnegative")
-        if not np.isfinite(self.mppi_update_threshold) or self.mppi_update_threshold < 0.0:
-            raise ValueError("mppi_update_threshold must be finite and nonnegative")
 
 class JointMPPIController:
-    """Native-MuJoCo policy-seeded direct-joint MPPI controller.
+    """Native-MuJoCo direct-joint MPPI controller.
 
-    This follows the uploaded controller's structure, but the control vector is
-    no longer fixed to two vehicle controls. For every classic MuJoCo robot:
+    The control vector is the full MuJoCo actuator vector::
 
         u_t == MjData.ctrl in R^(model.nu)
 
-    The nominal is seeded by that robot's locomotion policy, locally refined around
-    the policy rollout, and MPPI explores directly in the full MuJoCo actuator space.
+    The first update is centered on zero control. With warm start enabled, each
+    later update shifts the previous optimized MPPI sequence forward by one step.
     """
 
     def __init__(
@@ -229,34 +202,25 @@ class JointMPPIController:
         robot,
         track,
         prior,
-        policy,
         cfg: ControllerConfig,
         *,
-        variant: ControllerVariant | str = ControllerVariant.MPPI,
         sampling: SamplingOption | str = SamplingOption.STANDARD,
         seed: int = 1,
     ) -> None:
         self.robot = robot
         self.track = track
         self.prior = prior
-        self.policy = policy
         self.cfg = cfg
-        self.variant = ControllerVariant(variant)
         self.sampling = SamplingOption(sampling)
         screen_requested = cfg.screen_pool_size > 0 and cfg.screen_exploit > 0
         self._screen_enabled = (
-            self.variant == ControllerVariant.MPPI
-            and self.sampling in {SamplingOption.STANDARD, SamplingOption.SPIKE}
+            self.sampling in {SamplingOption.STANDARD, SamplingOption.SPIKE}
             and screen_requested
         )
-        if screen_requested and self.variant != ControllerVariant.MPPI:
-            raise ValueError("--screen-pool/--screen-exploit require --variant mppi")
         if screen_requested and self.sampling not in {SamplingOption.STANDARD, SamplingOption.SPIKE}:
             raise ValueError(
                 "--screen-pool/--screen-exploit are only valid with --sampling standard or spike"
             )
-        if self.variant == ControllerVariant.NOMINAL and self.sampling != SamplingOption.STANDARD:
-            raise ValueError("non-standard --sampling options require --variant mppi")
         self.rng = np.random.default_rng(int(seed))
         ratio = float(cfg.control_dt) / max(float(robot.physics_dt), 1e-12)
         self.control_substeps = max(1, int(round(ratio)))
@@ -353,29 +317,9 @@ class JointMPPIController:
                 self._spike_mark_prob_map, self._spike_levels,
                 cfg.control_dt, spike_n, self._spike_twitch,
                 backend=self._spike_sampler_backend,
-                twitch_decoder=cfg.spike_twitch_decoder,
             )
         self._screen_step = 0
         self._last_screen_diag: dict[str, float] = {}
-
-        control_hz = 1.0 / float(cfg.control_dt)
-        if cfg.mppi_update_hz <= 0.0 or cfg.mppi_update_hz >= control_hz:
-            self._mppi_update_interval = 1
-        else:
-            ratio = control_hz / cfg.mppi_update_hz
-            lo = max(1, int(math.floor(ratio)))
-            hi = max(1, int(math.ceil(ratio)))
-            self._mppi_update_interval = min(
-                (lo, hi),
-                key=lambda n: abs(control_hz / n - cfg.mppi_update_hz),
-            )
-        self._mppi_effective_update_hz = control_hz / self._mppi_update_interval
-        if self._mppi_update_interval > 1 and not cfg.warm_start:
-            raise ValueError("reduced-rate MPPI (--mppi-update-hz) requires warm_start")
-        # Number of completed control ticks since the most recent full MPPI
-        # update. Initialize as due so the first MPPI action is always optimized.
-        self._steps_since_mppi_update = self._mppi_update_interval
-        self._last_mppi_plan_update_rms_norm = math.inf
 
         self._fixed_spike_diagnostics = self._make_fixed_spike_diagnostics()
 
@@ -437,15 +381,13 @@ class JointMPPIController:
                     f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
                     f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
                     f"scale={self.cfg.spike_scale_mode}, preview=implicitfast, full update unchanged, "
-                    f"implementation={self._spike_sampler_backend}, "
-                    f"twitch_decoder={getattr(self._spike_generator, 'identity_twitch_decoder', 'unused')}"
+                    f"implementation={self._spike_sampler_backend}"
                 )
             return (
                 "Spike-MPPI: fixed direct-joint signed marked-Poisson events + causal twitch; "
                 f"neurons={self.robot.nu}, base_rate={self.cfg.spike_rate_hz:g}Hz, "
                 f"scale={self.cfg.spike_scale_mode}, identity wiring, no learning, unchanged nominal, "
-                f"implementation={self._spike_sampler_backend}, "
-                f"twitch_decoder={getattr(self._spike_generator, 'identity_twitch_decoder', 'unused')}"
+                f"implementation={self._spike_sampler_backend}"
             )
         if self.sampling == SamplingOption.STANDARD and self._screen_enabled:
             return (
@@ -486,12 +428,11 @@ class JointMPPIController:
         self.native_batcher = None
 
     def _build_nominal(self, data, current_s: float):
-        """Build the policy-seeded control nominal used by MPPI.
+        """Build the MPPI proposal center from zero or the shifted prior plan.
 
-        With warm start enabled, the previous optimized plan is shifted and
-        re-simulated. Otherwise the pretrained policy generates the H-step
-        nominal. Optional nominal refinement remains available. MPPI candidate
-        generation is selected independently through ``SamplingOption``.
+        The first update always starts from a literal zero control horizon. With
+        warm start enabled, subsequent updates shift the previous optimized MPPI
+        sequence and use that sequence as the proposal center.
         """
         t0 = time.perf_counter()
         start = self.robot.snapshot(data)
@@ -500,48 +441,33 @@ class JointMPPIController:
             and self._previous_plan is not None
             and self._previous_plan.shape == (self.cfg.horizon, self.robot.nu)
         )
-        if used_warm_start:
-            shifted = np.empty_like(self._previous_plan)
-            shifted[:-1] = self._previous_plan[1:]
-            shifted[-1] = self._previous_plan[-1]
-            if not self.cfg.nominal_diagnostics and self.cfg.nominal_refine_iterations <= 0:
-                # Only the shifted controls enter sampling and rollout costs.
-                # Re-simulating H nominal steps here cannot change them. Omit
-                # that serial physics pass when no caller needs its geometry.
-                # Empty diagnostics are explicit, not stale/approximate paths.
-                shifted = self.robot.clip_ctrl(shifted)
-                policy_rollout = NominalRollout(
-                    shifted, [], np.empty((0, 2)), np.empty(0), np.empty(0)
-                )
-            else:
-                policy_rollout = rollout_control_nominal(
-                    self.robot,
-                    start,
-                    shifted,
-                    self.track,
-                    current_s,
-                    control_substeps=self.control_substeps,
-                    native_batcher=self.nominal_batcher,
-                )
-        else:
-            policy_rollout = rollout_policy_nominal(
-                self.robot,
-                start,
-                self.policy,
-                self.track,
-                self.prior,
-                current_s,
-                horizon=self.cfg.horizon,
-                control_substeps=self.control_substeps,
-            )
-        t_policy = time.perf_counter()
 
-        refined = policy_rollout
-        if int(self.cfg.nominal_refine_iterations) > 0:
-            refined, _jac, _endpoints = refine_policy_nominal(
+        if used_warm_start:
+            base_controls = np.empty_like(self._previous_plan)
+            base_controls[:-1] = self._previous_plan[1:]
+            base_controls[-1] = self._previous_plan[-1]
+        else:
+            base_controls = np.zeros((self.cfg.horizon, self.robot.nu), dtype=np.float64)
+        base_controls = self.robot.clip_ctrl(base_controls)
+
+        need_geometry = bool(self.cfg.nominal_diagnostics or (used_warm_start and int(self.cfg.nominal_refine_iterations) > 0))
+        if need_geometry:
+            base_rollout = rollout_control_nominal(
+                self.robot, start, base_controls, self.track, current_s,
+                control_substeps=self.control_substeps, native_batcher=self.nominal_batcher,
+            )
+        else:
+            base_rollout = NominalRollout(
+                base_controls, [], np.empty((0, 2)), np.empty(0), np.empty(0)
+            )
+        t_base = time.perf_counter()
+
+        refined = base_rollout
+        if used_warm_start and int(self.cfg.nominal_refine_iterations) > 0:
+            refined, _jac, _endpoints = refine_control_nominal(
                 self.robot,
                 start,
-                policy_rollout,
+                base_rollout,
                 self.track,
                 self.prior,
                 control_substeps=self.control_substeps,
@@ -565,14 +491,14 @@ class JointMPPIController:
         t_prior = time.perf_counter()
 
         nominal_timing_ms = {
-            "policy": 0.0 if used_warm_start else 1e3 * (t_policy - t0),
-            "warm_start": 1e3 * (t_policy - t0) if used_warm_start else 0.0,
-            "sensitivity": 1e3 * (t_refine - t_policy),
+            "warm_start": 1e3 * (t_base - t0) if used_warm_start else 0.0,
+            "zero_init": 1e3 * (t_base - t0) if not used_warm_start else 0.0,
+            "sensitivity": 1e3 * (t_refine - t_base),
             "prior": 1e3 * (t_prior - t_refine),
         }
         return (
             start,
-            policy_rollout,
+            base_rollout,
             refined,
             None,
             endpoints,
@@ -1039,193 +965,10 @@ class JointMPPIController:
         k = min(int(self.cfg.icem_elites), len(order))
         self._icem_elites = np.asarray(controls[order[:k]], dtype=np.float64).copy()
 
-    def _shift_cached_plan_one_step(self) -> np.ndarray:
-        """Advance the cached optimized plan exactly as the warm-start path does."""
-        if self._previous_plan is None:
-            raise RuntimeError("cannot shift an empty MPPI plan")
-        shifted = np.empty_like(self._previous_plan)
-        shifted[:-1] = self._previous_plan[1:]
-        shifted[-1] = self._previous_plan[-1]
-        np.clip(shifted, self._ctrl_low, self._ctrl_high, out=shifted)
-        return shifted
-
-    def _advance_sampler_state_without_update(self) -> None:
-        """Keep time-indexed proposal memories aligned on a skipped MPC tick."""
-        if self.sampling in {SamplingOption.GUIDED, SamplingOption.DIAG_LOWRANK}:
-            shifted_history = []
-            for old in self._direction_history:
-                old_h = np.asarray(old, dtype=np.float64).reshape(
-                    self.cfg.horizon, self.robot.nu
-                )
-                shifted_history.append(
-                    self._shift_horizon_array(
-                        old_h, tail=np.zeros(self.robot.nu, dtype=np.float64)
-                    ).reshape(-1)
-                )
-            self._direction_history = shifted_history
-        if self.sampling == SamplingOption.DIAG_LOWRANK:
-            self._diag_variance = self._shift_horizon_array(
-                self._diag_variance, tail=np.ones(self.robot.nu, dtype=np.float64)
-            )
-        if self.sampling == SamplingOption.ICEM and self._icem_elites is not None:
-            shifted = np.empty_like(self._icem_elites)
-            shifted[:, :-1] = self._icem_elites[:, 1:]
-            shifted[:, -1] = self._icem_elites[:, -1]
-            self._icem_elites = shifted
-
-    def _mppi_update_due(self) -> tuple[bool, str]:
-        """Return whether to run MPPI now and why. No model/policy calls occur."""
-        if self._previous_plan is None:
-            return True, "initial"
-        if not self.cfg.warm_start or self._mppi_update_interval <= 1:
-            return True, "full-rate"
-        cadence_due = self._steps_since_mppi_update >= self._mppi_update_interval - 1
-        threshold_due = (
-            self.cfg.mppi_update_threshold > 0.0
-            and np.isfinite(self._last_mppi_plan_update_rms_norm)
-            and self._last_mppi_plan_update_rms_norm >= self.cfg.mppi_update_threshold
-        )
-        if threshold_due and not cadence_due:
-            return True, "threshold"
-        if cadence_due:
-            return True, "cadence"
-        return False, "cached"
-
-    def _skip_mppi_update(self, data, t_total: float) -> tuple[np.ndarray, dict[str, Any]]:
-        """Execute one shifted cached-plan action without sampling or rollouts."""
-        t_shift0 = time.perf_counter()
-        candidate = self._shift_cached_plan_one_step()
-        self._previous_plan = candidate.copy()
-        self._advance_sampler_state_without_update()
-        self._steps_since_mppi_update += 1
-        t_shift1 = time.perf_counter()
-
-        action = candidate[0].copy()
-        task_xy = np.asarray(self.robot.task_xy(data), dtype=np.float64).reshape(1, 2)
-        spike_diag = self._spike_diagnostics()
-        info = {
-            "planned_control_sequence": candidate,
-            "policy_nominal": candidate,
-            "nominal": candidate,
-            "nominal_positions": np.empty((0, 2), dtype=np.float64),
-            "prior_mean": np.empty((0, 2), dtype=np.float64),
-            "spatial_covariance": np.empty((0, 2, 2), dtype=np.float64),
-            "temperature": math.nan,
-            "ess": math.nan,
-            "lbps_score": math.nan,
-            "finite_rollouts": 0,
-            "collision_rollouts": 0,
-            "best_rollout": task_xy,
-            "best_cost": math.nan,
-            "best_terminal_progress": math.nan,
-            "rollout_backend": self.rollout_backend_name,
-            "sampling_option": self.sampling.value,
-            "proposal": self.sampling.value,
-            "proposal_rank": int(self._last_proposal_rank),
-            "spike_sampler_backend": self._spike_sampler_backend,
-            "spike_twitch_decoder": (
-                getattr(self._spike_generator, "identity_twitch_decoder", "unused")
-                if self._spike_generator is not None else "unused"
-            ),
-            "nominal_geometry_evaluated": False,
-            "spike_synergies": int(self._spike_synergies.shape[0]),
-            "spike_events_mean": 0.0,
-            **spike_diag,
-            "nominal_cost": math.nan,
-            "weighted_rollout_cost": math.nan,
-            "best_finite_cost": math.nan,
-            "nominal_weighted_improvement": math.nan,
-            "nominal_weighted_improvement_rel": math.nan,
-            "nominal_best_improvement": math.nan,
-            "nominal_best_improvement_rel": math.nan,
-            "applied_residual_l2": math.nan,
-            "applied_residual_rms_norm": math.nan,
-            "applied_saturation_fraction": float(
-                np.mean(
-                    (action <= self._ctrl_low + 1e-6 * np.maximum(self._ctrl_high - self._ctrl_low, 1.0))
-                    | (action >= self._ctrl_high - 1e-6 * np.maximum(self._ctrl_high - self._ctrl_low, 1.0))
-                )
-            ),
-            "mppi_update_performed": 0.0,
-            "mppi_update_reason": "cached",
-            "mppi_update_interval_steps": int(self._mppi_update_interval),
-            "mppi_update_effective_hz": float(self._mppi_effective_update_hz),
-            "mppi_steps_since_update": int(self._steps_since_mppi_update),
-            "mppi_plan_update_rms_norm": float(self._last_mppi_plan_update_rms_norm),
-            "timing_ms": {
-                "nominal": 1e3 * (t_shift1 - t_shift0),
-                "policy": 0.0,
-                "warm_start": 1e3 * (t_shift1 - t_shift0),
-                "sensitivity": 0.0,
-                "prior": 0.0,
-                "sampling": 0.0,
-                "screening": 0.0,
-                "rollouts": 0.0,
-                "rollout_physics": 0.0,
-                "rollout_cost": 0.0,
-                "rollout_fused": 0.0,
-                "update": 0.0,
-                "diagnostics": 0.0,
-                "total": 1e3 * (time.perf_counter() - t_total),
-            },
-        }
-        return action, info
-
     def step(self, data, current_s: float) -> tuple[np.ndarray, dict[str, Any]]:
         t_total = time.perf_counter()
 
-        # A nominal-policy benchmark is closed-loop: only the action applied at
-        # the current real state is needed.  Building an H-step simulated policy
-        # rollout here used to perform H JAX inferences + H MuJoCo propagations
-        # every 20 ms, making `nominal` much slower computationally than
-        # the nominal used by warm-started MPPI.  One inference per tick is both
-        # faster and the faithful way to execute the pretrained running policy.
-        if self.variant == ControllerVariant.NOMINAL:
-            t_policy0 = time.perf_counter()
-            robot_s, _ = self.track.project(self.robot.xy(data))
-            ctrl = np.asarray(
-                self.policy.action(
-                    self.robot, data, track=self.track, prior=self.prior,
-                    current_s=float(robot_s),
-                ),
-                dtype=np.float64,
-            )
-            ctrl = self.robot.clip_ctrl(ctrl)
-            t_policy1 = time.perf_counter()
-            task_xy = np.asarray(self.robot.task_xy(data), dtype=np.float64).reshape(1, 2)
-            one = ctrl.reshape(1, -1)
-            elapsed = 1e3 * (t_policy1 - t_policy0)
-            return ctrl.copy(), {
-                "nominal": one.copy(),
-                "policy_nominal": one.copy(),
-                "nominal_positions": task_xy,
-                "prior_mean": np.empty((0, 2), dtype=np.float64),
-                "spatial_covariance": np.empty((0, 2, 2), dtype=np.float64),
-                "temperature": math.nan,
-                "ess": 1.0,
-                "finite_rollouts": 1,
-                "rollout_backend": "policy-closed-loop",
-                "timing_ms": {
-                    "nominal": elapsed,
-                    "policy": elapsed,
-                    "warm_start": 0.0,
-                    "sensitivity": 0.0,
-                    "prior": 0.0,
-                    "sampling": 0.0,
-                    "rollouts": 0.0,
-                    "rollout_physics": 0.0,
-                    "rollout_cost": 0.0,
-                    "rollout_fused": 0.0,
-                    "update": 0.0,
-                    "total": 1e3 * (time.perf_counter() - t_total),
-                },
-            }
-
-        update_due, update_reason = self._mppi_update_due()
-        if not update_due:
-            return self._skip_mppi_update(data, t_total)
-
-        start, policy_nom, refined, sensitivity, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
+        start, base_nominal, refined, sensitivity, endpoints, prior_mean, prior_cov, nominal_parts = self._build_nominal(data, current_s)
         t_nominal = time.perf_counter()
         nominal = refined.controls
         screen_population = None
@@ -1381,10 +1124,6 @@ class JointMPPIController:
         diag_weights = self._normalized_weights(costs, temperature)
         candidate = np.einsum("n,nhu->hu", diag_weights, controls, optimize=False)
         np.clip(candidate, self._ctrl_low, self._ctrl_high, out=candidate)
-        plan_delta_norm = (candidate - nominal) / np.maximum(self._ctrl_scale, 1e-12)[None, :]
-        mppi_plan_update_rms_norm = float(np.sqrt(np.mean(plan_delta_norm * plan_delta_norm)))
-        self._last_mppi_plan_update_rms_norm = mppi_plan_update_rms_norm
-        self._steps_since_mppi_update = 0
         if self.sampling == SamplingOption.DIAG_LOWRANK:
             self._update_adaptive_diagonal(controls, nominal, diag_weights, ess)
         if self.sampling in {SamplingOption.GUIDED, SamplingOption.DIAG_LOWRANK}:
@@ -1471,7 +1210,7 @@ class JointMPPIController:
 
         info = {
             "planned_control_sequence": candidate,
-            "policy_nominal": policy_nom.controls,
+            "base_nominal": base_nominal.controls,
             "nominal": nominal,
             "nominal_positions": refined.positions,
             "prior_mean": prior_mean,
@@ -1498,16 +1237,6 @@ class JointMPPIController:
             ),
             "icem_elites": 0 if self._icem_elites is None else int(len(self._icem_elites)),
             "spike_sampler_backend": self._spike_sampler_backend,
-            "spike_twitch_decoder": (
-                getattr(self._spike_generator, "identity_twitch_decoder", "unused")
-                if self._spike_generator is not None else "unused"
-            ),
-            "mppi_update_performed": 1.0,
-            "mppi_update_reason": update_reason,
-            "mppi_update_interval_steps": int(self._mppi_update_interval),
-            "mppi_update_effective_hz": float(self._mppi_effective_update_hz),
-            "mppi_steps_since_update": int(self._steps_since_mppi_update),
-            "mppi_plan_update_rms_norm": float(mppi_plan_update_rms_norm),
             "nominal_geometry_evaluated": bool(len(refined.positions)),
             "spike_synergies": int(self._spike_synergies.shape[0]),
             "spike_events_mean": float(self._last_spike_event_count_mean),

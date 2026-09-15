@@ -1275,7 +1275,7 @@ def rollout_control_nominal(
     control_substeps: int,
     native_batcher: NativeRolloutBatcher | None = None,
 ) -> NominalRollout:
-    """Roll out a supplied warm-start sequence without invoking the policy.
+    """Roll out a supplied warm-start sequence in native MuJoCo.
 
     With the native backend this is one C++ rollout call.  The fallback keeps
     the original Python loop exactly for unsupported MuJoCo/root layouts.
@@ -1310,44 +1310,6 @@ def rollout_control_nominal(
         cumulative[t] = cum
     return NominalRollout(clipped, snapshots, positions, progress_s, cumulative)
 
-
-def rollout_policy_nominal(
-    robot,
-    start_snapshot,
-    policy,
-    track,
-    prior,
-    current_s: float,
-    *,
-    horizon: int,
-    control_substeps: int,
-) -> NominalRollout:
-    """Roll out the robot's default policy in native MuJoCo to seed the nominal."""
-    d = robot.new_data(start_snapshot)
-    controls = np.empty((horizon, robot.nu), dtype=np.float64)
-    snapshots = []
-    positions = np.empty((horizon, 2), dtype=np.float64)
-    progress_s = np.empty(horizon, dtype=np.float64)
-    cumulative = np.empty(horizon, dtype=np.float64)
-    s_prev = float(current_s)
-    cum = 0.0
-    for t in range(horizon):
-        snapshots.append(robot.snapshot(d))
-        # The transferred policy is still a *running* policy.  Its track
-        # command therefore follows the robot root, not the pushed object's
-        # location.  MPPI alone sees and optimizes the box objective.
-        s_now, _ = track.project(robot.xy(d))
-        u = np.asarray(policy.action(robot, d, track=track, prior=prior, current_s=float(s_now)), dtype=np.float64)
-        controls[t] = robot.clip_ctrl(u)
-        robot.step_control(controls[t], substeps=control_substeps, data=d)
-        p = robot.task_xy(d)
-        s_new, _ = track.project(p)
-        cum += track.signed_progress_delta(float(s_new), s_prev)
-        s_prev = float(s_new)
-        positions[t] = p
-        progress_s[t] = float(s_new)
-        cumulative[t] = cum
-    return NominalRollout(controls, snapshots, positions, progress_s, cumulative)
 
 
 def rollout_controls(
@@ -1595,10 +1557,10 @@ def estimate_joint_task_time_sensitivities(
     return sensitivity, future_positions
 
 
-def refine_policy_nominal(
+def refine_control_nominal(
     robot,
     start_snapshot,
-    policy_rollout: NominalRollout,
+    nominal_rollout: NominalRollout,
     track,
     prior,
     *,
@@ -1611,16 +1573,15 @@ def refine_policy_nominal(
     epsilon_fraction: float = 1e-3,
     native_batcher: NativeRolloutBatcher | None = None,
 ) -> tuple[NominalRollout, np.ndarray, np.ndarray]:
-    """Policy-seeded iLQR-like task-space refinement.
+    """Optional iLQR-like task-space refinement of a control nominal.
 
     A full contact-rich iLQR implementation that works identically for every
     robot actuator model is brittle. This uses the same local principle:
-    linearize MuJoCo around the policy rollout, solve a damped least-squares
-    task correction, update the joint sequence, and re-rollout. The resulting
-    sensitivity matrices are also the exact matrices consumed by SPG.
+    linearize MuJoCo around the current open-loop nominal, solve a damped
+    least-squares task correction, update the joint sequence, and re-rollout.
     """
-    controls = np.asarray(policy_rollout.controls, dtype=np.float64).copy()
-    current = policy_rollout
+    controls = np.asarray(nominal_rollout.controls, dtype=np.float64).copy()
+    current = nominal_rollout
     jac = np.zeros((len(controls), 2, robot.nu), dtype=np.float64)
     endpoints = current.positions.copy()
     max_step = max_control_step_fraction * np.maximum(robot.control_scale(fraction=1.0), 1e-6)

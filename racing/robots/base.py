@@ -96,8 +96,8 @@ class ClassicRobot:
         self.xml_path = classic_xml_path(info)
 
         # Keep the original robot dimensions even when the race environment adds
-        # dynamic task objects (e.g. a free box).  The pretrained locomotion
-        # policy must continue to see exactly the observation it was trained on.
+        # dynamic task objects (e.g. a free box). These dimensions are used by
+        # rollout/state helpers independently of added task bodies.
         base_model = mujoco.MjModel.from_xml_path(str(self.xml_path))
         self.robot_nq = int(base_model.nq)
         self.robot_nv = int(base_model.nv)

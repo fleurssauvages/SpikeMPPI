@@ -207,8 +207,7 @@ class StadiumTrack:
         p = np.asarray(xy, dtype=np.float64)
         scalar = p.ndim == 1
         if scalar:
-            # Allocation-free scalar path. This is used heavily by the policy
-            # nominal and by the online race loop.
+            # Allocation-free scalar path used heavily by the online race loop.
             dx = float(p[0]) - float(self._origin[0])
             dy = float(p[1]) - float(self._origin[1])
             px = dx * self._rot[0, 0] + dy * self._rot[1, 0] + self._canonical_start[0]
