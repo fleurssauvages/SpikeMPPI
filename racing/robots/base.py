@@ -71,10 +71,10 @@ def replace_ant_motors_with_muscles_xml(root: ET.Element) -> list[tuple[str, str
     joint-coordinate scaling.  In particular, the classic Ant reaches angular
     velocities that can push the shortcut far into its force-velocity roll-off.
 
-    Ant-Bio uses an affine one-sided pulling-force law with *instantaneous*
+    Ant-2 uses an affine one-sided pulling-force law with *instantaneous*
     excitation-to-force mapping. Temporal activation/twitch dynamics live in the
-    controller proposal: standard MPPI has none, fixed Spike uses its common
-    twitch kernel, and Spike-Bio uses heterogeneous motor-unit twitch kernels.
+    controller proposal: standard MPPI has none, Poisson uses its common
+    twitch kernel, and Spike uses heterogeneous motor-unit twitch kernels.
     This avoids filtering those controller-side kernels a second time in MuJoCo.
 
     For one original joint with peak motor authority F0, the two actuators obey
@@ -101,15 +101,15 @@ def replace_ant_motors_with_muscles_xml(root: ET.Element) -> list[tuple[str, str
     for index, motor in enumerate(motors):
         if motor.tag != "motor":
             raise ValueError(
-                "ant-bio muscle conversion expects only <motor> actuators; "
+                "ant-2 muscle conversion expects only <motor> actuators; "
                 f"found <{motor.tag}>"
             )
         joint = motor.attrib.get("joint")
         if not joint:
-            raise ValueError("ant-bio muscle conversion requires joint-transmission motors")
+            raise ValueError("ant-2 muscle conversion requires joint-transmission motors")
         gear_values = [float(x) for x in motor.attrib.get("gear", "1").split()]
         if len(gear_values) != 1:
-            raise ValueError("ant-bio currently requires scalar motor gear values")
+            raise ValueError("ant-2 currently requires scalar motor gear values")
         motor_gear = float(gear_values[0])
         if not np.isfinite(motor_gear) or abs(motor_gear) <= 1e-12:
             raise ValueError(f"invalid motor gear for {joint!r}: {motor.attrib.get('gear')!r}")
@@ -216,7 +216,7 @@ class ClassicRobot:
         self.robot_nbody = int(base_model.nbody)
         # Reference generalized-force authority of the original classic motors.
         # For a MuJoCo motor shortcut, force = gain * ctrl and the scalar joint
-        # transmission contributes ``gear`` to qfrc_actuator.  Ant-Bio uses this
+        # transmission contributes ``gear`` to qfrc_actuator.  Ant-2 uses this
         # as a compile-time calibration target instead of assuming that
         # muscle ``force=1`` happens to reproduce the same joint torque.
         if int(base_model.nu):
@@ -240,9 +240,9 @@ class ClassicRobot:
         if self.actuator_model == "muscle":
             pairs: list[tuple[int, int]] = []
             # The converter emits adjacent positive/negative muscles in original
-            # joint-actuator order. Keep explicit indices for Spike-Bio decoding.
+            # joint-actuator order. Keep explicit indices for Spike decoding.
             if int(self.model.nu) % 2 != 0:
-                raise ValueError("ant-bio muscle actuator count must be even")
+                raise ValueError("ant-2 muscle actuator count must be even")
             for k in range(0, int(self.model.nu), 2):
                 pairs.append((k, k + 1))
             self._muscle_pairs = tuple(pairs)
@@ -283,7 +283,7 @@ class ClassicRobot:
     def _calibrate_muscle_force_to_source_motors(self) -> None:
         """Backward-compatible no-op.
 
-        Ant-Bio authority is set analytically in the generated affine force law,
+        Ant-2 authority is set analytically in the generated affine force law,
         with F0 equal to the source motor's peak generalized-force authority.
         """
         if self.is_muscle_model:
@@ -304,7 +304,7 @@ class ClassicRobot:
         Assets are supplied through MuJoCo's in-memory asset mechanism so this
         remains robust for classic XMLs that reference files relative to the
         Gymnasium asset directory. Joint/state topology is preserved; the
-        ``ant-bio`` variant replaces each original motor with an antagonistic
+        ``ant-2`` variant replaces each original motor with an antagonistic
         MuJoCo muscle pair before compilation.
         """
         root = ET.fromstring(Path(self.xml_path).read_text(encoding="utf-8"))
@@ -390,12 +390,12 @@ class ClassicRobot:
 
     @property
     def muscle_force_calibration(self) -> np.ndarray:
-        """Legacy calibration diagnostic; explicit Ant-Bio XML scaling returns ones."""
+        """Legacy calibration diagnostic; explicit Ant-2 XML scaling returns ones."""
         return np.asarray(self._muscle_force_calibration, dtype=np.float64).copy()
 
     @property
     def muscle_peak_force(self) -> np.ndarray:
-        """Peak active pulling-force magnitude F0 for Ant-Bio."""
+        """Peak active pulling-force magnitude F0 for Ant-2."""
         if not self.is_muscle_model:
             return np.zeros(0, dtype=np.float64)
         return np.abs(np.asarray(self.model.actuator_gainprm[:, 0], dtype=np.float64)).copy()
@@ -478,7 +478,7 @@ class ClassicRobot:
         self.model.actuator_forcerange[:] = self._baseline_forcerange
         if self.model.nu:
             if self.is_muscle_model:
-                # Ant-Bio's affine pulling-force law is
+                # Ant-2's affine pulling-force law is
                 #   gain = -F0 - K*length - B*velocity.
                 # Strength mismatch scales the whole force law and its pulling
                 # clamp together, preserving the impedance-to-force ratio.

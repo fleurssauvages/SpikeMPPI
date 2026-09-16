@@ -16,3 +16,10 @@
 /racing/_fused_mujoco.cpython-312-x86_64-linux-gnu.so
 /racing/results/
 /benchmark_scripts
+run_all_evaluations.sh
+racing/experiments/evaluate_common.py
+racing/experiments/evaluate_flat.py
+racing/experiments/evaluate_integrator_mismatch.py
+racing/experiments/evaluate_leg_mismatch.py
+racing/experiments/evaluate_tasks.py
+racing/experiments/evaluate_terrain.py

@@ -9,9 +9,9 @@ def _robot_variant(name: str) -> tuple[str, str, str, str]:
     key = str(name).strip().lower().replace("_", "-").replace(" ", "-")
     if key == "ant":
         return "ant", "motor", "ant", "Ant"
-    if key == "ant-bio":
-        return "ant", "muscle", "ant-bio", "Ant-Bio (antagonistic muscles)"
-    raise KeyError("Unknown robot %r. Available: ant, ant-bio" % (name,))
+    if key == "ant-2":
+        return "ant", "muscle", "ant-2", "Ant-2 (antagonistic actuators)"
+    raise KeyError("Unknown robot %r. Available: ant, ant-2" % (name,))
 
 
 def make_robot(
@@ -33,7 +33,7 @@ def make_robot(
 
 def list_racing_candidates() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for name in ("ant", "ant-bio"):
+    for name in ("ant", "ant-2"):
         try:
             robot = make_robot(name)
             rows.append({

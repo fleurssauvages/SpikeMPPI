@@ -141,7 +141,7 @@ class RaceEnvironmentConfig:
         if self.leg_mismatch == "none":
             return {}
         robot_key = str(robot_name).strip().lower().replace("_", "-")
-        if robot_key not in {"ant", "ant-bio"}:
+        if robot_key not in {"ant", "ant-2"}:
             raise ValueError("--leg-mismatch is currently supported only with Ant robot variants")
         short = float(self.short_leg_scale)
         long = float(self.long_leg_scale)

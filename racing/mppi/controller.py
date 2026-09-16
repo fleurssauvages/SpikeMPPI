@@ -17,8 +17,8 @@ from .rollout import (
     refine_control_nominal,
 )
 from .fast_kernels import NUMBA_AVAILABLE, lbps_optimize_fast
-from .spike_kernels import StaticSpikeSampler, resolve_spike_sampler
-from .bio_motor_pool import BioMotorPoolSampler
+from .poisson_kernels import StaticPoissonSampler, resolve_poisson_sampler
+from .spike_motor_pool import SpikeMotorPoolSampler
 
 
 class SamplingOption(str, Enum):
@@ -29,8 +29,8 @@ class SamplingOption(str, Enum):
     DIAG_LOWRANK = "diag-lowrank"
     SPLINE = "spline"
     ICEM = "icem"
+    POISSON = "poisson"
     SPIKE = "spike"
-    SPIKE_BIO = "spike-bio"
 
 
 @dataclass
@@ -59,35 +59,35 @@ class ControllerConfig:
     spline_modes: int = 6
     icem_elites: int = 4
 
-    # Shared marked-Poisson/twitch physiology. ``spike`` uses one independent
+    # Shared marked-Poisson/twitch physiology. ``poisson`` uses one independent
     # point-process drive per original joint/motor pool and an ordered motor-unit
-    # recruitment mark. On Ant-Bio, event sign selects the agonist/antagonist
+    # recruitment mark. On Ant-2, event sign selects the agonist/antagonist
     # muscle before twitch filtering.
     # Event timing remains fixed Poisson; only the event mark selects recruitment
     # depth through the size-principle-inspired pool.
-    spike_rate_hz: float = 8.0
-    spike_recruitment_levels: int = 6
-    spike_sampler: str = "auto"
-    # ``variance`` keeps Spike-MPPI exploration power matched to standard
+    base_rate_hz: float = 8.0
+    recruitment_levels: int = 6
+    poisson_sampler: str = "auto"
+    # ``variance`` keeps Poisson-MPPI exploration power matched to standard
     # Gaussian MPPI. ``peak`` makes one isolated full-recruitment twitch peak
     # at exactly the configured per-joint noise scale. Overlapping events can
     # still sum above that level, so ``peak`` is not a hard noise bound.
-    spike_scale_mode: str = "variance"
+    proposal_scale_mode: str = "variance"
 
 
-    spike_twitch_rise_s: float = 0.016
-    spike_twitch_decay_s: float = 0.064
-    spike_twitch_duration_s: float = 0.200
+    twitch_rise_s: float = 0.016
+    twitch_decay_s: float = 0.064
+    twitch_duration_s: float = 0.200
 
-    # Spike-Bio proposal-shape parameters.
+    # Spike proposal-shape parameters.
     # Physiological constants (recruitment thresholds, firing-rate range,
     # refractory/renewal statistics, hysteresis and twitch heterogeneity) stay
     # fixed; these two parameters are the intended HPO surface.
-    bio_drive_sigma: float = 0.20
-    bio_drive_tau_s: float = 0.05
+    spike_drive_sigma: float = 0.20
+    spike_drive_tau_s: float = 0.05
 
     # Optional full-horizon multi-fidelity screening for standard Gaussian or
-    # Spike-MPPI sampling. Both values at zero recover the unscreened path.
+    # Poisson/Spike sampling. Both values at zero recover the unscreened path.
     # When enabled, ``screen_pool_size`` candidates are ranked with the existing
     # full-horizon implicitfast preview and only ``num_rollouts`` are evaluated
     # at full fidelity.
@@ -164,23 +164,23 @@ class ControllerConfig:
             raise ValueError("diag_lowrank_max must be >= diag_lowrank_min")
         self.spline_modes = max(4, int(self.spline_modes))
         self.icem_elites = max(0, int(self.icem_elites))
-        if self.spike_sampler not in {"auto", "numpy", "numba"}:
-            raise ValueError("spike_sampler must be auto, numpy, or numba")
-        if self.spike_scale_mode not in {"variance", "peak"}:
-            raise ValueError("spike_scale_mode must be variance or peak")
-        if not np.isfinite(self.spike_rate_hz) or self.spike_rate_hz <= 0:
-            raise ValueError("spike_rate_hz must be finite and positive")
-        if not np.isfinite(self.bio_drive_sigma) or self.bio_drive_sigma <= 0.0:
-            raise ValueError("bio_drive_sigma must be finite and positive")
-        if not np.isfinite(self.bio_drive_tau_s) or self.bio_drive_tau_s <= 0.0:
-            raise ValueError("bio_drive_tau_s must be finite and positive")
-        self.spike_recruitment_levels = max(1, int(self.spike_recruitment_levels))
-        if self.spike_twitch_rise_s <= 0.0:
-            raise ValueError("spike_twitch_rise_s must be positive")
-        if self.spike_twitch_decay_s <= self.spike_twitch_rise_s:
-            raise ValueError("spike_twitch_decay_s must be greater than spike_twitch_rise_s")
-        if self.spike_twitch_duration_s <= 0.0:
-            raise ValueError("spike_twitch_duration_s must be positive")
+        if self.poisson_sampler not in {"auto", "numpy", "numba"}:
+            raise ValueError("poisson_sampler must be auto, numpy, or numba")
+        if self.proposal_scale_mode not in {"variance", "peak"}:
+            raise ValueError("proposal_scale_mode must be variance or peak")
+        if not np.isfinite(self.base_rate_hz) or self.base_rate_hz <= 0:
+            raise ValueError("base_rate_hz must be finite and positive")
+        if not np.isfinite(self.spike_drive_sigma) or self.spike_drive_sigma <= 0.0:
+            raise ValueError("spike_drive_sigma must be finite and positive")
+        if not np.isfinite(self.spike_drive_tau_s) or self.spike_drive_tau_s <= 0.0:
+            raise ValueError("spike_drive_tau_s must be finite and positive")
+        self.recruitment_levels = max(1, int(self.recruitment_levels))
+        if self.twitch_rise_s <= 0.0:
+            raise ValueError("twitch_rise_s must be positive")
+        if self.twitch_decay_s <= self.twitch_rise_s:
+            raise ValueError("twitch_decay_s must be greater than twitch_rise_s")
+        if self.twitch_duration_s <= 0.0:
+            raise ValueError("twitch_duration_s must be positive")
         self.screen_pool_size = max(0, int(self.screen_pool_size))
         self.screen_exploit = max(0, int(self.screen_exploit))
         self.screen_audit_every = max(0, int(self.screen_audit_every))
@@ -228,12 +228,12 @@ class JointMPPIController:
         self.sampling = SamplingOption(sampling)
         screen_requested = cfg.screen_pool_size > 0 and cfg.screen_exploit > 0
         self._screen_enabled = (
-            self.sampling in {SamplingOption.STANDARD, SamplingOption.SPIKE, SamplingOption.SPIKE_BIO}
+            self.sampling in {SamplingOption.STANDARD, SamplingOption.POISSON, SamplingOption.SPIKE}
             and screen_requested
         )
-        if screen_requested and self.sampling not in {SamplingOption.STANDARD, SamplingOption.SPIKE, SamplingOption.SPIKE_BIO}:
+        if screen_requested and self.sampling not in {SamplingOption.STANDARD, SamplingOption.POISSON, SamplingOption.SPIKE}:
             raise ValueError(
-                "--screen-pool/--screen-exploit are only valid with --sampling standard, spike, or spike-bio"
+                "--screen-pool/--screen-exploit are only valid with --sampling standard, spike, or spike"
             )
         self.rng = np.random.default_rng(int(seed))
         ratio = float(cfg.control_dt) / max(float(robot.physics_dt), 1e-12)
@@ -288,86 +288,86 @@ class JointMPPIController:
         self._diag_variance = np.ones((cfg.horizon, robot.nu), dtype=np.float64)
         self._icem_elites: np.ndarray | None = None
         self._spline_basis = self._make_bspline_basis(cfg.horizon, cfg.spline_modes)
-        self._spike_sampler_backend = (
-            resolve_spike_sampler(cfg.spike_sampler)
-            if self.sampling == SamplingOption.SPIKE
-            else ("numba-bio" if self.sampling == SamplingOption.SPIKE_BIO else "unused")
+        self._poisson_sampler_backend = (
+            resolve_poisson_sampler(cfg.poisson_sampler)
+            if self.sampling == SamplingOption.POISSON
+            else ("numba-spike" if self.sampling == SamplingOption.SPIKE else "unused")
         )
         (
-            self._spike_levels,
-            self._spike_level_prior,
-            self._spike_motor_unit_strengths,
-        ) = self._make_recruitment_marks(cfg.spike_recruitment_levels)
-        self._spike_twitch = self._make_spike_twitch_kernel(
+            self._poisson_levels,
+            self._poisson_level_prior,
+            self._poisson_motor_unit_strengths,
+        ) = self._make_recruitment_marks(cfg.recruitment_levels)
+        self._poisson_twitch = self._make_poisson_twitch_kernel(
             cfg.control_dt,
-            cfg.spike_twitch_rise_s,
-            cfg.spike_twitch_decay_s,
-            cfg.spike_twitch_duration_s,
+            cfg.twitch_rise_s,
+            cfg.twitch_decay_s,
+            cfg.twitch_duration_s,
         )
         h = int(cfg.horizon)
-        # ``spike`` keeps one point-process channel per original Ant joint. On
-        # Ant-Bio, positive and negative events are decoded *before filtering*
+        # ``poisson`` keeps one point-process channel per original Ant joint. On
+        # Ant-2, positive and negative events are decoded *before filtering*
         # into separate agonist/antagonist muscle channels, giving a native 16-D
         # physical control trajectory while preserving the original event budget.
         m = int(getattr(robot, "motor_pool_count", robot.nu))
-        self._spike_synergies = np.eye(m, dtype=np.float64)
-        spike_shape = (h, m)
-        self._spike_total_rate_hz = float(m) * float(cfg.spike_rate_hz)
-        per_channel_rate = self._spike_total_rate_hz / float(m)
+        self._poisson_channels = np.eye(m, dtype=np.float64)
+        poisson_shape = (h, m)
+        self._poisson_total_rate_hz = float(m) * float(cfg.base_rate_hz)
+        per_channel_rate = self._poisson_total_rate_hz / float(m)
         half_base = 0.5 * per_channel_rate
-        self._spike_pos_rate_map = np.full(spike_shape, half_base, dtype=np.float64)
-        self._spike_neg_rate_map = np.full(spike_shape, half_base, dtype=np.float64)
-        self._spike_mark_prob_map = np.broadcast_to(
-            self._spike_level_prior, spike_shape + (len(self._spike_levels),)
+        self._poisson_pos_rate_map = np.full(poisson_shape, half_base, dtype=np.float64)
+        self._poisson_neg_rate_map = np.full(poisson_shape, half_base, dtype=np.float64)
+        self._poisson_mark_prob_map = np.broadcast_to(
+            self._poisson_level_prior, poisson_shape + (len(self._poisson_levels),)
         ).copy()
-        for array in (self._spike_pos_rate_map, self._spike_neg_rate_map,
-                      self._spike_mark_prob_map):
+        for array in (self._poisson_pos_rate_map, self._poisson_neg_rate_map,
+                      self._poisson_mark_prob_map):
             array.flags.writeable = False
-        self._last_spike_event_count_mean = 0.0
-        k2_prefix = np.cumsum(self._spike_twitch ** 2)
+        self._last_event_count_mean = 0.0
+        k2_prefix = np.cumsum(self._poisson_twitch ** 2)
         remaining = np.minimum(np.arange(h, 0, -1), len(k2_prefix))
-        self._spike_variance_weights = k2_prefix[remaining - 1] / float(h)
-        self._spike_variance_match_scale = self._compute_spike_global_noise_scale()
-        self._spike_global_noise_scale = (
+        self._poisson_variance_weights = k2_prefix[remaining - 1] / float(h)
+        self._poisson_variance_match_scale = self._compute_poisson_global_noise_scale()
+        self._poisson_global_noise_scale = (
             1.0
-            if cfg.spike_scale_mode == "peak"
-            else self._spike_variance_match_scale
+            if cfg.proposal_scale_mode == "peak"
+            else self._poisson_variance_match_scale
         )
+        self._poisson_generator = None
         self._spike_generator = None
-        self._bio_spike_generator = None
-        self._bio_last_stats: dict[str, float] = {}
-        self._bio_variance_match_scale = math.nan
-        self._bio_global_noise_scale = math.nan
-        spike_n = cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts
-        if self.sampling == SamplingOption.SPIKE:
-            self._spike_generator = StaticSpikeSampler(
-                self._spike_pos_rate_map, self._spike_neg_rate_map,
-                self._spike_mark_prob_map, self._spike_levels,
-                cfg.control_dt, spike_n, self._spike_twitch,
-                backend=self._spike_sampler_backend,
+        self._spike_last_stats: dict[str, float] = {}
+        self._spike_variance_match_scale = math.nan
+        self._spike_global_noise_scale = math.nan
+        proposal_n = cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts
+        if self.sampling == SamplingOption.POISSON:
+            self._poisson_generator = StaticPoissonSampler(
+                self._poisson_pos_rate_map, self._poisson_neg_rate_map,
+                self._poisson_mark_prob_map, self._poisson_levels,
+                cfg.control_dt, proposal_n, self._poisson_twitch,
+                backend=self._poisson_sampler_backend,
             )
-        elif self.sampling == SamplingOption.SPIKE_BIO:
-            self._bio_spike_generator = BioMotorPoolSampler(
-                n=spike_n, h=h, nu=int(getattr(robot, "motor_pool_count", robot.nu)),
+        elif self.sampling == SamplingOption.SPIKE:
+            self._spike_generator = SpikeMotorPoolSampler(
+                n=proposal_n, h=h, nu=int(getattr(robot, "motor_pool_count", robot.nu)),
                 dt=cfg.control_dt,
-                levels=cfg.spike_recruitment_levels,
-                base_rate_hz=cfg.spike_rate_hz,
-                twitch_rise_s=cfg.spike_twitch_rise_s,
-                twitch_decay_s=cfg.spike_twitch_decay_s,
-                twitch_duration_s=cfg.spike_twitch_duration_s,
-                drive_sigma=cfg.bio_drive_sigma,
-                drive_tau_s=cfg.bio_drive_tau_s,
+                levels=cfg.recruitment_levels,
+                base_rate_hz=cfg.base_rate_hz,
+                twitch_rise_s=cfg.twitch_rise_s,
+                twitch_decay_s=cfg.twitch_decay_s,
+                twitch_duration_s=cfg.twitch_duration_s,
+                drive_sigma=cfg.spike_drive_sigma,
+                drive_tau_s=cfg.spike_drive_tau_s,
                 separate_antagonists=bool(getattr(robot, "is_muscle_model", False)),
             )
-            bio_rms = self._bio_spike_generator.estimate_unit_rms()
-            self._bio_variance_match_scale = 1.0 / max(bio_rms, 1e-12)
-            self._bio_global_noise_scale = (
-                1.0 if cfg.spike_scale_mode == "peak" else self._bio_variance_match_scale
+            spike_rms = self._spike_generator.estimate_unit_rms()
+            self._spike_variance_match_scale = 1.0 / max(spike_rms, 1e-12)
+            self._spike_global_noise_scale = (
+                1.0 if cfg.proposal_scale_mode == "peak" else self._spike_variance_match_scale
             )
         self._screen_step = 0
         self._last_screen_diag: dict[str, float] = {}
 
-        self._fixed_spike_diagnostics = self._make_fixed_spike_diagnostics()
+        self._fixed_poisson_diagnostics = self._make_fixed_poisson_diagnostics()
 
         # Online MPPI is CPU-only. Prefer the allocation-light fused C++
         # evaluator, then stock mujoco.rollout, then the Python fallback.
@@ -419,35 +419,35 @@ class JointMPPIController:
             return f"spline latent sampling: cubic B-spline modes={self._spline_basis.shape[1]} per joint"
         if self.sampling == SamplingOption.ICEM:
             return f"iCEM-style elite reuse: shifted_elites={self.cfg.icem_elites}"
-        if self.sampling == SamplingOption.SPIKE:
+        if self.sampling == SamplingOption.POISSON:
             if self._screen_enabled:
                 return (
-                    "Spike-MPPI with optional full-horizon screening: fixed direct-joint "
+                    "Poisson-MPPI with optional full-horizon screening: fixed direct-joint "
                     "Poisson events + ordered motor-unit recruitment + causal twitch; "
                     f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
                     f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
-                    f"scale={self.cfg.spike_scale_mode}, preview=implicitfast, full update unchanged, "
-                    f"implementation={self._spike_sampler_backend}"
+                    f"scale={self.cfg.proposal_scale_mode}, preview=implicitfast, full update unchanged, "
+                    f"implementation={self._poisson_sampler_backend}"
                 )
-            spike_channels = int(self._spike_synergies.shape[0])
+            poisson_channels = int(self._poisson_channels.shape[0])
             decode = (
                 f"sign-split to {self.robot.nu} antagonistic muscle controls"
                 if bool(getattr(self.robot, "is_muscle_model", False))
                 else f"identity decode to {self.robot.nu} controls"
             )
             return (
-                "Spike-MPPI: fixed Poisson events + ordered motor-unit recruitment + causal twitch; "
-                f"event_channels={spike_channels}, {decode}, motor_units={len(self._spike_levels)}, "
-                f"base_rate={self.cfg.spike_rate_hz:g}Hz, scale={self.cfg.spike_scale_mode}, "
-                f"no learning, implementation={self._spike_sampler_backend}"
+                "Poisson-MPPI: fixed Poisson events + ordered motor-unit recruitment + causal twitch; "
+                f"event_channels={poisson_channels}, {decode}, motor_units={len(self._poisson_levels)}, "
+                f"base_rate={self.cfg.base_rate_hz:g}Hz, scale={self.cfg.proposal_scale_mode}, "
+                f"no learning, implementation={self._poisson_sampler_backend}"
             )
-        if self.sampling == SamplingOption.SPIKE_BIO:
-            pool = self._bio_spike_generator
+        if self.sampling == SamplingOption.SPIKE:
+            pool = self._spike_generator
             return (
-                "Bio Spike-MPPI: antagonistic motor pools + common drive + ordered threshold recruitment + "
+                "Spike-MPPI: antagonistic motor pools + common drive + ordered threshold recruitment + "
                 "rate coding + refractory gamma-renewal firing + heterogeneous twitches + hysteresis; "
-                f"motor_units={self.cfg.spike_recruitment_levels}/pool, min_rate={self.cfg.spike_rate_hz:g}Hz, "
-                f"max_rate={pool.max_rate_hz:g}Hz, scale={self.cfg.spike_scale_mode}, implementation=numba"
+                f"motor_units={self.cfg.recruitment_levels}/pool, min_rate={self.cfg.base_rate_hz:g}Hz, "
+                f"max_rate={pool.max_rate_hz:g}Hz, scale={self.cfg.proposal_scale_mode}, implementation=numba"
             )
         if self.sampling == SamplingOption.STANDARD and self._screen_enabled:
             return (
@@ -570,7 +570,7 @@ class JointMPPIController:
     def _sample_standard(self, nominal: np.ndarray, *, count: int | None = None) -> np.ndarray:
         """Standard Gaussian MPPI in the robot's native actuator space.
 
-        Ant-Bio therefore uses 16 independent nonnegative muscle channels; no
+        Ant-2 therefore uses 16 independent nonnegative muscle channels; no
         half-wave decoder or twitch filter is applied to the standard baseline.
         """
         n = self.cfg.num_rollouts if count is None else max(1, int(count))
@@ -708,7 +708,7 @@ class JointMPPIController:
         return z
 
     @staticmethod
-    def _make_spike_twitch_kernel(
+    def _make_poisson_twitch_kernel(
         control_dt: float,
         rise_s: float,
         decay_s: float,
@@ -764,7 +764,7 @@ class JointMPPIController:
 
         return amplitudes, prior, unit_strengths
 
-    def _compute_spike_global_noise_scale(self) -> float:
+    def _compute_poisson_global_noise_scale(self) -> float:
         """Match only the *global* uniform-law motor power to the 8-neuron identity baseline.
 
         There is intentionally no per-joint variance matching.  Every sparse
@@ -774,138 +774,137 @@ class JointMPPIController:
         natural anisotropy from primitive wiring and learned spike statistics.
         """
         total_rate = np.asarray(
-            self._spike_pos_rate_map + self._spike_neg_rate_map, dtype=np.float64
+            self._poisson_pos_rate_map + self._poisson_neg_rate_map, dtype=np.float64
         )
-        mark_prob = np.asarray(self._spike_mark_prob_map, dtype=np.float64)
-        mark_sq = self._spike_levels * self._spike_levels
+        mark_prob = np.asarray(self._poisson_mark_prob_map, dtype=np.float64)
+        mark_sq = self._poisson_levels * self._poisson_levels
         expected_mark_sq = np.sum(mark_prob * mark_sq[None, None, :], axis=-1)
         impulse_variance = float(self.cfg.control_dt) * total_rate * expected_mark_sq
-        channel_variance = self._spike_variance_weights @ impulse_variance
+        channel_variance = self._poisson_variance_weights @ impulse_variance
         total_motor_variance = float(
-            np.sum(channel_variance * np.sum(self._spike_synergies ** 2, axis=1))
+            np.sum(channel_variance * np.sum(self._poisson_channels ** 2, axis=1))
         )
-        # For Ant-Bio the signed point process is split into two physical muscle
+        # For Ant-2 the signed point process is split into two physical muscle
         # channels. Total variance is conserved by Poisson thinning, so divide by
         # all 16 actuator coordinates to match standard MPPI per muscle channel.
         variance_dim = int(self.robot.nu)
         mean_motor_variance = total_motor_variance / float(max(variance_dim, 1))
         return 1.0 / math.sqrt(max(mean_motor_variance, 1e-12))
 
-    def _make_fixed_spike_diagnostics(self) -> dict[str, float]:
-        """Diagnostics for the fixed direct-joint Spike baseline."""
-        m = int(self._spike_synergies.shape[0])
-        levels = len(self._spike_levels)
-        total_rate = float(self._spike_total_rate_hz)
+    def _make_fixed_poisson_diagnostics(self) -> dict[str, float]:
+        """Diagnostics for the fixed direct-joint Poisson baseline."""
+        m = int(self._poisson_channels.shape[0])
+        levels = len(self._poisson_levels)
+        total_rate = float(self._poisson_total_rate_hz)
         per_rate = total_rate / max(m, 1)
         out = {
-            "spike_rate_hz_mean": per_rate, "spike_rate_hz_std": 0.0,
-            "spike_rate_hz_min": per_rate, "spike_rate_hz_max": per_rate,
-            "spike_pos_rate_hz_min": per_rate / 2, "spike_pos_rate_hz_max": per_rate / 2,
-            "spike_neg_rate_hz_min": per_rate / 2, "spike_neg_rate_hz_max": per_rate / 2,
-            "spike_sign_prob_min": 0.5, "spike_sign_prob_max": 0.5,
-            "spike_sign_entropy": 1.0,
-            "spike_recruitment_entropy": float(levels > 1),
-            "spike_mark_entropy_mean": float(levels > 1),
-            "spike_mark_prob_min": 1.0 / levels, "spike_mark_prob_max": 1.0 / levels,
-            "spike_mean_recruitment": float(np.mean(self._spike_levels)),
-            "spike_motor_unit_pool_size": float(levels),
-            "spike_mean_recruited_units": float((levels + 1) / 2.0),
-            "spike_mean_recruited_fraction": float((levels + 1) / (2.0 * levels)),
-            "spike_low_threshold_unit_fraction": float(self._spike_motor_unit_strengths[0]),
-            "spike_high_threshold_unit_fraction": float(self._spike_motor_unit_strengths[-1]),
-            "spike_effective_synergies": float(m) if self.sampling == SamplingOption.SPIKE else math.nan,
-            "spike_synergy_entropy": float(m > 1) if self.sampling == SamplingOption.SPIKE else math.nan,
-            "spike_expected_events": self.cfg.control_dt * self.cfg.horizon * total_rate,
-            "spike_total_rate_hz": total_rate,
-            "spike_event_budget_fixed": 1.0,
-            "spike_firing_fixed": float(self.sampling == SamplingOption.SPIKE),
-            "spike_noise_scale": float(self._spike_global_noise_scale),
-            "spike_variance_match_scale": float(self._spike_variance_match_scale),
-            "spike_expected_rms_ratio": float(
-                self._spike_global_noise_scale / max(self._spike_variance_match_scale, 1e-12)
+            "poisson_rate_hz_mean": per_rate, "poisson_rate_hz_std": 0.0,
+            "poisson_rate_hz_min": per_rate, "poisson_rate_hz_max": per_rate,
+            "poisson_pos_rate_hz_min": per_rate / 2, "poisson_pos_rate_hz_max": per_rate / 2,
+            "poisson_neg_rate_hz_min": per_rate / 2, "poisson_neg_rate_hz_max": per_rate / 2,
+            "poisson_sign_prob_min": 0.5, "poisson_sign_prob_max": 0.5,
+            "poisson_sign_entropy": 1.0,
+            "poisson_recruitment_entropy": float(levels > 1),
+            "poisson_mark_entropy_mean": float(levels > 1),
+            "poisson_mark_prob_min": 1.0 / levels, "poisson_mark_prob_max": 1.0 / levels,
+            "poisson_mean_recruitment": float(np.mean(self._poisson_levels)),
+            "poisson_motor_unit_pool_size": float(levels),
+            "poisson_mean_recruited_units": float((levels + 1) / 2.0),
+            "poisson_mean_recruited_fraction": float((levels + 1) / (2.0 * levels)),
+            "poisson_low_threshold_unit_fraction": float(self._poisson_motor_unit_strengths[0]),
+            "poisson_high_threshold_unit_fraction": float(self._poisson_motor_unit_strengths[-1]),
+            "poisson_event_channels": float(m) if self.sampling == SamplingOption.POISSON else math.nan,
+            "poisson_expected_events": self.cfg.control_dt * self.cfg.horizon * total_rate,
+            "poisson_total_rate_hz": total_rate,
+            "poisson_event_budget_fixed": 1.0,
+            "poisson_firing_fixed": float(self.sampling == SamplingOption.POISSON),
+            "poisson_noise_scale": float(self._poisson_global_noise_scale),
+            "poisson_variance_match_scale": float(self._poisson_variance_match_scale),
+            "poisson_expected_rms_ratio": float(
+                self._poisson_global_noise_scale / max(self._poisson_variance_match_scale, 1e-12)
             ),
-            "spike_peak_scale_mode": float(self.cfg.spike_scale_mode == "peak"),
+            "poisson_peak_scale_mode": float(self.cfg.proposal_scale_mode == "peak"),
         }
-        if self.sampling != SamplingOption.SPIKE:
+        if self.sampling != SamplingOption.POISSON:
             return {key: math.nan for key in out}
         return out
 
-    def _spike_diagnostics(self) -> dict[str, float]:
+    def _event_diagnostics(self) -> dict[str, float]:
+        if self.sampling == SamplingOption.POISSON:
+            return self._fixed_poisson_diagnostics
         if self.sampling == SamplingOption.SPIKE:
-            return self._fixed_spike_diagnostics
-        if self.sampling == SamplingOption.SPIKE_BIO:
-            out = {key: math.nan for key in self._fixed_spike_diagnostics}
+            out = {key: math.nan for key in self._fixed_poisson_diagnostics}
             out.update({
-                "spike_rate_hz_mean": float(self.cfg.spike_rate_hz),
-                "spike_rate_hz_min": float(self.cfg.spike_rate_hz),
-                "spike_rate_hz_max": float(3.0 * self.cfg.spike_rate_hz),
-                "spike_motor_unit_pool_size": float(self.cfg.spike_recruitment_levels),
-                "spike_noise_scale": float(self._bio_global_noise_scale),
-                "spike_variance_match_scale": float(self._bio_variance_match_scale),
+                "spike_rate_hz_mean": float(self.cfg.base_rate_hz),
+                "spike_rate_hz_min": float(self.cfg.base_rate_hz),
+                "spike_rate_hz_max": float(3.0 * self.cfg.base_rate_hz),
+                "spike_motor_unit_pool_size": float(self.cfg.recruitment_levels),
+                "spike_noise_scale": float(self._spike_global_noise_scale),
+                "spike_variance_match_scale": float(self._spike_variance_match_scale),
                 "spike_expected_rms_ratio": float(
-                    self._bio_global_noise_scale / max(self._bio_variance_match_scale, 1e-12)
+                    self._spike_global_noise_scale / max(self._spike_variance_match_scale, 1e-12)
                 ),
-                "spike_peak_scale_mode": float(self.cfg.spike_scale_mode == "peak"),
+                "spike_peak_scale_mode": float(self.cfg.proposal_scale_mode == "peak"),
                 "spike_firing_fixed": 0.0,
             })
-            out.update(self._bio_last_stats)
+            out.update(self._spike_last_stats)
             return out
-        return {key: math.nan for key in self._fixed_spike_diagnostics}
+        return {key: math.nan for key in self._fixed_poisson_diagnostics}
 
-    def _sample_spike(self, nominal: np.ndarray) -> np.ndarray:
-        """Fixed Spike baseline in native actuator space.
+    def _sample_poisson(self, nominal: np.ndarray) -> np.ndarray:
+        """Fixed Poisson proposal in native actuator space.
 
-        On Ant-Bio each joint owns two physical muscle channels. Positive events
+        On Ant-2 each joint owns two physical muscle channels. Positive events
         are routed to the agonist channel and negative events to the antagonist
         channel before the common twitch kernel is applied. Both muscle channels
         may therefore overlap in time and express genuine co-contraction.
         """
-        if self._spike_generator is None:
-            raise RuntimeError("Spike generator is unavailable")
+        if self._poisson_generator is None:
+            raise RuntimeError("Poisson generator is unavailable")
         if bool(getattr(self.robot, "is_muscle_model", False)):
-            z, event_total = self._spike_generator.sample_projected_antagonistic_pairs(self.rng)
+            z, event_total = self._poisson_generator.sample_projected_antagonistic_pairs(self.rng)
             n = int(z.shape[0])
             # Each physical muscle receives only nonnegative twitch events. Center
             # across rollouts before the additive MPPI update, exactly as in
-            # Spike-Bio, so warm-started muscle activations can move both up and
+            # Spike, so warm-started muscle activations can move both up and
             # down without introducing a common positive drift.
             z -= np.mean(z, axis=0, keepdims=True)
-            z *= self._spike_global_noise_scale
+            z *= self._poisson_global_noise_scale
             # Scale every physical muscle channel exactly like standard MPPI's
             # 16-D control coordinates.
             z *= self._joint_std[None, None, :]
             z += nominal[None, :, :]
             np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
         else:
-            z, event_total = self._spike_generator.sample_projected_identity(self.rng)
+            z, event_total = self._poisson_generator.sample_projected_identity(self.rng)
             n = int(z.shape[0])
-            z *= self._spike_global_noise_scale
+            z *= self._poisson_global_noise_scale
             z *= self._joint_std[None, None, :]
             z += nominal[None, :, :]
             np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
-        self._last_spike_event_count_mean = float(event_total) / n
+        self._last_event_count_mean = float(event_total) / n
         return z
 
-    def _sample_spike_bio(self, nominal: np.ndarray) -> np.ndarray:
+    def _sample_spike(self, nominal: np.ndarray) -> np.ndarray:
         """Biological motor-pool proposal with zero-mean MPPI perturbations."""
-        if self._bio_spike_generator is None:
-            raise RuntimeError("Bio motor-pool Spike generator is unavailable")
-        z, stats = self._bio_spike_generator.sample(self.rng)
+        if self._spike_generator is None:
+            raise RuntimeError("Spike motor-pool generator is unavailable")
+        z, stats = self._spike_generator.sample(self.rng)
         if bool(getattr(self.robot, "is_muscle_model", False)):
             # Separate antagonist twitches are nonnegative physical excitations,
             # but MPPI requires an additive perturbation around its warm-start
             # nominal. Remove the proposal mean while preserving joint/pool
             # covariance, including genuine common-mode co-contraction structure.
             z -= np.mean(z, axis=0, keepdims=True)
-            z *= self._bio_global_noise_scale
+            z *= self._spike_global_noise_scale
             z *= self._joint_std[None, None, :]
         else:
-            z *= self._bio_global_noise_scale
+            z *= self._spike_global_noise_scale
             z *= self._joint_std[None, None, :]
         z += nominal[None, :, :]
         np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
-        self._bio_last_stats = dict(stats)
-        self._last_spike_event_count_mean = float(stats.get("spike_events_mean", 0.0))
+        self._spike_last_stats = dict(stats)
+        self._last_event_count_mean = float(stats.get("spike_events_mean", 0.0))
         return z
 
     def _screen_population(
@@ -1133,10 +1132,10 @@ class JointMPPIController:
             controls = self._sample_spline(nominal)
         elif self.sampling == SamplingOption.ICEM:
             controls = self._sample_icem(nominal)
+        elif self.sampling == SamplingOption.POISSON:
+            controls = self._sample_poisson(nominal)
         elif self.sampling == SamplingOption.SPIKE:
             controls = self._sample_spike(nominal)
-        elif self.sampling == SamplingOption.SPIKE_BIO:
-            controls = self._sample_spike_bio(nominal)
         else:
             controls = self._sample_standard(
                 nominal,
@@ -1357,14 +1356,14 @@ class JointMPPIController:
         sat_tol = 1e-6 * np.maximum(self._ctrl_high - self._ctrl_low, 1.0)
         applied_lower_bound_fraction = float(np.mean(ctrl0 <= self._ctrl_low + sat_tol))
         applied_upper_bound_fraction = float(np.mean(ctrl0 >= self._ctrl_high - sat_tol))
-        # Backward-compatible any-bound metric. For Ant-Bio, a zero muscle
+        # Backward-compatible any-bound metric. For Ant-2, a zero muscle
         # excitation is ordinary inactivity rather than pathological saturation;
         # paper-facing analysis should therefore prefer the separate upper-bound
         # metric when discussing actuator saturation.
         applied_saturation_fraction = float(
             np.mean((ctrl0 <= self._ctrl_low + sat_tol) | (ctrl0 >= self._ctrl_high - sat_tol))
         )
-        spike_diag = self._spike_diagnostics()
+        spike_diag = self._event_diagnostics()
 
         info = {
             "planned_control_sequence": candidate,
@@ -1394,10 +1393,11 @@ class JointMPPIController:
                 if self.sampling == SamplingOption.DIAG_LOWRANK else 1.0
             ),
             "icem_elites": 0 if self._icem_elites is None else int(len(self._icem_elites)),
-            "spike_sampler_backend": self._spike_sampler_backend,
+            "poisson_sampler_backend": self._poisson_sampler_backend,
             "nominal_geometry_evaluated": bool(len(refined.positions)),
-            "spike_synergies": int(self._spike_synergies.shape[0]),
-            "spike_events_mean": float(self._last_spike_event_count_mean),
+            "poisson_event_channels": int(self._poisson_channels.shape[0]) if self.sampling == SamplingOption.POISSON else math.nan,
+            "poisson_events_mean": float(self._last_event_count_mean) if self.sampling == SamplingOption.POISSON else math.nan,
+            "spike_events_mean": float(self._last_event_count_mean) if self.sampling == SamplingOption.SPIKE else math.nan,
             **spike_diag,
             **screen_diag,
             "nominal_cost": nominal_cost,

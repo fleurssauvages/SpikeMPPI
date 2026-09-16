@@ -57,6 +57,8 @@ class RaceResult:
     plant_parameters: ModelParameterScales
     profile_summary: dict[str, float] = field(default_factory=dict)
     diagnostics_summary: dict[str, float] = field(default_factory=dict)
+    step_diagnostics: dict[str, np.ndarray] = field(default_factory=dict)
+    step_timing_ms: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 def run_race(
@@ -78,14 +80,14 @@ def run_race(
     diag_lowrank_max: float = 4.0,
     spline_modes: int = 6,
     icem_elites: int = 4,
-    spike_rate_hz: float = 8.0,
-    spike_recruitment_levels: int = 6,
-    spike_scale_mode: str = "variance",
-    spike_twitch_rise_s: float = 0.016,
-    spike_twitch_decay_s: float = 0.064,
-    spike_twitch_duration_s: float = 0.200,
-    bio_drive_sigma: float = 0.20,
-    bio_drive_tau_s: float = 0.05,
+    base_rate_hz: float = 8.0,
+    recruitment_levels: int = 6,
+    proposal_scale_mode: str = "variance",
+    twitch_rise_s: float = 0.016,
+    twitch_decay_s: float = 0.064,
+    twitch_duration_s: float = 0.200,
+    spike_drive_sigma: float = 0.20,
+    spike_drive_tau_s: float = 0.05,
     screen_pool: int = 0,
     screen_exploit: int = 0,
     audit: int = 0,
@@ -310,14 +312,14 @@ def run_race(
         diag_lowrank_max=float(diag_lowrank_max),
         spline_modes=int(spline_modes),
         icem_elites=int(icem_elites),
-        spike_rate_hz=float(spike_rate_hz),
-        spike_recruitment_levels=int(spike_recruitment_levels),
-        spike_scale_mode=str(spike_scale_mode),
-        spike_twitch_rise_s=float(spike_twitch_rise_s),
-        spike_twitch_decay_s=float(spike_twitch_decay_s),
-        spike_twitch_duration_s=float(spike_twitch_duration_s),
-        bio_drive_sigma=float(bio_drive_sigma),
-        bio_drive_tau_s=float(bio_drive_tau_s),
+        base_rate_hz=float(base_rate_hz),
+        recruitment_levels=int(recruitment_levels),
+        proposal_scale_mode=str(proposal_scale_mode),
+        twitch_rise_s=float(twitch_rise_s),
+        twitch_decay_s=float(twitch_decay_s),
+        twitch_duration_s=float(twitch_duration_s),
+        spike_drive_sigma=float(spike_drive_sigma),
+        spike_drive_tau_s=float(spike_drive_tau_s),
         screen_pool_size=int(screen_pool),
         screen_exploit=int(screen_exploit),
         screen_audit_every=int(audit),
@@ -373,6 +375,7 @@ def run_race(
     fell = False
     profile_rows: list[dict[str, float]] = []
     diagnostic_rows: list[dict[str, float]] = []
+    timing_rows: list[dict[str, float]] = []
     primary_reward_sum = 0.0
     previous_ctrl: np.ndarray | None = None
 
@@ -434,6 +437,7 @@ def run_race(
     t0 = time.perf_counter()
     try:
         for step in range(total_step_cap):
+            step_wall_t0 = time.perf_counter()
             if handle is not None and not handle.is_running():
                 break
             if steps_in_current_lap >= max_steps_per_lap:
@@ -448,6 +452,10 @@ def run_race(
             # The controller reads the physical qpos/qvel through the current data,
             # but all candidate rollouts use the separate planning MuJoCo model.
             ctrl, info = controller.step(plant.data, current_s)
+            timing_rows.append({
+                str(k): float(v)
+                for k, v in dict(info.get("timing_ms", {})).items()
+            })
             step_diag: dict[str, float] = {}
             for key in (
                 "nominal_cost",
@@ -462,44 +470,58 @@ def run_race(
                 "applied_saturation_fraction",
                 "applied_lower_bound_fraction",
                 "applied_upper_bound_fraction",
+                "poisson_events_mean",
+                "poisson_rate_hz_mean",
+                "poisson_rate_hz_std",
+                "poisson_sign_entropy",
+                "poisson_recruitment_entropy",
+                "poisson_mean_recruitment",
+                "poisson_motor_unit_pool_size",
+                "poisson_mean_recruited_units",
+                "poisson_mean_recruited_fraction",
+                "poisson_low_threshold_unit_fraction",
+                "poisson_high_threshold_unit_fraction",
+                "poisson_event_channels",
+                "poisson_expected_events",
+                "poisson_noise_scale",
+                "poisson_variance_match_scale",
+                "poisson_expected_rms_ratio",
+                "poisson_peak_scale_mode",
                 "spike_events_mean",
                 "spike_rate_hz_mean",
-                "spike_rate_hz_std",
-                "spike_sign_entropy",
-                "spike_recruitment_entropy",
-                "spike_mean_recruitment",
+                "spike_rate_hz_min",
+                "spike_rate_hz_max",
                 "spike_motor_unit_pool_size",
-                "spike_mean_recruited_units",
-                "spike_mean_recruited_fraction",
-                "spike_low_threshold_unit_fraction",
-                "spike_high_threshold_unit_fraction",
-                "bio_agonist_events_mean",
-                "bio_antagonist_events_mean",
-                "bio_mean_active_units",
-                "bio_coactivation_fraction",
-                "bio_mean_common_drive",
-                "bio_recruit_transitions_mean",
-                "bio_derecruit_transitions_mean",
-                "bio_min_observed_isi_s",
-                "bio_drive_sigma",
-                "bio_drive_tau_s",
-                "bio_cocontraction_drive",
-                "spike_effective_synergies",
-                "spike_synergy_entropy",
-                "spike_expected_events",
-            "screen_pool_size",
-            "screen_horizon",
-            "screen_exploit_count",
-            "screen_explore_count",
-            "screen_failed_fraction",
-            "screen_ms",
-            "screen_full_best_from_explore",
-            "screen_full_best_cheap_rank",
-            "screen_audit_full_ess",
-            "screen_audit_top_recall",
-            "screen_audit_captured_weight_mass",
-            "screen_audit_oracle_top_mass",
-            "screen_audit_first_action_cosine",
+                "spike_agonist_events_mean",
+                "spike_antagonist_events_mean",
+                "spike_mean_active_units",
+                "spike_coactivation_fraction",
+                "spike_mean_common_drive",
+                "spike_recruit_transitions_mean",
+                "spike_derecruit_transitions_mean",
+                "spike_min_observed_isi_s",
+                "spike_refractory_s",
+                "spike_drive_sigma",
+                "spike_drive_tau_s",
+                "spike_cocontraction_drive",
+                "spike_separate_antagonists",
+                "spike_noise_scale",
+                "spike_variance_match_scale",
+                "spike_expected_rms_ratio",
+                "spike_peak_scale_mode",
+                "screen_pool_size",
+                "screen_horizon",
+                "screen_exploit_count",
+                "screen_explore_count",
+                "screen_failed_fraction",
+                "screen_ms",
+                "screen_full_best_from_explore",
+                "screen_full_best_cheap_rank",
+                "screen_audit_full_ess",
+                "screen_audit_top_recall",
+                "screen_audit_captured_weight_mass",
+                "screen_audit_oracle_top_mass",
+                "screen_audit_first_action_cosine",
             ):
                 value = info.get(key, math.nan)
                 try:
@@ -577,6 +599,10 @@ def run_race(
             primary_reward_sum += primary_reward
             step_diag["task_progress_step_m"] = float(ds)
             step_diag["primary_reward_step"] = primary_reward
+            # Headless benchmark-facing wall time for the complete control step
+            # up through plant integration and track/task progress projection.
+            # Controller-only latency remains available in step_timing_ms["total"].
+            step_diag["step_compute_ms"] = 1e3 * (time.perf_counter() - step_wall_t0)
             diagnostic_rows.append(step_diag)
 
             xy_hist.append(p)
@@ -607,7 +633,7 @@ def run_race(
                     )
             if completed_this_step:
                 # A newly completed lap receives a fresh step budget.  The
-                # controller, plant state, and Spike-MPPI online statistics are
+                # controller and plant state are
                 # intentionally *not* reset between laps.
                 steps_in_current_lap = 0
 
@@ -694,6 +720,8 @@ def run_race(
             return values[np.isfinite(values)]
 
         aggregate_keys = (
+            "temperature",
+            "ess",
             "nominal_cost",
             "weighted_rollout_cost",
             "best_finite_cost",
@@ -704,30 +732,43 @@ def run_race(
             "applied_residual_l2",
             "applied_residual_rms_norm",
             "applied_saturation_fraction",
+            "applied_lower_bound_fraction",
+            "applied_upper_bound_fraction",
             "control_increment_l2",
             "control_increment_rms_norm",
             "task_progress_step_m",
             "primary_reward_step",
+            "step_compute_ms",
+            "poisson_events_mean",
+            "poisson_rate_hz_mean",
+            "poisson_rate_hz_std",
+            "poisson_sign_entropy",
+            "poisson_recruitment_entropy",
+            "poisson_mean_recruitment",
+            "poisson_event_channels",
+            "poisson_expected_events",
+            "poisson_noise_scale",
+            "poisson_variance_match_scale",
+            "poisson_expected_rms_ratio",
+            "poisson_peak_scale_mode",
             "spike_events_mean",
             "spike_rate_hz_mean",
-            "spike_rate_hz_std",
-            "spike_sign_entropy",
-            "spike_recruitment_entropy",
-            "spike_mean_recruitment",
-            "bio_agonist_events_mean",
-            "bio_antagonist_events_mean",
-            "bio_mean_active_units",
-            "bio_coactivation_fraction",
-            "bio_mean_common_drive",
-            "bio_recruit_transitions_mean",
-            "bio_derecruit_transitions_mean",
-            "bio_min_observed_isi_s",
-            "bio_drive_sigma",
-            "bio_drive_tau_s",
-            "bio_cocontraction_drive",
-            "spike_effective_synergies",
-            "spike_synergy_entropy",
-            "spike_expected_events",
+            "spike_rate_hz_min",
+            "spike_rate_hz_max",
+            "spike_motor_unit_pool_size",
+            "spike_agonist_events_mean",
+            "spike_antagonist_events_mean",
+            "spike_mean_active_units",
+            "spike_coactivation_fraction",
+            "spike_mean_common_drive",
+            "spike_recruit_transitions_mean",
+            "spike_derecruit_transitions_mean",
+            "spike_min_observed_isi_s",
+            "spike_refractory_s",
+            "spike_drive_sigma",
+            "spike_drive_tau_s",
+            "spike_cocontraction_drive",
+            "spike_separate_antagonists",
             "spike_noise_scale",
             "spike_variance_match_scale",
             "spike_expected_rms_ratio",
@@ -766,27 +807,28 @@ def run_race(
 
         # Cleaner paper-facing aliases for per-step quantities whose internal
         # names already contain ``mean``.
-        event_vals = finite_values("spike_events_mean")
-        if event_vals.size:
-            diagnostics_summary["spike_events_per_rollout_mean"] = float(np.mean(event_vals))
-        rate_vals = finite_values("spike_rate_hz_mean")
-        if rate_vals.size:
-            diagnostics_summary["spike_rate_hz_mean"] = float(np.mean(rate_vals))
+        poisson_event_vals = finite_values("poisson_events_mean")
+        if poisson_event_vals.size:
+            diagnostics_summary["poisson_events_per_rollout_mean"] = float(np.mean(poisson_event_vals))
+        poisson_rate_vals = finite_values("poisson_rate_hz_mean")
+        if poisson_rate_vals.size:
+            diagnostics_summary["poisson_rate_hz_mean"] = float(np.mean(poisson_rate_vals))
+        spike_event_vals = finite_values("spike_events_mean")
+        if spike_event_vals.size:
+            diagnostics_summary["spike_events_per_rollout_mean"] = float(np.mean(spike_event_vals))
+        spike_rate_vals = finite_values("spike_rate_hz_mean")
+        if spike_rate_vals.size:
+            diagnostics_summary["spike_rate_hz_mean"] = float(np.mean(spike_rate_vals))
 
-        if controller.sampling == SamplingOption.SPIKE:
-            eff = finite_values("spike_effective_synergies")
-            if eff.size:
-                diagnostics_summary["spike_effective_synergies_initial"] = float(controller._spike_synergies.shape[0])
-                diagnostics_summary["spike_effective_synergies_final"] = float(eff[-1])
-                diagnostics_summary["spike_effective_synergies_delta"] = float(
-                    eff[-1] - controller._spike_synergies.shape[0]
-                )
+        if controller.sampling == SamplingOption.POISSON:
+            channels = finite_values("poisson_event_channels")
+            if channels.size:
+                diagnostics_summary["poisson_event_channels"] = float(channels[-1])
             for key in (
-                "spike_rate_hz_std",
-                "spike_sign_entropy",
-                "spike_recruitment_entropy",
-                "spike_mean_recruitment",
-                "spike_synergy_entropy",
+                "poisson_rate_hz_std",
+                "poisson_sign_entropy",
+                "poisson_recruitment_entropy",
+                "poisson_mean_recruitment",
             ):
                 vals = finite_values(key)
                 if vals.size:
@@ -814,7 +856,7 @@ def run_race(
         if active_damping.size:
             diagnostics_summary["muscle_active_damping_mean"] = float(np.mean(active_damping))
         if controls:
-            # Ant-Bio has instantaneous excitation-to-force mapping: controls are
+            # Ant-2 has instantaneous excitation-to-force mapping: controls are
             # also the physical muscle activation values.
             u = np.asarray(controls, dtype=np.float64)
             plus_u = u[:, 0::2]
@@ -860,6 +902,18 @@ def run_race(
                     np.mean(np.abs(plus - minus))
                 )
 
+    def rows_to_series(rows: list[dict[str, float]]) -> dict[str, np.ndarray]:
+        if not rows:
+            return {}
+        keys = sorted({key for row in rows for key in row})
+        return {
+            key: np.asarray([row.get(key, math.nan) for row in rows], dtype=np.float64)
+            for key in keys
+        }
+
+    step_diagnostics = rows_to_series(diagnostic_rows)
+    step_timing_ms = rows_to_series(timing_rows)
+
     return RaceResult(
         robot_name=plant.name,
         controller_variant="mppi",
@@ -890,6 +944,8 @@ def run_race(
         plant_parameters=plant_params,
         profile_summary=profile_summary,
         diagnostics_summary=diagnostics_summary,
+        step_diagnostics=step_diagnostics,
+        step_timing_ms=step_timing_ms,
     )
 
 
@@ -897,9 +953,8 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
     """Save metrics plus the full MuJoCo state trajectory for exact visual replay."""
     path = Path(path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        replay_format_version=np.asarray(3, dtype=np.int64),
+    payload = dict(
+        replay_format_version=np.asarray(4, dtype=np.int64),
         robot_name=result.robot_name,
         controller_variant=result.controller_variant,
         sampling_option=result.sampling_option,
@@ -942,14 +997,19 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
             result.plant_parameters.slope_deg,
         ]),
     )
+    for key, values in result.step_diagnostics.items():
+        payload[f"diag__{key}"] = np.asarray(values, dtype=np.float64)
+    for key, values in result.step_timing_ms.items():
+        payload[f"timing_ms__{key}"] = np.asarray(values, dtype=np.float64)
+    np.savez_compressed(path, **payload)
     return path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MuJoCo MPPI racing")
     parser.add_argument(
-        "--robot", default="ant", choices=["ant", "ant-bio"],
-        help="ant = original bidirectional motors; ant-bio = antagonistic MuJoCo muscle pairs",
+        "--robot", default="ant", choices=["ant", "ant-2"],
+        help="ant = original bidirectional motors; ant-2 = antagonistic actuator pairs",
     )
     parser.add_argument("--prior", default=None, help="Empirical prior .npz; geometric when omitted")
     parser.add_argument("--laps", type=int, default=1)
@@ -978,30 +1038,30 @@ def main() -> None:
     parser.add_argument("--spline-modes", type=int, default=6, help="number of cubic B-spline latent modes per actuator")
     parser.add_argument("--icem-elites", type=int, default=4, help="number of shifted previous elite control sequences reused by icem sampling")
     
-    parser.add_argument("--spike-rate-hz", type=float, default=8.0, help="Spike rate [Hz]: event rate for spike; minimum active motor-unit discharge rate for spike-bio (default: 8 Hz)")
-    parser.add_argument("--spike-recruitment-levels", type=int, default=6, help="ordered motor units per actuator; recruitment is cumulative from low- to high-threshold units")
+    parser.add_argument("--base-rate-hz", type=float, default=8.0, help="Base rate [Hz]: Poisson event rate for poisson; minimum active motor-unit discharge rate for spike (default: 8 Hz)")
+    parser.add_argument("--recruitment-levels", type=int, default=6, help="ordered motor units per actuator; recruitment is cumulative from low- to high-threshold units")
     parser.add_argument(
-        "--spike-scale", choices=("variance", "peak"), default="variance",
+        "--proposal-scale", choices=("variance", "peak"), default="variance",
         help=(
-            "Spike-MPPI amplitude convention: variance matches expected exploration power to standard MPPI; "
+            "Event-sampler amplitude convention: variance matches expected exploration power to standard MPPI; "
             "peak makes one isolated full-recruitment twitch peak at --joint-noise"
         ),
     )
 
-    parser.add_argument("--spike-twitch-rise", type=float, default=0.016, help="spike twitch rise time constant [s]")
-    parser.add_argument("--spike-twitch-decay", type=float, default=0.064, help="spike twitch decay time constant [s]")
-    parser.add_argument("--spike-twitch-duration", type=float, default=0.200, help="finite twitch-kernel support [s]")
+    parser.add_argument("--twitch-rise", type=float, default=0.016, help="shared twitch rise time constant [s]")
+    parser.add_argument("--twitch-decay", type=float, default=0.064, help="shared twitch decay time constant [s]")
+    parser.add_argument("--twitch-duration", type=float, default=0.200, help="finite twitch-kernel support [s]")
     parser.add_argument(
-        "--bio-drive-sigma", type=float, default=0.20,
-        help="spike-bio common-drive standard deviation (default: 0.20)",
+        "--spike-drive-sigma", type=float, default=0.20,
+        help="spike common-drive standard deviation (default: 0.20)",
     )
     parser.add_argument(
-        "--bio-drive-tau", type=float, default=0.05,
-        help="spike-bio common-drive correlation time constant [s] (default: 0.05)",
+        "--spike-drive-tau", type=float, default=0.05,
+        help="spike common-drive correlation time constant [s] (default: 0.05)",
     )
     parser.add_argument(
         "--screen-pool", type=int, default=0,
-        help="with --sampling standard, spike, or spike-bio, pre-screen this many candidates over the full planning horizon; 0 disables screening",
+        help="with --sampling standard, poisson, or spike, pre-screen this many candidates over the full planning horizon; 0 disables screening",
     )
     parser.add_argument(
         "--screen-exploit", type=int, default=0,
@@ -1022,9 +1082,9 @@ def main() -> None:
         help=(
             "MPPI candidate sampling: standard Gaussian, guided low-rank history, "
             "diag-lowrank adaptive covariance, spline latent sampling, iCEM-style elite reuse, "
-            "spike (fixed Poisson/twitch sampling), or spike-bio (antagonistic motor pools, "
+            "poisson (fixed Poisson/twitch sampling), or spike (antagonistic motor pools, "
             "threshold recruitment, rate coding, renewal firing, heterogeneous twitches, hysteresis). "
-            "Optional full-horizon screening is available for standard/spike/spike-bio."
+            "Optional full-horizon screening is available for standard/poisson/spike."
         ),
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -1165,14 +1225,14 @@ def main() -> None:
         diag_lowrank_max=args.diag_lowrank_max,
         spline_modes=args.spline_modes,
         icem_elites=args.icem_elites,
-        spike_rate_hz=args.spike_rate_hz,
-        spike_recruitment_levels=args.spike_recruitment_levels,
-        spike_scale_mode=args.spike_scale,
-        spike_twitch_rise_s=args.spike_twitch_rise,
-        spike_twitch_decay_s=args.spike_twitch_decay,
-        spike_twitch_duration_s=args.spike_twitch_duration,
-        bio_drive_sigma=args.bio_drive_sigma,
-        bio_drive_tau_s=args.bio_drive_tau,
+        base_rate_hz=args.base_rate_hz,
+        recruitment_levels=args.recruitment_levels,
+        proposal_scale_mode=args.proposal_scale,
+        twitch_rise_s=args.twitch_rise,
+        twitch_decay_s=args.twitch_decay,
+        twitch_duration_s=args.twitch_duration,
+        spike_drive_sigma=args.spike_drive_sigma,
+        spike_drive_tau_s=args.spike_drive_tau,
         screen_pool=args.screen_pool,
         screen_exploit=args.screen_exploit,
         audit=args.audit,
@@ -1230,7 +1290,7 @@ def main() -> None:
         f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s"
     )
     ds = result.diagnostics_summary
-    if result.sampling_option in {SamplingOption.STANDARD.value, SamplingOption.SPIKE.value, SamplingOption.SPIKE_BIO.value} and "screen_pool_size_median" in ds:
+    if result.sampling_option in {SamplingOption.STANDARD.value, SamplingOption.POISSON.value, SamplingOption.SPIKE.value} and "screen_pool_size_median" in ds:
         parts = []
         if "screen_ms_median" in ds:
             parts.append(f"preview={ds['screen_ms_median']:.2f}ms")
