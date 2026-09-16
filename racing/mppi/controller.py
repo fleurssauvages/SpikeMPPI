@@ -18,6 +18,7 @@ from .rollout import (
 )
 from .fast_kernels import NUMBA_AVAILABLE, lbps_optimize_fast
 from .spike_kernels import StaticSpikeSampler, resolve_spike_sampler
+from .bio_motor_pool import BioMotorPoolSampler
 
 
 class SamplingOption(str, Enum):
@@ -29,9 +30,8 @@ class SamplingOption(str, Enum):
     SPLINE = "spline"
     ICEM = "icem"
     SPIKE = "spike"
+    SPIKE_BIO = "spike-bio"
 
-
-BIO_EVENT_SAMPLING_OPTIONS = frozenset({SamplingOption.SPIKE})
 
 @dataclass
 class ControllerConfig:
@@ -45,7 +45,7 @@ class ControllerConfig:
     temporal_noise_smoothing: float = 0.25
 
     # Direct joint-space proposal.
-    joint_noise_fraction: float = 0.25
+    joint_noise_fraction: float = 0.30
     unlimited_control_span: float = 1.0
 
     # Alternative sampling proposals.  These only change how candidate
@@ -59,9 +59,12 @@ class ControllerConfig:
     spline_modes: int = 6
     icem_elites: int = 4
 
-    # Shared marked-Poisson/twitch physiology. ``spike`` is always the fixed
-    # direct-joint baseline: one independent neuron per actuator, identity wiring,
-    # and no online learning.
+    # Shared marked-Poisson/twitch physiology. ``spike`` uses one independent
+    # point-process drive per original joint/motor pool and an ordered motor-unit
+    # recruitment mark. On Ant-Bio, event sign selects the agonist/antagonist
+    # muscle before twitch filtering.
+    # Event timing remains fixed Poisson; only the event mark selects recruitment
+    # depth through the size-principle-inspired pool.
     spike_rate_hz: float = 8.0
     spike_recruitment_levels: int = 6
     spike_sampler: str = "auto"
@@ -76,6 +79,13 @@ class ControllerConfig:
     spike_twitch_decay_s: float = 0.064
     spike_twitch_duration_s: float = 0.200
 
+    # Spike-Bio proposal-shape parameters.
+    # Physiological constants (recruitment thresholds, firing-rate range,
+    # refractory/renewal statistics, hysteresis and twitch heterogeneity) stay
+    # fixed; these two parameters are the intended HPO surface.
+    bio_drive_sigma: float = 0.20
+    bio_drive_tau_s: float = 0.05
+
     # Optional full-horizon multi-fidelity screening for standard Gaussian or
     # Spike-MPPI sampling. Both values at zero recover the unscreened path.
     # When enabled, ``screen_pool_size`` candidates are ranked with the existing
@@ -87,7 +97,7 @@ class ControllerConfig:
     # 0 disables the expensive full-population audit; N>0 audits every N MPC steps.
     screen_audit_every: int = 0
 
-    # Policy-seeded local iLQR-style nominal construction.
+    # Optional local iLQR-style nominal refinement.
     nominal_refine_iterations: int = 0
     nominal_refine_damping: float = 1e-4
     nominal_refine_step_size: float = 0.35
@@ -160,6 +170,10 @@ class ControllerConfig:
             raise ValueError("spike_scale_mode must be variance or peak")
         if not np.isfinite(self.spike_rate_hz) or self.spike_rate_hz <= 0:
             raise ValueError("spike_rate_hz must be finite and positive")
+        if not np.isfinite(self.bio_drive_sigma) or self.bio_drive_sigma <= 0.0:
+            raise ValueError("bio_drive_sigma must be finite and positive")
+        if not np.isfinite(self.bio_drive_tau_s) or self.bio_drive_tau_s <= 0.0:
+            raise ValueError("bio_drive_tau_s must be finite and positive")
         self.spike_recruitment_levels = max(1, int(self.spike_recruitment_levels))
         if self.spike_twitch_rise_s <= 0.0:
             raise ValueError("spike_twitch_rise_s must be positive")
@@ -214,12 +228,12 @@ class JointMPPIController:
         self.sampling = SamplingOption(sampling)
         screen_requested = cfg.screen_pool_size > 0 and cfg.screen_exploit > 0
         self._screen_enabled = (
-            self.sampling in {SamplingOption.STANDARD, SamplingOption.SPIKE}
+            self.sampling in {SamplingOption.STANDARD, SamplingOption.SPIKE, SamplingOption.SPIKE_BIO}
             and screen_requested
         )
-        if screen_requested and self.sampling not in {SamplingOption.STANDARD, SamplingOption.SPIKE}:
+        if screen_requested and self.sampling not in {SamplingOption.STANDARD, SamplingOption.SPIKE, SamplingOption.SPIKE_BIO}:
             raise ValueError(
-                "--screen-pool/--screen-exploit are only valid with --sampling standard or spike"
+                "--screen-pool/--screen-exploit are only valid with --sampling standard, spike, or spike-bio"
             )
         self.rng = np.random.default_rng(int(seed))
         ratio = float(cfg.control_dt) / max(float(robot.physics_dt), 1e-12)
@@ -263,6 +277,12 @@ class JointMPPIController:
             unlimited_span=cfg.unlimited_control_span,
         )
         self._standard_workspace: tuple[np.ndarray, np.ndarray] | None = None
+        if bool(getattr(robot, "is_muscle_model", False)):
+            self._muscle_pos_idx = np.asarray([p for p, _ in robot.muscle_pairs], dtype=np.int32)
+            self._muscle_neg_idx = np.asarray([n for _, n in robot.muscle_pairs], dtype=np.int32)
+        else:
+            self._muscle_pos_idx = np.empty(0, dtype=np.int32)
+            self._muscle_neg_idx = np.empty(0, dtype=np.int32)
         self._direction_history: list[np.ndarray] = []
         self._last_proposal_rank = 0
         self._diag_variance = np.ones((cfg.horizon, robot.nu), dtype=np.float64)
@@ -270,12 +290,14 @@ class JointMPPIController:
         self._spline_basis = self._make_bspline_basis(cfg.horizon, cfg.spline_modes)
         self._spike_sampler_backend = (
             resolve_spike_sampler(cfg.spike_sampler)
-            if self.sampling in BIO_EVENT_SAMPLING_OPTIONS
-            else "unused"
+            if self.sampling == SamplingOption.SPIKE
+            else ("numba-bio" if self.sampling == SamplingOption.SPIKE_BIO else "unused")
         )
-        self._spike_levels, self._spike_level_prior = self._make_recruitment_marks(
-            cfg.spike_recruitment_levels
-        )
+        (
+            self._spike_levels,
+            self._spike_level_prior,
+            self._spike_motor_unit_strengths,
+        ) = self._make_recruitment_marks(cfg.spike_recruitment_levels)
         self._spike_twitch = self._make_spike_twitch_kernel(
             cfg.control_dt,
             cfg.spike_twitch_rise_s,
@@ -283,12 +305,14 @@ class JointMPPIController:
             cfg.spike_twitch_duration_s,
         )
         h = int(cfg.horizon)
-        # ``spike`` is intentionally the former spike-joint baseline: exactly one
-        # independent channel per physical actuator and identity decoding.
-        self._spike_synergies = np.eye(robot.nu, dtype=np.float64)
-        m = int(robot.nu)
+        # ``spike`` keeps one point-process channel per original Ant joint. On
+        # Ant-Bio, positive and negative events are decoded *before filtering*
+        # into separate agonist/antagonist muscle channels, giving a native 16-D
+        # physical control trajectory while preserving the original event budget.
+        m = int(getattr(robot, "motor_pool_count", robot.nu))
+        self._spike_synergies = np.eye(m, dtype=np.float64)
         spike_shape = (h, m)
-        self._spike_total_rate_hz = float(robot.nu) * float(cfg.spike_rate_hz)
+        self._spike_total_rate_hz = float(m) * float(cfg.spike_rate_hz)
         per_channel_rate = self._spike_total_rate_hz / float(m)
         half_base = 0.5 * per_channel_rate
         self._spike_pos_rate_map = np.full(spike_shape, half_base, dtype=np.float64)
@@ -310,13 +334,35 @@ class JointMPPIController:
             else self._spike_variance_match_scale
         )
         self._spike_generator = None
-        if self.sampling in BIO_EVENT_SAMPLING_OPTIONS:
-            spike_n = cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts
+        self._bio_spike_generator = None
+        self._bio_last_stats: dict[str, float] = {}
+        self._bio_variance_match_scale = math.nan
+        self._bio_global_noise_scale = math.nan
+        spike_n = cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts
+        if self.sampling == SamplingOption.SPIKE:
             self._spike_generator = StaticSpikeSampler(
                 self._spike_pos_rate_map, self._spike_neg_rate_map,
                 self._spike_mark_prob_map, self._spike_levels,
                 cfg.control_dt, spike_n, self._spike_twitch,
                 backend=self._spike_sampler_backend,
+            )
+        elif self.sampling == SamplingOption.SPIKE_BIO:
+            self._bio_spike_generator = BioMotorPoolSampler(
+                n=spike_n, h=h, nu=int(getattr(robot, "motor_pool_count", robot.nu)),
+                dt=cfg.control_dt,
+                levels=cfg.spike_recruitment_levels,
+                base_rate_hz=cfg.spike_rate_hz,
+                twitch_rise_s=cfg.spike_twitch_rise_s,
+                twitch_decay_s=cfg.spike_twitch_decay_s,
+                twitch_duration_s=cfg.spike_twitch_duration_s,
+                drive_sigma=cfg.bio_drive_sigma,
+                drive_tau_s=cfg.bio_drive_tau_s,
+                separate_antagonists=bool(getattr(robot, "is_muscle_model", False)),
+            )
+            bio_rms = self._bio_spike_generator.estimate_unit_rms()
+            self._bio_variance_match_scale = 1.0 / max(bio_rms, 1e-12)
+            self._bio_global_noise_scale = (
+                1.0 if cfg.spike_scale_mode == "peak" else self._bio_variance_match_scale
             )
         self._screen_step = 0
         self._last_screen_diag: dict[str, float] = {}
@@ -377,17 +423,31 @@ class JointMPPIController:
             if self._screen_enabled:
                 return (
                     "Spike-MPPI with optional full-horizon screening: fixed direct-joint "
-                    "signed marked-Poisson events + causal twitch; "
+                    "Poisson events + ordered motor-unit recruitment + causal twitch; "
                     f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
                     f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
                     f"scale={self.cfg.spike_scale_mode}, preview=implicitfast, full update unchanged, "
                     f"implementation={self._spike_sampler_backend}"
                 )
+            spike_channels = int(self._spike_synergies.shape[0])
+            decode = (
+                f"sign-split to {self.robot.nu} antagonistic muscle controls"
+                if bool(getattr(self.robot, "is_muscle_model", False))
+                else f"identity decode to {self.robot.nu} controls"
+            )
             return (
-                "Spike-MPPI: fixed direct-joint signed marked-Poisson events + causal twitch; "
-                f"neurons={self.robot.nu}, base_rate={self.cfg.spike_rate_hz:g}Hz, "
-                f"scale={self.cfg.spike_scale_mode}, identity wiring, no learning, unchanged nominal, "
-                f"implementation={self._spike_sampler_backend}"
+                "Spike-MPPI: fixed Poisson events + ordered motor-unit recruitment + causal twitch; "
+                f"event_channels={spike_channels}, {decode}, motor_units={len(self._spike_levels)}, "
+                f"base_rate={self.cfg.spike_rate_hz:g}Hz, scale={self.cfg.spike_scale_mode}, "
+                f"no learning, implementation={self._spike_sampler_backend}"
+            )
+        if self.sampling == SamplingOption.SPIKE_BIO:
+            pool = self._bio_spike_generator
+            return (
+                "Bio Spike-MPPI: antagonistic motor pools + common drive + ordered threshold recruitment + "
+                "rate coding + refractory gamma-renewal firing + heterogeneous twitches + hysteresis; "
+                f"motor_units={self.cfg.spike_recruitment_levels}/pool, min_rate={self.cfg.spike_rate_hz:g}Hz, "
+                f"max_rate={pool.max_rate_hz:g}Hz, scale={self.cfg.spike_scale_mode}, implementation=numba"
             )
         if self.sampling == SamplingOption.STANDARD and self._screen_enabled:
             return (
@@ -508,8 +568,16 @@ class JointMPPIController:
         )
 
     def _sample_standard(self, nominal: np.ndarray, *, count: int | None = None) -> np.ndarray:
+        """Standard Gaussian MPPI in the robot's native actuator space.
+
+        Ant-Bio therefore uses 16 independent nonnegative muscle channels; no
+        half-wave decoder or twitch filter is applied to the standard baseline.
+        """
         n = self.cfg.num_rollouts if count is None else max(1, int(count))
-        h, nu = self.cfg.horizon, self.robot.nu
+        h = self.cfg.horizon
+        nu = self.robot.nu
+        rho = float(self.cfg.temporal_noise_smoothing)
+        beta = math.sqrt(max(0.0, 1.0 - rho * rho))
         std = self._joint_std
         if (
             self._standard_workspace is None
@@ -522,8 +590,6 @@ class JointMPPIController:
         noise, controls = self._standard_workspace
         self.rng.standard_normal(noise.shape, out=noise)
         np.multiply(noise, std[None, None, :], out=noise)
-        rho = float(self.cfg.temporal_noise_smoothing)
-        beta = math.sqrt(max(0.0, 1.0 - rho * rho))
         for t in range(1, h):
             noise[:, t] = rho * noise[:, t - 1] + beta * noise[:, t]
         np.add(nominal[None, :, :], noise, out=controls)
@@ -665,22 +731,38 @@ class JointMPPIController:
     @staticmethod
     def _make_recruitment_marks(
         levels: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return ordered normalized recruitment marks and a uniform prior."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build an ordered size-principle-inspired motor-unit pool.
+
+        Recruitment marks no longer mean an arbitrary scalar amplitude.  Each
+        actuator owns ``levels`` ordered motor units. Unit twitch strength grows
+        monotonically with recruitment order (1, 2, ..., levels), while a mark
+        at depth ``r`` recruits units 1..r cumulatively.  Because all recruited
+        units share the same event time and twitch kernel, summing their twitches
+        is exactly equivalent to using the cumulative amplitude returned here.
+
+        The full-pool twitch is normalized to one, so ``peak`` scaling keeps its
+        previous interpretation. ``variance`` scaling is recomputed from the new
+        mark amplitudes, keeping expected exploration power comparable.
+        """
         levels = max(1, int(levels))
 
-        amplitudes = (
-            np.arange(1, levels + 1, dtype=np.float64)
-            / float(levels)
-        )
+        # Simplified Henneman-like size principle: later-recruited motor units
+        # contribute more twitch force. Using rank-proportional strengths avoids
+        # another tuning parameter while producing a genuinely hierarchical pool.
+        unit_strengths = np.arange(1, levels + 1, dtype=np.float64)
+        unit_strengths /= float(np.sum(unit_strengths))
 
-        prior = np.full(
-            levels,
-            1.0 / float(levels),
-            dtype=np.float64,
-        )
+        # Recruitment depth r activates every lower-threshold unit 1..r.
+        amplitudes = np.cumsum(unit_strengths)
+        amplitudes[-1] = 1.0
 
-        return amplitudes, prior
+        # Keep the old fixed mark law: every recruitment depth is equally likely.
+        # This isolates the contribution of ordered cumulative recruitment from
+        # changes in firing rate or mark probabilities.
+        prior = np.full(levels, 1.0 / float(levels), dtype=np.float64)
+
+        return amplitudes, prior, unit_strengths
 
     def _compute_spike_global_noise_scale(self) -> float:
         """Match only the *global* uniform-law motor power to the 8-neuron identity baseline.
@@ -702,12 +784,16 @@ class JointMPPIController:
         total_motor_variance = float(
             np.sum(channel_variance * np.sum(self._spike_synergies ** 2, axis=1))
         )
-        mean_motor_variance = total_motor_variance / float(max(self.robot.nu, 1))
+        # For Ant-Bio the signed point process is split into two physical muscle
+        # channels. Total variance is conserved by Poisson thinning, so divide by
+        # all 16 actuator coordinates to match standard MPPI per muscle channel.
+        variance_dim = int(self.robot.nu)
+        mean_motor_variance = total_motor_variance / float(max(variance_dim, 1))
         return 1.0 / math.sqrt(max(mean_motor_variance, 1e-12))
 
     def _make_fixed_spike_diagnostics(self) -> dict[str, float]:
         """Diagnostics for the fixed direct-joint Spike baseline."""
-        m = int(self.robot.nu)
+        m = int(self._spike_synergies.shape[0])
         levels = len(self._spike_levels)
         total_rate = float(self._spike_total_rate_hz)
         per_rate = total_rate / max(m, 1)
@@ -722,12 +808,17 @@ class JointMPPIController:
             "spike_mark_entropy_mean": float(levels > 1),
             "spike_mark_prob_min": 1.0 / levels, "spike_mark_prob_max": 1.0 / levels,
             "spike_mean_recruitment": float(np.mean(self._spike_levels)),
-            "spike_effective_synergies": float(m) if self.sampling in BIO_EVENT_SAMPLING_OPTIONS else math.nan,
-            "spike_synergy_entropy": float(m > 1) if self.sampling in BIO_EVENT_SAMPLING_OPTIONS else math.nan,
+            "spike_motor_unit_pool_size": float(levels),
+            "spike_mean_recruited_units": float((levels + 1) / 2.0),
+            "spike_mean_recruited_fraction": float((levels + 1) / (2.0 * levels)),
+            "spike_low_threshold_unit_fraction": float(self._spike_motor_unit_strengths[0]),
+            "spike_high_threshold_unit_fraction": float(self._spike_motor_unit_strengths[-1]),
+            "spike_effective_synergies": float(m) if self.sampling == SamplingOption.SPIKE else math.nan,
+            "spike_synergy_entropy": float(m > 1) if self.sampling == SamplingOption.SPIKE else math.nan,
             "spike_expected_events": self.cfg.control_dt * self.cfg.horizon * total_rate,
             "spike_total_rate_hz": total_rate,
             "spike_event_budget_fixed": 1.0,
-            "spike_firing_fixed": float(self.sampling in BIO_EVENT_SAMPLING_OPTIONS),
+            "spike_firing_fixed": float(self.sampling == SamplingOption.SPIKE),
             "spike_noise_scale": float(self._spike_global_noise_scale),
             "spike_variance_match_scale": float(self._spike_variance_match_scale),
             "spike_expected_rms_ratio": float(
@@ -735,27 +826,86 @@ class JointMPPIController:
             ),
             "spike_peak_scale_mode": float(self.cfg.spike_scale_mode == "peak"),
         }
-        if self.sampling not in BIO_EVENT_SAMPLING_OPTIONS:
+        if self.sampling != SamplingOption.SPIKE:
             return {key: math.nan for key in out}
         return out
 
     def _spike_diagnostics(self) -> dict[str, float]:
-        return self._fixed_spike_diagnostics
+        if self.sampling == SamplingOption.SPIKE:
+            return self._fixed_spike_diagnostics
+        if self.sampling == SamplingOption.SPIKE_BIO:
+            out = {key: math.nan for key in self._fixed_spike_diagnostics}
+            out.update({
+                "spike_rate_hz_mean": float(self.cfg.spike_rate_hz),
+                "spike_rate_hz_min": float(self.cfg.spike_rate_hz),
+                "spike_rate_hz_max": float(3.0 * self.cfg.spike_rate_hz),
+                "spike_motor_unit_pool_size": float(self.cfg.spike_recruitment_levels),
+                "spike_noise_scale": float(self._bio_global_noise_scale),
+                "spike_variance_match_scale": float(self._bio_variance_match_scale),
+                "spike_expected_rms_ratio": float(
+                    self._bio_global_noise_scale / max(self._bio_variance_match_scale, 1e-12)
+                ),
+                "spike_peak_scale_mode": float(self.cfg.spike_scale_mode == "peak"),
+                "spike_firing_fixed": 0.0,
+            })
+            out.update(self._bio_last_stats)
+            return out
+        return {key: math.nan for key in self._fixed_spike_diagnostics}
 
     def _sample_spike(self, nominal: np.ndarray) -> np.ndarray:
-        """Fixed spike-joint baseline: no contextual or online adaptation."""
+        """Fixed Spike baseline in native actuator space.
+
+        On Ant-Bio each joint owns two physical muscle channels. Positive events
+        are routed to the agonist channel and negative events to the antagonist
+        channel before the common twitch kernel is applied. Both muscle channels
+        may therefore overlap in time and express genuine co-contraction.
+        """
         if self._spike_generator is None:
             raise RuntimeError("Spike generator is unavailable")
-        z, event_total = self._spike_generator.sample_projected_identity(self.rng)
-        n = int(z.shape[0])
-        z *= self._spike_global_noise_scale
-        z *= self._joint_std[None, None, :]
-        # ``z`` is borrowed sampler workspace and is fully overwritten on the
-        # next draw. Reuse it as the candidate-control batch rather than
-        # allocating another N x H x nu array every 20 ms.
+        if bool(getattr(self.robot, "is_muscle_model", False)):
+            z, event_total = self._spike_generator.sample_projected_antagonistic_pairs(self.rng)
+            n = int(z.shape[0])
+            # Each physical muscle receives only nonnegative twitch events. Center
+            # across rollouts before the additive MPPI update, exactly as in
+            # Spike-Bio, so warm-started muscle activations can move both up and
+            # down without introducing a common positive drift.
+            z -= np.mean(z, axis=0, keepdims=True)
+            z *= self._spike_global_noise_scale
+            # Scale every physical muscle channel exactly like standard MPPI's
+            # 16-D control coordinates.
+            z *= self._joint_std[None, None, :]
+            z += nominal[None, :, :]
+            np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
+        else:
+            z, event_total = self._spike_generator.sample_projected_identity(self.rng)
+            n = int(z.shape[0])
+            z *= self._spike_global_noise_scale
+            z *= self._joint_std[None, None, :]
+            z += nominal[None, :, :]
+            np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
+        self._last_spike_event_count_mean = float(event_total) / n
+        return z
+
+    def _sample_spike_bio(self, nominal: np.ndarray) -> np.ndarray:
+        """Biological motor-pool proposal with zero-mean MPPI perturbations."""
+        if self._bio_spike_generator is None:
+            raise RuntimeError("Bio motor-pool Spike generator is unavailable")
+        z, stats = self._bio_spike_generator.sample(self.rng)
+        if bool(getattr(self.robot, "is_muscle_model", False)):
+            # Separate antagonist twitches are nonnegative physical excitations,
+            # but MPPI requires an additive perturbation around its warm-start
+            # nominal. Remove the proposal mean while preserving joint/pool
+            # covariance, including genuine common-mode co-contraction structure.
+            z -= np.mean(z, axis=0, keepdims=True)
+            z *= self._bio_global_noise_scale
+            z *= self._joint_std[None, None, :]
+        else:
+            z *= self._bio_global_noise_scale
+            z *= self._joint_std[None, None, :]
         z += nominal[None, :, :]
         np.clip(z, self._ctrl_low, self._ctrl_high, out=z)
-        self._last_spike_event_count_mean = float(event_total) / n
+        self._bio_last_stats = dict(stats)
+        self._last_spike_event_count_mean = float(stats.get("spike_events_mean", 0.0))
         return z
 
     def _screen_population(
@@ -985,6 +1135,8 @@ class JointMPPIController:
             controls = self._sample_icem(nominal)
         elif self.sampling == SamplingOption.SPIKE:
             controls = self._sample_spike(nominal)
+        elif self.sampling == SamplingOption.SPIKE_BIO:
+            controls = self._sample_spike_bio(nominal)
         else:
             controls = self._sample_standard(
                 nominal,
@@ -1203,6 +1355,12 @@ class JointMPPIController:
         )
         ctrl0 = np.asarray(candidate[0], dtype=np.float64)
         sat_tol = 1e-6 * np.maximum(self._ctrl_high - self._ctrl_low, 1.0)
+        applied_lower_bound_fraction = float(np.mean(ctrl0 <= self._ctrl_low + sat_tol))
+        applied_upper_bound_fraction = float(np.mean(ctrl0 >= self._ctrl_high - sat_tol))
+        # Backward-compatible any-bound metric. For Ant-Bio, a zero muscle
+        # excitation is ordinary inactivity rather than pathological saturation;
+        # paper-facing analysis should therefore prefer the separate upper-bound
+        # metric when discussing actuator saturation.
         applied_saturation_fraction = float(
             np.mean((ctrl0 <= self._ctrl_low + sat_tol) | (ctrl0 >= self._ctrl_high - sat_tol))
         )
@@ -1252,6 +1410,8 @@ class JointMPPIController:
             "applied_residual_l2": applied_residual_l2,
             "applied_residual_rms_norm": applied_residual_rms_norm,
             "applied_saturation_fraction": applied_saturation_fraction,
+            "applied_lower_bound_fraction": applied_lower_bound_fraction,
+            "applied_upper_bound_fraction": applied_upper_bound_fraction,
             "timing_ms": {
                 "nominal": 1e3 * (t_nominal - t_total),
                 **nominal_parts,

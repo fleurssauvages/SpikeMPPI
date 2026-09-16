@@ -145,13 +145,6 @@ def resolve_spike_sampler(requested: str) -> str:
                                         0.02, 2, np.array([1.0, 0.5]), backend="numba")
             static.sample(rng)
             static.sample_projected(rng, np.eye(2), collect_channel_energy=True)
-            static.sample_projected_adaptive(
-                rng, np.eye(2), total_rate_hz=16.0,
-                rate_prob=np.array([0.5, 0.5]),
-                sign_prob=np.array([0.5, 0.5]),
-                mark_prob=np.array([[0.5, 0.5], [0.5, 0.5]]),
-                collect_stats=True,
-            )
             _prepared = True
         except Exception as exc:
             _prepare_error = exc
@@ -239,6 +232,39 @@ def _static_project_homogeneous_identity(rng, block_means, amplitudes,
 
 
 @njit(cache=True, nogil=True, fastmath=False)
+def _static_project_homogeneous_antagonistic(rng, block_means, amplitudes,
+                                               muscle_impulses):
+    """Map fixed signed Spike events to nonnegative antagonist muscles.
+
+    Positive events go to channel ``2*j`` and negative events to ``2*j+1``.
+    No event itself is negative; opposite joint torque is produced by the
+    opposing muscle transmission in the MuJoCo model.
+    """
+    muscle_impulses[:] = 0.0
+    n, h, nu = muscle_impulses.shape
+    m = nu // 2
+    cells = n * h * m
+    total = 0
+    for level in range(len(amplitudes)):
+        amp = amplitudes[level]
+        for sign in range(2):
+            lam = block_means[level, sign]
+            if lam <= 0.0:
+                continue
+            pos = rng.exponential(1.0 / lam)
+            while pos < cells:
+                idx = int(pos)
+                j = idx % m
+                q = idx // m
+                t = q % h
+                i = q // h
+                muscle_impulses[i, t, 2 * j + sign] += amp
+                total += 1
+                pos += rng.exponential(1.0 / lam)
+    return total
+
+
+@njit(cache=True, nogil=True, fastmath=False)
 def _static_project_homogeneous(rng, block_means, amplitudes, wiring,
                                 motor_impulses, channel_energy):
     """Exact homogeneous marked-Poisson sampling with event skipping.
@@ -282,173 +308,6 @@ def _static_project_homogeneous(rng, block_means, amplitudes, wiring,
     return total
 
 
-
-@njit(cache=True, nogil=True, fastmath=False)
-def _adaptive_project_budget(rng, total_rate_hz, dt, rate_cdf, sign_prob,
-                             mark_cdf, amplitudes, wiring, motor_impulses,
-                             event_counts, positive_counts, level_counts):
-    """Exact fixed-budget marked-Poisson superposition with learned marks.
-
-    The total population process is Poisson(total_rate_hz).  Conditional on an
-    event, the neuron is drawn from rate_cdf, sign from sign_prob, recruitment
-    from mark_cdf, and the discrete horizon bin uniformly.  Poisson thinning
-    makes this exactly equivalent to independent homogeneous per-neuron Poisson
-    processes whose rates sum to total_rate_hz.
-    """
-    motor_impulses[:] = 0.0
-    event_counts[:] = 0
-    positive_counts[:] = 0
-    level_counts[:] = 0
-    n, h, nu = motor_impulses.shape
-    m = wiring.shape[0]
-    levels = len(amplitudes)
-    expected_total = total_rate_hz * dt * h
-    total = 0
-
-    for i in range(n):
-        k = rng.poisson(expected_total)
-        total += k
-        for _ in range(k):
-            r = rng.random()
-            lo = 0
-            hi = m - 1
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if r <= rate_cdf[mid]:
-                    hi = mid
-                else:
-                    lo = mid + 1
-            j = lo
-            t = int(rng.random() * h)
-            is_pos = rng.random() < sign_prob[j]
-            q = rng.random()
-            level = 0
-            while level + 1 < levels and q > mark_cdf[j, level]:
-                level += 1
-            amp = amplitudes[level]
-            signed_amp = amp if is_pos else -amp
-            event_counts[i, j] += 1
-            if is_pos:
-                positive_counts[i, j] += 1
-            level_counts[i, j, level] += 1
-            for u in range(nu):
-                wij = wiring[j, u]
-                if wij != 0.0:
-                    motor_impulses[i, t, u] += signed_amp * wij
-
-    # Center the learned asymmetric event law exactly in expectation so every
-    # candidate distribution still explores around the unchanged nominal.
-    # rate probability is recovered from the CDF increments.
-    for u in range(nu):
-        mean_u = 0.0
-        prev = 0.0
-        for j in range(m):
-            qj = rate_cdf[j] - prev
-            prev = rate_cdf[j]
-            mean_amp = 0.0
-            prev_mark = 0.0
-            for level in range(levels):
-                pij = mark_cdf[j, level] - prev_mark
-                prev_mark = mark_cdf[j, level]
-                mean_amp += pij * amplitudes[level]
-            mean_u += qj * (2.0 * sign_prob[j] - 1.0) * mean_amp * wiring[j, u]
-        mean_u *= total_rate_hz * dt
-        if mean_u != 0.0:
-            for i in range(n):
-                for t in range(h):
-                    motor_impulses[i, t, u] -= mean_u
-    return total
-
-
-
-@njit(cache=True, nogil=True, fastmath=False)
-def _temporal_project_budget(rng, total_rate_hz, dt, rate_cdf, sign_prob,
-                             mark_cdf, amplitudes, wiring, mean_motor,
-                             motor_impulses, event_counts, positive_counts,
-                             level_counts):
-    """Fixed-budget marked-Poisson sampling from a K-knot trajectory proposal.
-
-    Event time is sampled from the unchanged homogeneous population Poisson
-    process.  The event's latent proposal knot is drawn by linear interpolation
-    between the two neighboring temporal knots; neuron/sign/recruitment are then
-    sampled from that knot.  This gives a continuous-in-time mixture without
-    constructing H x N probability tensors.
-    """
-    motor_impulses[:] = 0.0
-    event_counts[:] = 0
-    positive_counts[:] = 0
-    level_counts[:] = 0
-    n, h, nu = motor_impulses.shape
-    knots, m = rate_cdf.shape
-    levels = len(amplitudes)
-    expected_total = total_rate_hz * dt * h
-    total = 0
-
-    for i in range(n):
-        nevents = rng.poisson(expected_total)
-        total += nevents
-        for _ in range(nevents):
-            t = int(rng.random() * h)
-            if knots <= 1 or h <= 1:
-                knot = 0
-            else:
-                x = (t * (knots - 1.0)) / (h - 1.0)
-                k0 = int(x)
-                if k0 >= knots - 1:
-                    knot = knots - 1
-                else:
-                    a = x - k0
-                    knot = k0 + 1 if rng.random() < a else k0
-
-            r = rng.random()
-            lo = 0
-            hi = m - 1
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if r <= rate_cdf[knot, mid]:
-                    hi = mid
-                else:
-                    lo = mid + 1
-            j = lo
-
-            is_pos = rng.random() < sign_prob[knot, j]
-            q = rng.random()
-            level = 0
-            while level + 1 < levels and q > mark_cdf[knot, j, level]:
-                level += 1
-            signed_amp = amplitudes[level] if is_pos else -amplitudes[level]
-            event_counts[i, knot, j] += 1
-            if is_pos:
-                positive_counts[i, knot, j] += 1
-            level_counts[i, knot, j, level] += 1
-            for u in range(nu):
-                wij = wiring[j, u]
-                if wij != 0.0:
-                    motor_impulses[i, t, u] += signed_amp * wij
-
-    # Center the learned asymmetric proposal exactly in expectation at every
-    # horizon bin.  This keeps the proposal centered on the unchanged nominal.
-    for t in range(h):
-        if knots <= 1 or h <= 1:
-            k0 = 0
-            k1 = 0
-            a = 0.0
-        else:
-            x = (t * (knots - 1.0)) / (h - 1.0)
-            k0 = int(x)
-            if k0 >= knots - 1:
-                k0 = knots - 1
-                k1 = k0
-                a = 0.0
-            else:
-                k1 = k0 + 1
-                a = x - k0
-        for u in range(nu):
-            mu = (1.0 - a) * mean_motor[k0, u] + a * mean_motor[k1, u]
-            if mu != 0.0:
-                for i in range(n):
-                    motor_impulses[i, t, u] -= mu
-    return total
 
 @njit(cache=True, nogil=True, fastmath=False)
 def _project_impulses(impulses, wiring, motor_impulses, channel_energy):
@@ -534,7 +393,7 @@ class StaticSpikeSampler:
         self.n = int(n)
         self.h = int(pos.shape[0])
         self.m = int(pos.shape[1])
-        # The racing hot path projects homogeneous events directly into 8 motor
+        # The racing hot path projects homogeneous events directly into motor
         # channels and never needs an N-neuron horizon tensor. Keep the large
         # general-law workspaces lazy so 32/64-neuron sampling does not carry
         # unused impulses/plus/minus/filter arrays in cache.
@@ -547,17 +406,6 @@ class StaticSpikeSampler:
         self.motor_impulses = None
         self.motor_filtered = None
         self.channel_energy = np.empty((self.n, self.m), dtype=np.float64)
-        self.event_counts = None
-        self.positive_counts = None
-        self.level_counts = None
-        self.rate_cdf = None
-        self.mark_cdf = None
-        self.temporal_rate_cdf = None
-        self.temporal_mark_cdf = None
-        self.temporal_event_counts = None
-        self.temporal_positive_counts = None
-        self.temporal_level_counts = None
-        self.temporal_mean_motor = None
         self.last_event_total = 0
 
     def _ensure_channel_workspace(self):
@@ -573,15 +421,14 @@ class StaticSpikeSampler:
     @property
     def workspace_nbytes(self):
         """Persistent buffers only, excludes small fixed plans and NumPy draws."""
-        return sum(a.nbytes for a in (self.impulses, self.filtered, self.motor_impulses,
-                                       self.motor_filtered, self.channel_energy,
-                                       self.event_counts, self.positive_counts, self.level_counts,
-                                       self.rate_cdf, self.mark_cdf,
-                                       self.temporal_rate_cdf, self.temporal_mark_cdf,
-                                       self.temporal_event_counts, self.temporal_positive_counts,
-                                       self.temporal_level_counts, self.temporal_mean_motor,
-                                       self.plus, self.minus)
-                   if a is not None)
+        return sum(
+            a.nbytes
+            for a in (
+                self.impulses, self.filtered, self.motor_impulses,
+                self.motor_filtered, self.channel_energy, self.plus, self.minus,
+            )
+            if a is not None
+        )
 
     def sample_projected_identity(self, rng):
         """Specialized production path for one fixed neuron per actuator.
@@ -611,12 +458,56 @@ class StaticSpikeSampler:
         )
         return out, int(total)
 
+    def sample_projected_antagonistic_pairs(self, rng):
+        """Decode fixed Spike signs into separate nonnegative muscle channels.
+
+        There are ``m`` original joint-level Spike channels and ``2*m`` muscle
+        outputs ordered ``[positive, negative]`` per joint.  The point-process
+        law and event budget are unchanged from the torque-space Spike baseline;
+        only the sign decoder changes.
+        """
+        target_shape = (self.n, self.h, 2 * self.m)
+        if self.motor_impulses is None or self.motor_impulses.shape != target_shape:
+            self.motor_impulses = np.zeros(target_shape, dtype=np.float64)
+            self.motor_filtered = np.zeros(target_shape, dtype=np.float64)
+
+        if self.backend == "numba" and self.homogeneous_blocks is not None and not self.center:
+            total = _static_project_homogeneous_antagonistic(
+                rng, self.homogeneous_blocks, self.amplitudes, self.motor_impulses
+            )
+            _twitch_into(self.motor_impulses, self.kernel, self.motor_filtered)
+            self.last_event_total = int(total)
+            return self.motor_filtered, self.last_event_total
+
+        # NumPy/general-law reference path. Each sign is routed to its own
+        # nonnegative muscle instead of subtracting the two event streams.
+        self.motor_impulses.fill(0.0)
+        total = 0
+        for level, amplitude in enumerate(self.amplitudes):
+            plus = rng.poisson(
+                self.means[level, 0][None], size=(self.n, self.h, self.m)
+            )
+            minus = rng.poisson(
+                self.means[level, 1][None], size=(self.n, self.h, self.m)
+            )
+            self.motor_impulses[..., 0::2] += float(amplitude) * plus
+            self.motor_impulses[..., 1::2] += float(amplitude) * minus
+            total += int(plus.sum(dtype=np.int64)) + int(minus.sum(dtype=np.int64))
+        self.motor_filtered.fill(0.0)
+        h = self.motor_filtered.shape[1]
+        for lag, k in enumerate(self.kernel[:h]):
+            self.motor_filtered[:, lag:, :] += (
+                float(k) * self.motor_impulses[:, :h-lag, :]
+            )
+        self.last_event_total = int(total)
+        return self.motor_filtered, self.last_event_total
+
     def sample_projected(self, rng, wiring, *, collect_channel_energy=False):
         """Sample neuron events, project to motors, then apply the common twitch.
 
         Because convolution is linear and every neuron uses the same fixed twitch
         kernel, twitch(project(impulses)) == project(twitch(impulses)). This avoids
-        filtering N=32/64 channels when only nu=8 motor outputs are required.
+        filtering many event channels when only the physical motor outputs are required.
         """
         wiring = np.asarray(wiring, dtype=np.float64)
         if wiring.ndim != 2 or wiring.shape[0] != self.m:
@@ -670,229 +561,6 @@ class StaticSpikeSampler:
 
         self.last_event_total = int(total)
         return self.motor_filtered, (self.channel_energy if collect_channel_energy else None), self.last_event_total
-
-    def sample_projected_adaptive(self, rng, wiring, *, total_rate_hz, rate_prob,
-                                  sign_prob, mark_prob, collect_stats=True):
-        """Sample learned rate/sign/recruitment laws with a fixed event budget.
-
-        ``sum(rate_prob)==1`` makes the expected number of population events
-        exactly ``total_rate_hz * horizon * dt`` regardless of neuron count.
-        The returned sufficient statistics are per rollout/neuron and contain no
-        horizon tensor, so 256-1048 neuron learning remains compact.
-        """
-        wiring = np.asarray(wiring, dtype=np.float64)
-        rate_prob = np.asarray(rate_prob, dtype=np.float64).reshape(-1)
-        sign_prob = np.asarray(sign_prob, dtype=np.float64).reshape(-1)
-        mark_prob = np.asarray(mark_prob, dtype=np.float64)
-        if wiring.ndim != 2 or wiring.shape[0] != self.m:
-            raise ValueError("wiring must have shape (channels, motors)")
-        if rate_prob.shape != (self.m,) or sign_prob.shape != (self.m,):
-            raise ValueError("rate_prob and sign_prob must have one entry per channel")
-        if mark_prob.shape != (self.m, len(self.amplitudes)):
-            raise ValueError("mark_prob must have shape (channels, levels)")
-        if (not np.all(np.isfinite(rate_prob)) or np.any(rate_prob < 0.0)
-                or abs(float(np.sum(rate_prob)) - 1.0) > 1e-8):
-            raise ValueError("rate_prob must be finite, nonnegative and sum to one")
-        if (not np.all(np.isfinite(sign_prob)) or np.any(sign_prob < 0.0)
-                or np.any(sign_prob > 1.0)):
-            raise ValueError("sign_prob must lie in [0,1]")
-        if (not np.all(np.isfinite(mark_prob)) or np.any(mark_prob < 0.0)
-                or not np.allclose(np.sum(mark_prob, axis=1), 1.0, atol=1e-8)):
-            raise ValueError("mark_prob rows must be finite, nonnegative and sum to one")
-        total_rate_hz = float(total_rate_hz)
-        if not np.isfinite(total_rate_hz) or total_rate_hz <= 0.0:
-            raise ValueError("total_rate_hz must be finite and positive")
-
-        nu = int(wiring.shape[1])
-        target_shape = (self.n, self.h, nu)
-        if self.motor_impulses is None or self.motor_impulses.shape != target_shape:
-            self.motor_impulses = np.zeros(target_shape, dtype=np.float64)
-            self.motor_filtered = np.zeros(target_shape, dtype=np.float64)
-        levels = len(self.amplitudes)
-        if self.event_counts is None or self.event_counts.shape != (self.n, self.m):
-            self.event_counts = np.zeros((self.n, self.m), dtype=np.int32)
-            self.positive_counts = np.zeros((self.n, self.m), dtype=np.int32)
-            self.level_counts = np.zeros((self.n, self.m, levels), dtype=np.int32)
-            self.rate_cdf = np.empty(self.m, dtype=np.float64)
-            self.mark_cdf = np.empty((self.m, levels), dtype=np.float64)
-        np.cumsum(rate_prob, out=self.rate_cdf)
-        self.rate_cdf[-1] = 1.0
-        np.cumsum(mark_prob, axis=1, out=self.mark_cdf)
-        self.mark_cdf[:, -1] = 1.0
-
-        if self.backend == "numba":
-            total = _adaptive_project_budget(
-                rng, total_rate_hz, self.dt, self.rate_cdf, sign_prob,
-                self.mark_cdf, self.amplitudes, wiring, self.motor_impulses,
-                self.event_counts, self.positive_counts, self.level_counts,
-            )
-            _twitch_into(self.motor_impulses, self.kernel, self.motor_filtered)
-        else:
-            # Reference path with the same Poisson-superposition law.
-            self.motor_impulses.fill(0.0)
-            self.event_counts.fill(0)
-            self.positive_counts.fill(0)
-            self.level_counts.fill(0)
-            expected_total = total_rate_hz * self.dt * self.h
-            total = 0
-            for i in range(self.n):
-                k = int(rng.poisson(expected_total))
-                total += k
-                if k == 0:
-                    continue
-                neurons = rng.choice(self.m, size=k, p=rate_prob)
-                times = rng.integers(0, self.h, size=k)
-                for e in range(k):
-                    j = int(neurons[e])
-                    t = int(times[e])
-                    is_pos = bool(rng.random() < sign_prob[j])
-                    level = int(rng.choice(levels, p=mark_prob[j]))
-                    amp = self.amplitudes[level] if is_pos else -self.amplitudes[level]
-                    self.event_counts[i, j] += 1
-                    if is_pos:
-                        self.positive_counts[i, j] += 1
-                    self.level_counts[i, j, level] += 1
-                    self.motor_impulses[i, t] += amp * wiring[j]
-            mean_amp = mark_prob @ self.amplitudes
-            signed = total_rate_hz * self.dt * rate_prob * (2.0 * sign_prob - 1.0) * mean_amp
-            self.motor_impulses -= (signed @ wiring)[None, None, :]
-            self.motor_filtered.fill(0.0)
-            h = self.motor_filtered.shape[1]
-            for lag, kval in enumerate(self.kernel[:h]):
-                self.motor_filtered[:, lag:, :] += float(kval) * self.motor_impulses[:, :h-lag, :]
-
-        self.last_event_total = int(total)
-        if collect_stats:
-            return (self.motor_filtered, self.event_counts, self.positive_counts,
-                    self.level_counts, self.last_event_total)
-        return self.motor_filtered, None, None, None, self.last_event_total
-
-
-
-    def sample_projected_temporal(self, rng, wiring, *, total_rate_hz, rate_prob,
-                                  sign_prob, mark_prob, collect_stats=True):
-        """Sample a state-conditioned K-knot spike-trajectory proposal.
-
-        The global population Poisson rate is unchanged.  Temporal structure is
-        represented by K knot distributions and sampled through a latent linear
-        interpolation, avoiding any H x neurons probability expansion.
-        """
-        wiring = np.asarray(wiring, dtype=np.float64)
-        rate_prob = np.asarray(rate_prob, dtype=np.float64)
-        sign_prob = np.asarray(sign_prob, dtype=np.float64)
-        mark_prob = np.asarray(mark_prob, dtype=np.float64)
-        if rate_prob.ndim != 2:
-            raise ValueError("rate_prob must have shape (knots, channels)")
-        knots, channels = rate_prob.shape
-        levels = len(self.amplitudes)
-        if wiring.ndim != 2 or wiring.shape[0] != self.m or channels != self.m:
-            raise ValueError("wiring/rate_prob channel count mismatch")
-        if sign_prob.shape != (knots, self.m):
-            raise ValueError("sign_prob must have shape (knots, channels)")
-        if mark_prob.shape != (knots, self.m, levels):
-            raise ValueError("mark_prob must have shape (knots, channels, levels)")
-        if (not np.all(np.isfinite(rate_prob)) or np.any(rate_prob < 0.0)
-                or not np.allclose(np.sum(rate_prob, axis=1), 1.0, atol=1e-8)):
-            raise ValueError("each temporal rate_prob row must sum to one")
-        if (not np.all(np.isfinite(sign_prob)) or np.any(sign_prob < 0.0)
-                or np.any(sign_prob > 1.0)):
-            raise ValueError("sign_prob must lie in [0,1]")
-        if (not np.all(np.isfinite(mark_prob)) or np.any(mark_prob < 0.0)
-                or not np.allclose(np.sum(mark_prob, axis=2), 1.0, atol=1e-8)):
-            raise ValueError("temporal mark_prob rows must sum to one")
-        total_rate_hz = float(total_rate_hz)
-        if not np.isfinite(total_rate_hz) or total_rate_hz <= 0.0:
-            raise ValueError("total_rate_hz must be finite and positive")
-
-        nu = int(wiring.shape[1])
-        target_shape = (self.n, self.h, nu)
-        if self.motor_impulses is None or self.motor_impulses.shape != target_shape:
-            self.motor_impulses = np.zeros(target_shape, dtype=np.float64)
-            self.motor_filtered = np.zeros(target_shape, dtype=np.float64)
-
-        stats_shape = (self.n, knots, self.m)
-        if self.temporal_event_counts is None or self.temporal_event_counts.shape != stats_shape:
-            self.temporal_event_counts = np.zeros(stats_shape, dtype=np.int32)
-            self.temporal_positive_counts = np.zeros(stats_shape, dtype=np.int32)
-            self.temporal_level_counts = np.zeros(stats_shape + (levels,), dtype=np.int32)
-            self.temporal_rate_cdf = np.empty((knots, self.m), dtype=np.float64)
-            self.temporal_mark_cdf = np.empty((knots, self.m, levels), dtype=np.float64)
-            self.temporal_mean_motor = np.empty((knots, nu), dtype=np.float64)
-
-        np.cumsum(rate_prob, axis=1, out=self.temporal_rate_cdf)
-        self.temporal_rate_cdf[:, -1] = 1.0
-        np.cumsum(mark_prob, axis=2, out=self.temporal_mark_cdf)
-        self.temporal_mark_cdf[:, :, -1] = 1.0
-
-        # Expected signed motor impulse per event-knot, then scale by the fixed
-        # population event rate per control bin.  Only a K x nu matrix is kept.
-        mean_amp = np.sum(mark_prob * self.amplitudes[None, None, :], axis=2)
-        signed_mass = rate_prob * (2.0 * sign_prob - 1.0) * mean_amp
-        self.temporal_mean_motor[:] = (
-            float(total_rate_hz) * self.dt * (signed_mass @ wiring)
-        )
-
-        if self.backend == "numba":
-            total = _temporal_project_budget(
-                rng, total_rate_hz, self.dt, self.temporal_rate_cdf, sign_prob,
-                self.temporal_mark_cdf, self.amplitudes, wiring,
-                self.temporal_mean_motor, self.motor_impulses,
-                self.temporal_event_counts, self.temporal_positive_counts,
-                self.temporal_level_counts,
-            )
-            _twitch_into(self.motor_impulses, self.kernel, self.motor_filtered)
-        else:
-            self.motor_impulses.fill(0.0)
-            self.temporal_event_counts.fill(0)
-            self.temporal_positive_counts.fill(0)
-            self.temporal_level_counts.fill(0)
-            expected_total = total_rate_hz * self.dt * self.h
-            total = 0
-            for i in range(self.n):
-                nevents = int(rng.poisson(expected_total))
-                total += nevents
-                for _ in range(nevents):
-                    t = int(rng.integers(0, self.h))
-                    if knots <= 1 or self.h <= 1:
-                        knot = 0
-                    else:
-                        x = t * (knots - 1.0) / (self.h - 1.0)
-                        k0 = min(int(x), knots - 1)
-                        if k0 >= knots - 1:
-                            knot = knots - 1
-                        else:
-                            knot = k0 + 1 if rng.random() < (x - k0) else k0
-                    j = int(rng.choice(self.m, p=rate_prob[knot]))
-                    is_pos = bool(rng.random() < sign_prob[knot, j])
-                    level = int(rng.choice(levels, p=mark_prob[knot, j]))
-                    signed_amp = self.amplitudes[level] if is_pos else -self.amplitudes[level]
-                    self.temporal_event_counts[i, knot, j] += 1
-                    if is_pos:
-                        self.temporal_positive_counts[i, knot, j] += 1
-                    self.temporal_level_counts[i, knot, j, level] += 1
-                    self.motor_impulses[i, t] += signed_amp * wiring[j]
-            for t in range(self.h):
-                if knots <= 1 or self.h <= 1:
-                    mu = self.temporal_mean_motor[0]
-                else:
-                    x = t * (knots - 1.0) / (self.h - 1.0)
-                    k0 = min(int(x), knots - 1)
-                    if k0 >= knots - 1:
-                        mu = self.temporal_mean_motor[-1]
-                    else:
-                        a = x - k0
-                        mu = (1.0 - a) * self.temporal_mean_motor[k0] + a * self.temporal_mean_motor[k0 + 1]
-                self.motor_impulses[:, t, :] -= mu[None, :]
-            self.motor_filtered.fill(0.0)
-            for lag, kval in enumerate(self.kernel[:self.h]):
-                self.motor_filtered[:, lag:, :] += float(kval) * self.motor_impulses[:, :self.h-lag, :]
-
-        self.last_event_total = int(total)
-        if collect_stats:
-            return (self.motor_filtered, self.temporal_event_counts,
-                    self.temporal_positive_counts, self.temporal_level_counts,
-                    self.last_event_total)
-        return self.motor_filtered, None, None, None, self.last_event_total
 
     def sample(self, rng):
         self._ensure_channel_workspace()

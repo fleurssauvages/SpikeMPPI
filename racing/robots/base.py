@@ -63,6 +63,107 @@ def apply_ant_leg_length_scales_xml(root: ET.Element, leg_scales: dict[str, floa
                 geom.set("fromto", _scale_fromto_text(geom.attrib["fromto"], scale))
 
 
+def replace_ant_motors_with_muscles_xml(root: ET.Element) -> list[tuple[str, str]]:
+    """Replace classic Ant motors with antagonistic muscle-like actuators.
+
+    Directly attaching MuJoCo's full Hill-type ``<muscle>`` shortcut to Ant's
+    hinge coordinates makes the force-length-velocity curve depend on arbitrary
+    joint-coordinate scaling.  In particular, the classic Ant reaches angular
+    velocities that can push the shortcut far into its force-velocity roll-off.
+
+    Ant-Bio uses an affine one-sided pulling-force law with *instantaneous*
+    excitation-to-force mapping. Temporal activation/twitch dynamics live in the
+    controller proposal: standard MPPI has none, fixed Spike uses its common
+    twitch kernel, and Spike-Bio uses heterogeneous motor-unit twitch kernels.
+    This avoids filtering those controller-side kernels a second time in MuJoCo.
+
+    For one original joint with peak motor authority F0, the two actuators obey
+
+        tau = F0 (a_pos - a_neg)
+              - K (a_pos + a_neg) q
+              - B (a_pos + a_neg) qdot,
+
+    up to force clamping.  Thus unilateral activation is close to the original
+    torque motor while simultaneous activation increases mechanical impedance.
+    Each actuator remains one-sided: its scalar force is clamped to pulling
+    force only, and its control range is [0, 1].
+
+    Returns ``[(pos_name, neg_name), ...]`` in original actuator order.
+    """
+    actuator = root.find("actuator")
+    if actuator is None:
+        raise ValueError("classic Ant XML has no <actuator> section")
+    motors = list(actuator)
+    if not motors:
+        raise ValueError("classic Ant XML has no actuators to convert")
+
+    pairs: list[tuple[str, str]] = []
+    for index, motor in enumerate(motors):
+        if motor.tag != "motor":
+            raise ValueError(
+                "ant-bio muscle conversion expects only <motor> actuators; "
+                f"found <{motor.tag}>"
+            )
+        joint = motor.attrib.get("joint")
+        if not joint:
+            raise ValueError("ant-bio muscle conversion requires joint-transmission motors")
+        gear_values = [float(x) for x in motor.attrib.get("gear", "1").split()]
+        if len(gear_values) != 1:
+            raise ValueError("ant-bio currently requires scalar motor gear values")
+        motor_gear = float(gear_values[0])
+        if not np.isfinite(motor_gear) or abs(motor_gear) <= 1e-12:
+            raise ValueError(f"invalid motor gear for {joint!r}: {motor.attrib.get('gear')!r}")
+
+        # Classic <motor> has fixed gain 1, so |gear| is its peak generalized
+        # force at |ctrl|=1. Keep that authority explicitly in the muscle force
+        # law rather than in transmission geometry.
+        peak_force = abs(motor_gear)
+        motor_sign = 1.0 if motor_gear > 0.0 else -1.0
+
+        # Modest activation-dependent impedance. At the classic Ant F0=150 this
+        # gives K=18 Nm/rad and B=1.5 Nms/rad per fully active muscle. With only
+        # one muscle active this perturbs the ideal motor weakly; with both active
+        # the stiffness/damping contributions add, giving physical co-contraction.
+        stiffness = 0.12 * peak_force
+        damping = 0.01 * peak_force
+        pull_limit = 1.50 * peak_force
+
+        base = motor.attrib.get("name") or joint or f"act{index}"
+        pos_name = f"{base}_muscle_pos"
+        neg_name = f"{base}_muscle_neg"
+
+        def make_muscle(name: str, transmission_sign: float) -> ET.Element:
+            # Both actuators generate only negative scalar force (pulling). The
+            # opposite transmission signs map that pulling force to opposite joint
+            # torques. With length=l=s*q and velocity=s*qdot, the shared affine
+            # gain -F0-K*l-B*v yields the closed-form joint torque documented above.
+            gear = float(transmission_sign)
+            return ET.Element("general", {
+                "name": name,
+                "joint": joint,
+                "gear": f"{gear:.12g}",
+                "dyntype": "none",
+                "ctrllimited": "true",
+                "ctrlrange": "0 1",
+                "gaintype": "affine",
+                "gainprm": f"{-peak_force:.12g} {-stiffness:.12g} {-damping:.12g}",
+                "biastype": "none",
+                "forcelimited": "true",
+                "forcerange": f"{-pull_limit:.12g} 0",
+            })
+
+        # Scalar pulling force is negative. Negative transmission therefore gives
+        # positive original-motor torque; positive transmission gives the antagonist.
+        pos = make_muscle(pos_name, -motor_sign)
+        neg = make_muscle(neg_name, motor_sign)
+        actuator.remove(motor)
+        actuator.append(pos)
+        actuator.append(neg)
+        pairs.append((pos_name, neg_name))
+
+    return pairs
+
+
 @dataclass
 class RobotSnapshot:
     time: float
@@ -86,6 +187,9 @@ class ClassicRobot:
         *,
         extra_worldbody_xml: str = "",
         leg_length_scales: dict[str, float] | None = None,
+        actuator_model: str = "motor",
+        variant_name: str | None = None,
+        variant_display_name: str | None = None,
     ) -> None:
         try:
             import mujoco
@@ -94,6 +198,14 @@ class ClassicRobot:
         self.mujoco = mujoco
         self.info = info
         self.xml_path = classic_xml_path(info)
+        self.actuator_model = str(actuator_model).strip().lower()
+        if self.actuator_model not in {"motor", "muscle"}:
+            raise ValueError("actuator_model must be 'motor' or 'muscle'")
+        if self.actuator_model == "muscle" and self.info.name != "ant":
+            raise ValueError("antagonistic muscle conversion is currently implemented only for Ant")
+        self._variant_name = str(variant_name or info.name)
+        self._variant_display_name = str(variant_display_name or info.display_name)
+        self._muscle_pairs: tuple[tuple[int, int], ...] = ()
 
         # Keep the original robot dimensions even when the race environment adds
         # dynamic task objects (e.g. a free box). These dimensions are used by
@@ -102,21 +214,46 @@ class ClassicRobot:
         self.robot_nq = int(base_model.nq)
         self.robot_nv = int(base_model.nv)
         self.robot_nbody = int(base_model.nbody)
+        # Reference generalized-force authority of the original classic motors.
+        # For a MuJoCo motor shortcut, force = gain * ctrl and the scalar joint
+        # transmission contributes ``gear`` to qfrc_actuator.  Ant-Bio uses this
+        # as a compile-time calibration target instead of assuming that
+        # muscle ``force=1`` happens to reproduce the same joint torque.
+        if int(base_model.nu):
+            self._source_motor_peak_force = np.abs(
+                np.asarray(base_model.actuator_gear[:, 0], dtype=np.float64)
+                * np.asarray(base_model.actuator_gainprm[:, 0], dtype=np.float64)
+            )
+        else:
+            self._source_motor_peak_force = np.zeros(0, dtype=np.float64)
         leg_length_scales = dict(leg_length_scales or {})
         if leg_length_scales and self.info.name != "ant":
             raise ValueError("leg-length morphology transfer is currently implemented only for Ant")
-        if str(extra_worldbody_xml).strip() or leg_length_scales:
+        if str(extra_worldbody_xml).strip() or leg_length_scales or self.actuator_model == "muscle":
             self.model = self._load_augmented_model(
                 str(extra_worldbody_xml), leg_length_scales=leg_length_scales
             )
         else:
             self.model = base_model
         self.data = mujoco.MjData(self.model)
+        self._muscle_force_calibration = np.ones(int(self.model.nu), dtype=np.float64)
+        if self.actuator_model == "muscle":
+            pairs: list[tuple[int, int]] = []
+            # The converter emits adjacent positive/negative muscles in original
+            # joint-actuator order. Keep explicit indices for Spike-Bio decoding.
+            if int(self.model.nu) % 2 != 0:
+                raise ValueError("ant-bio muscle actuator count must be even")
+            for k in range(0, int(self.model.nu), 2):
+                pairs.append((k, k + 1))
+            self._muscle_pairs = tuple(pairs)
+            # Peak force and impedance are encoded directly in the affine pulling-force law.
 
         self._baseline_geom_friction = np.asarray(self.model.geom_friction, dtype=np.float64).copy()
         self._baseline_body_mass = np.asarray(self.model.body_mass, dtype=np.float64).copy()
         self._baseline_body_inertia = np.asarray(self.model.body_inertia, dtype=np.float64).copy()
         self._baseline_gainprm = np.asarray(self.model.actuator_gainprm, dtype=np.float64).copy()
+        self._baseline_biasprm = np.asarray(self.model.actuator_biasprm, dtype=np.float64).copy()
+        self._baseline_forcerange = np.asarray(self.model.actuator_forcerange, dtype=np.float64).copy()
         self._baseline_gravity = np.asarray(self.model.opt.gravity, dtype=np.float64).copy()
         self._parameter_scales = ModelParameterScales()
         self._ground_geom_ids = self._find_ground_geoms()
@@ -142,6 +279,16 @@ class ClassicRobot:
             if self._task_qpos_adr is not None else float(self.initial_root_height)
         )
 
+
+    def _calibrate_muscle_force_to_source_motors(self) -> None:
+        """Backward-compatible no-op.
+
+        Ant-Bio authority is set analytically in the generated affine force law,
+        with F0 equal to the source motor's peak generalized-force authority.
+        """
+        if self.is_muscle_model:
+            self._muscle_force_calibration = np.ones(int(self.model.nu), dtype=np.float64)
+
     def _load_augmented_model(
         self,
         worldbody_fragment: str,
@@ -156,12 +303,15 @@ class ClassicRobot:
 
         Assets are supplied through MuJoCo's in-memory asset mechanism so this
         remains robust for classic XMLs that reference files relative to the
-        Gymnasium asset directory.  No actuator/joint in the original robot is
-        modified.
+        Gymnasium asset directory. Joint/state topology is preserved; the
+        ``ant-bio`` variant replaces each original motor with an antagonistic
+        MuJoCo muscle pair before compilation.
         """
         root = ET.fromstring(Path(self.xml_path).read_text(encoding="utf-8"))
         if leg_length_scales:
             apply_ant_leg_length_scales_xml(root, leg_length_scales)
+        if self.actuator_model == "muscle":
+            replace_ant_motors_with_muscles_xml(root)
         worldbody = root.find("worldbody")
         if worldbody is None:
             raise ValueError(f"MuJoCo XML has no <worldbody>: {self.xml_path}")
@@ -220,11 +370,53 @@ class ClassicRobot:
 
     @property
     def name(self) -> str:
-        return self.info.name
+        return self._variant_name
 
     @property
     def display_name(self) -> str:
-        return self.info.display_name
+        return self._variant_display_name
+
+    @property
+    def base_name(self) -> str:
+        return self.info.name
+
+    @property
+    def is_muscle_model(self) -> bool:
+        return self.actuator_model == "muscle"
+
+    @property
+    def muscle_pairs(self) -> tuple[tuple[int, int], ...]:
+        return self._muscle_pairs
+
+    @property
+    def muscle_force_calibration(self) -> np.ndarray:
+        """Legacy calibration diagnostic; explicit Ant-Bio XML scaling returns ones."""
+        return np.asarray(self._muscle_force_calibration, dtype=np.float64).copy()
+
+    @property
+    def muscle_peak_force(self) -> np.ndarray:
+        """Peak active pulling-force magnitude F0 for Ant-Bio."""
+        if not self.is_muscle_model:
+            return np.zeros(0, dtype=np.float64)
+        return np.abs(np.asarray(self.model.actuator_gainprm[:, 0], dtype=np.float64)).copy()
+
+    @property
+    def muscle_active_stiffness(self) -> np.ndarray:
+        """Activation-dependent stiffness coefficient K for each muscle."""
+        if not self.is_muscle_model:
+            return np.zeros(0, dtype=np.float64)
+        return np.abs(np.asarray(self.model.actuator_gainprm[:, 1], dtype=np.float64)).copy()
+
+    @property
+    def muscle_active_damping(self) -> np.ndarray:
+        """Activation-dependent damping coefficient B for each muscle."""
+        if not self.is_muscle_model:
+            return np.zeros(0, dtype=np.float64)
+        return np.abs(np.asarray(self.model.actuator_gainprm[:, 2], dtype=np.float64)).copy()
+
+    @property
+    def motor_pool_count(self) -> int:
+        return len(self._muscle_pairs) if self.is_muscle_model else int(self.model.nu)
 
     @property
     def navigation(self) -> str:
@@ -282,8 +474,22 @@ class ClassicRobot:
             self.model.body_inertia[1:robot_end] = self._baseline_body_inertia[1:robot_end] * float(p.mass)
 
         self.model.actuator_gainprm[:] = self._baseline_gainprm
+        self.model.actuator_biasprm[:] = self._baseline_biasprm
+        self.model.actuator_forcerange[:] = self._baseline_forcerange
         if self.model.nu:
-            self.model.actuator_gainprm[:, 0] = self._baseline_gainprm[:, 0] * float(p.motor)
+            if self.is_muscle_model:
+                # Ant-Bio's affine pulling-force law is
+                #   gain = -F0 - K*length - B*velocity.
+                # Strength mismatch scales the whole force law and its pulling
+                # clamp together, preserving the impedance-to-force ratio.
+                self.model.actuator_gainprm[:, :3] = (
+                    self._baseline_gainprm[:, :3] * float(p.motor)
+                )
+                self.model.actuator_forcerange[:] = (
+                    self._baseline_forcerange * float(p.motor)
+                )
+            else:
+                self.model.actuator_gainprm[:, 0] = self._baseline_gainprm[:, 0] * float(p.motor)
 
         g = float(np.linalg.norm(self._baseline_gravity))
         if g <= 1e-12:

@@ -70,7 +70,7 @@ def run_race(
     control_dt: float | None = None,
     lbps_delta: float = 0.95,
     nominal_refine_iterations: int = 0,
-    joint_noise_fraction: float = 0.25,
+    joint_noise_fraction: float = 0.30,
     guided_rank: int = 6,
     guided_fraction: float = 0.50,
     diag_lowrank_rate: float = 0.08,
@@ -84,6 +84,8 @@ def run_race(
     spike_twitch_rise_s: float = 0.016,
     spike_twitch_decay_s: float = 0.064,
     spike_twitch_duration_s: float = 0.200,
+    bio_drive_sigma: float = 0.20,
+    bio_drive_tau_s: float = 0.05,
     screen_pool: int = 0,
     screen_exploit: int = 0,
     audit: int = 0,
@@ -134,7 +136,7 @@ def run_race(
     sled_max_lift: float = 0.12,
     sled_min_up: float = 0.70,
 ) -> RaceResult:
-    """Race a classic MuJoCo robot using direct-joint MPPI.
+    """Race Ant using MPPI with either motor or antagonistic-muscle actuation.
 
     MPPI starts from a zero control horizon and, by default, warm-starts each
     subsequent update from the shifted previous optimized sequence. Plant and
@@ -314,6 +316,8 @@ def run_race(
         spike_twitch_rise_s=float(spike_twitch_rise_s),
         spike_twitch_decay_s=float(spike_twitch_decay_s),
         spike_twitch_duration_s=float(spike_twitch_duration_s),
+        bio_drive_sigma=float(bio_drive_sigma),
+        bio_drive_tau_s=float(bio_drive_tau_s),
         screen_pool_size=int(screen_pool),
         screen_exploit=int(screen_exploit),
         screen_audit_every=int(audit),
@@ -385,7 +389,7 @@ def run_race(
     if verbose:
         print(
             f"controller=mppi  sampling={controller.sampling.value}  "
-            f"robot={plant.name}  nu={plant.nu}  "
+            f"robot={plant.name}  actuation={plant.actuator_model}  nu={plant.nu}  "
             f"rollouts={cfg.num_rollouts}  H={cfg.horizon}  dt={cfg.control_dt:g}s  "
             f"planner={controller.rollout_backend_name}  "
             f"plant={plant_integrator}:{plant_control_substeps}x{plant.physics_dt:g}s  "
@@ -456,12 +460,30 @@ def run_race(
                 "applied_residual_l2",
                 "applied_residual_rms_norm",
                 "applied_saturation_fraction",
+                "applied_lower_bound_fraction",
+                "applied_upper_bound_fraction",
                 "spike_events_mean",
                 "spike_rate_hz_mean",
                 "spike_rate_hz_std",
                 "spike_sign_entropy",
                 "spike_recruitment_entropy",
                 "spike_mean_recruitment",
+                "spike_motor_unit_pool_size",
+                "spike_mean_recruited_units",
+                "spike_mean_recruited_fraction",
+                "spike_low_threshold_unit_fraction",
+                "spike_high_threshold_unit_fraction",
+                "bio_agonist_events_mean",
+                "bio_antagonist_events_mean",
+                "bio_mean_active_units",
+                "bio_coactivation_fraction",
+                "bio_mean_common_drive",
+                "bio_recruit_transitions_mean",
+                "bio_derecruit_transitions_mean",
+                "bio_min_observed_isi_s",
+                "bio_drive_sigma",
+                "bio_drive_tau_s",
+                "bio_cocontraction_drive",
                 "spike_effective_synergies",
                 "spike_synergy_entropy",
                 "spike_expected_events",
@@ -692,6 +714,17 @@ def run_race(
             "spike_sign_entropy",
             "spike_recruitment_entropy",
             "spike_mean_recruitment",
+            "bio_agonist_events_mean",
+            "bio_antagonist_events_mean",
+            "bio_mean_active_units",
+            "bio_coactivation_fraction",
+            "bio_mean_common_drive",
+            "bio_recruit_transitions_mean",
+            "bio_derecruit_transitions_mean",
+            "bio_min_observed_isi_s",
+            "bio_drive_sigma",
+            "bio_drive_tau_s",
+            "bio_cocontraction_drive",
             "spike_effective_synergies",
             "spike_synergy_entropy",
             "spike_expected_events",
@@ -762,6 +795,70 @@ def run_race(
         audit_vals = finite_values("screen_audit_captured_weight_mass")
         if audit_vals.size:
             diagnostics_summary["screen_audit_count"] = float(audit_vals.size)
+
+    if bool(getattr(plant, "is_muscle_model", False)):
+        calibration = np.asarray(plant.muscle_force_calibration, dtype=np.float64)
+        if calibration.size:
+            diagnostics_summary["muscle_force_calibration_mean"] = float(np.mean(calibration))
+            diagnostics_summary["muscle_force_calibration_min"] = float(np.min(calibration))
+            diagnostics_summary["muscle_force_calibration_max"] = float(np.max(calibration))
+        peak_force = np.asarray(plant.muscle_peak_force, dtype=np.float64)
+        if peak_force.size:
+            diagnostics_summary["muscle_peak_force_mean"] = float(np.mean(peak_force))
+            diagnostics_summary["muscle_peak_force_min"] = float(np.min(peak_force))
+            diagnostics_summary["muscle_peak_force_max"] = float(np.max(peak_force))
+        active_stiffness = np.asarray(plant.muscle_active_stiffness, dtype=np.float64)
+        if active_stiffness.size:
+            diagnostics_summary["muscle_active_stiffness_mean"] = float(np.mean(active_stiffness))
+        active_damping = np.asarray(plant.muscle_active_damping, dtype=np.float64)
+        if active_damping.size:
+            diagnostics_summary["muscle_active_damping_mean"] = float(np.mean(active_damping))
+        if controls:
+            # Ant-Bio has instantaneous excitation-to-force mapping: controls are
+            # also the physical muscle activation values.
+            u = np.asarray(controls, dtype=np.float64)
+            plus_u = u[:, 0::2]
+            minus_u = u[:, 1::2]
+            total_u = plus_u + minus_u
+            command_ci = 2.0 * np.minimum(plus_u, minus_u) / np.maximum(total_u, 1e-12)
+            diagnostics_summary["muscle_command_sum_mean"] = float(np.mean(total_u))
+            diagnostics_summary["muscle_command_cocontraction_index_mean"] = float(np.mean(command_ci))
+            diagnostics_summary["muscle_command_coactive_pair_fraction"] = float(
+                np.mean((plus_u > 1e-6) & (minus_u > 1e-6))
+            )
+            if int(getattr(plant.model, "na", 0)) == 0:
+                diagnostics_summary["muscle_activation_mean"] = float(np.mean(total_u))
+                diagnostics_summary["muscle_activation_peak"] = float(np.max(total_u))
+                diagnostics_summary["muscle_cocontraction_index_mean"] = float(np.mean(command_ci))
+                diagnostics_summary["muscle_cocontraction_index_p95"] = float(np.percentile(command_ci, 95))
+                diagnostics_summary["muscle_coactive_pair_fraction"] = float(
+                    np.mean((plus_u > 1e-6) & (minus_u > 1e-6))
+                )
+                diagnostics_summary["muscle_differential_activation_mean"] = float(
+                    np.mean(np.abs(plus_u - minus_u))
+                )
+        if act_hist:
+            # Physical co-contraction is determined by MuJoCo's activation state.
+            # Use states after the initial all-zero reset entry.
+            a = np.asarray(act_hist, dtype=np.float64)
+            if a.ndim == 2 and a.shape[1] == plant.nu and a.shape[0] > 1:
+                a = a[1:]
+                plus = a[:, 0::2]
+                minus = a[:, 1::2]
+                total_activation = plus + minus
+                cocontraction_index = (
+                    2.0 * np.minimum(plus, minus) / np.maximum(total_activation, 1e-12)
+                )
+                diagnostics_summary["muscle_activation_mean"] = float(np.mean(total_activation))
+                diagnostics_summary["muscle_activation_peak"] = float(np.max(total_activation))
+                diagnostics_summary["muscle_cocontraction_index_mean"] = float(np.mean(cocontraction_index))
+                diagnostics_summary["muscle_cocontraction_index_p95"] = float(np.percentile(cocontraction_index, 95))
+                diagnostics_summary["muscle_coactive_pair_fraction"] = float(
+                    np.mean((plus > 1e-6) & (minus > 1e-6))
+                )
+                diagnostics_summary["muscle_differential_activation_mean"] = float(
+                    np.mean(np.abs(plus - minus))
+                )
 
     return RaceResult(
         robot_name=plant.name,
@@ -849,8 +946,11 @@ def save_result(result: RaceResult, path: str | Path) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Direct-joint MuJoCo MPPI racing")
-    parser.add_argument("--robot", default="ant", choices=["ant"], help="Ant stadium racing")
+    parser = argparse.ArgumentParser(description="MuJoCo MPPI racing")
+    parser.add_argument(
+        "--robot", default="ant", choices=["ant", "ant-bio"],
+        help="ant = original bidirectional motors; ant-bio = antagonistic MuJoCo muscle pairs",
+    )
     parser.add_argument("--prior", default=None, help="Empirical prior .npz; geometric when omitted")
     parser.add_argument("--laps", type=int, default=1)
     parser.add_argument(
@@ -867,8 +967,8 @@ def main() -> None:
     parser.add_argument("--lbps-delta", type=float, default=0.95)
     parser.add_argument("--nominal-refine-iters", type=int, default=0)
     parser.add_argument(
-        "--joint-noise", type=float, default=0.25,
-        help="actuator-range exploration-noise scale for MPPI (default: 0.25)",
+        "--joint-noise", type=float, default=0.30,
+        help="actuator-range exploration-noise scale for MPPI (default: 0.30)",
     )
     parser.add_argument("--guided-rank", type=int, default=6, help="history subspace rank for guided and diag-lowrank sampling")
     parser.add_argument("--guided-fraction", type=float, default=0.50, help="blend weight of the learned low-rank component before trace renormalization")
@@ -878,8 +978,8 @@ def main() -> None:
     parser.add_argument("--spline-modes", type=int, default=6, help="number of cubic B-spline latent modes per actuator")
     parser.add_argument("--icem-elites", type=int, default=4, help="number of shifted previous elite control sequences reused by icem sampling")
     
-    parser.add_argument("--spike-rate-hz", type=float, default=8.0, help="per-actuator event rate for Spike-MPPI (default: 8 Hz)")
-    parser.add_argument("--spike-recruitment-levels", type=int, default=6, help="fixed recruitment amplitudes for Spike-MPPI")
+    parser.add_argument("--spike-rate-hz", type=float, default=8.0, help="Spike rate [Hz]: event rate for spike; minimum active motor-unit discharge rate for spike-bio (default: 8 Hz)")
+    parser.add_argument("--spike-recruitment-levels", type=int, default=6, help="ordered motor units per actuator; recruitment is cumulative from low- to high-threshold units")
     parser.add_argument(
         "--spike-scale", choices=("variance", "peak"), default="variance",
         help=(
@@ -892,8 +992,16 @@ def main() -> None:
     parser.add_argument("--spike-twitch-decay", type=float, default=0.064, help="spike twitch decay time constant [s]")
     parser.add_argument("--spike-twitch-duration", type=float, default=0.200, help="finite twitch-kernel support [s]")
     parser.add_argument(
+        "--bio-drive-sigma", type=float, default=0.20,
+        help="spike-bio common-drive standard deviation (default: 0.20)",
+    )
+    parser.add_argument(
+        "--bio-drive-tau", type=float, default=0.05,
+        help="spike-bio common-drive correlation time constant [s] (default: 0.05)",
+    )
+    parser.add_argument(
         "--screen-pool", type=int, default=0,
-        help="with --sampling standard or spike, pre-screen this many candidates over the full planning horizon; 0 disables screening",
+        help="with --sampling standard, spike, or spike-bio, pre-screen this many candidates over the full planning horizon; 0 disables screening",
     )
     parser.add_argument(
         "--screen-exploit", type=int, default=0,
@@ -914,8 +1022,9 @@ def main() -> None:
         help=(
             "MPPI candidate sampling: standard Gaussian, guided low-rank history, "
             "diag-lowrank adaptive covariance, spline latent sampling, iCEM-style elite reuse, "
-            "or spike (fixed direct-joint Poisson/twitch sampling). Optional full-horizon "
-            "screening is available for standard and spike with --screen-pool/--screen-exploit."
+            "spike (fixed Poisson/twitch sampling), or spike-bio (antagonistic motor pools, "
+            "threshold recruitment, rate coding, renewal firing, heterogeneous twitches, hysteresis). "
+            "Optional full-horizon screening is available for standard/spike/spike-bio."
         ),
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -929,7 +1038,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--warm-start", action=argparse.BooleanOptionalAction, default=True,
-        help="shift the optimized sequence between updates (default: enabled; use --no-warm-start for the original behavior)",
+        help="shift the optimized sequence between updates (default: enabled; use --no-warm-start to re-center on zero every update)",
     )
     parser.add_argument(
         "--plant-integrator", choices=["model", "euler", "implicitfast"], default="model",
@@ -1010,22 +1119,22 @@ def main() -> None:
     parser.add_argument("--box-distance", type=float, default=1.8, help="initial box center distance ahead of the robot along track [m] (default: 1.8)")
     parser.add_argument("--box-size", type=float, default=0.90, help="box footprint edge [m] (default: 0.90)")
     parser.add_argument("--box-height", type=float, default=0.45, help="box height [m] (default: 0.45; low crate reduces kicking/tipping)")
-    parser.add_argument("--box-mass", type=float, default=0.25, help="box mass [kg] (default: 6.0)")
+    parser.add_argument("--box-mass", type=float, default=6.0, help="box mass [kg] (default: 6.0)")
     parser.add_argument("--box-friction", type=float, default=0.60, help="box-ground sliding friction coefficient (default: 0.60)")
     parser.add_argument("--sled-distance", type=float, default=1.8, help="initial sled center distance behind the robot along track [m] (default: 1.8)")
     parser.add_argument("--sled-length", type=float, default=1.0, help="sled length along the track [m] (default: 1.0)")
     parser.add_argument("--sled-width", type=float, default=0.80, help="sled width [m] (default: 0.80)")
     parser.add_argument("--sled-height", type=float, default=0.16, help="sled body height [m] (default: 0.16)")
-    parser.add_argument("--sled-mass", type=float, default=0.25, help="sled mass [kg] (default: 8.0)")
+    parser.add_argument("--sled-mass", type=float, default=8.0, help="sled mass [kg] (default: 8.0)")
     parser.add_argument("--sled-friction", type=float, default=0.60, help="sled-ground sliding friction coefficient (default: 0.60)")
-    parser.add_argument("--sled-rope-length", type=float, default=3.0, help="maximum tow-cable length [m] (default: 1.25)")
+    parser.add_argument("--sled-rope-length", type=float, default=1.25, help="maximum tow-cable length [m] (default: 1.25)")
     parser.add_argument("--push-box-progress-weight", type=float, default=1.0, help="primary box track-progress reward weight")
     parser.add_argument("--push-robot-progress-weight", type=float, default=0.35, help="coupled robot-progress shaping weight; robot cannot earn it by running past a stationary box")
     parser.add_argument("--push-approach-weight", type=float, default=1.00, help="dense reward for reducing/maintaining robot-box distance")
     parser.add_argument("--push-box-max-lift", type=float, default=0.12, help="reject MPPI candidates lifting the box more than this above reset height [m]")
     parser.add_argument("--push-box-min-up", type=float, default=0.75, help="reject MPPI candidates tipping the box below this world-up cosine")
     parser.add_argument("--sled-progress-weight", type=float, default=1.0, help="primary towed-sled track-progress reward weight")
-    parser.add_argument("--sled-robot-progress-weight", type=float, default=10.0, help="robot-progress shaping while towing; capped by sled progress")
+    parser.add_argument("--sled-robot-progress-weight", type=float, default=0.25, help="robot-progress shaping while towing; capped by sled progress (default: 0.25)")
     parser.add_argument("--sled-max-lift", type=float, default=0.12, help="reject MPPI candidates lifting the sled more than this above reset height [m]")
     parser.add_argument("--sled-min-up", type=float, default=0.70, help="reject MPPI candidates tipping the sled below this world-up cosine")
 
@@ -1062,6 +1171,8 @@ def main() -> None:
         spike_twitch_rise_s=args.spike_twitch_rise,
         spike_twitch_decay_s=args.spike_twitch_decay,
         spike_twitch_duration_s=args.spike_twitch_duration,
+        bio_drive_sigma=args.bio_drive_sigma,
+        bio_drive_tau_s=args.bio_drive_tau,
         screen_pool=args.screen_pool,
         screen_exploit=args.screen_exploit,
         audit=args.audit,
@@ -1119,7 +1230,7 @@ def main() -> None:
         f"sim={result.simulated_time_s:.2f}s, compute={result.runtime_s:.2f}s"
     )
     ds = result.diagnostics_summary
-    if result.sampling_option in {SamplingOption.STANDARD.value, SamplingOption.SPIKE.value} and "screen_pool_size_median" in ds:
+    if result.sampling_option in {SamplingOption.STANDARD.value, SamplingOption.SPIKE.value, SamplingOption.SPIKE_BIO.value} and "screen_pool_size_median" in ds:
         parts = []
         if "screen_ms_median" in ds:
             parts.append(f"preview={ds['screen_ms_median']:.2f}ms")

@@ -21,18 +21,12 @@ TASK_COLLISION_TYPE = 2
 class RaceEnvironmentConfig:
     """Physical task/environment additions layered onto the classic robot XML.
 
-    ``terrain`` is added to both the physical plant and the MPPI planner.
-    The terrain is therefore a *known test-time task/environment change*: the
-    pretrained locomotion policy was learned on flat ground, while MPPI receives
-    the true ramp/stair/rock geometry and can adapt the flat-running nominal
-    controls online.
+    ``terrain`` is added to both the physical plant and the MPPI planner, so
+    candidate rollouts see the same known ramp/stair/rock geometry as the plant.
 
-    ``push_box`` follows the same transfer principle: the object is present in
-    both plant and planner so candidate rollouts can predict robot-object
-    contact. ``tow_sled`` similarly adds a free sled plus a limited spatial
-    tendon (cable) from the robot root to the sled. The pretrained locomotion
-    policy remains unchanged; MPPI sees the transferred task dynamics and uses
-    the pushed/towed body as its progress target.
+    ``push_box`` similarly places the object in both plant and planner so MPPI
+    can predict robot-object contact. ``tow_sled`` adds a free sled plus a
+    limited spatial tendon (cable) from the robot root to the sled.
     """
 
     task: str = "run"  # run | push_box | tow_sled
@@ -42,8 +36,7 @@ class RaceEnvironmentConfig:
     terrain_scale: float = 1.0
 
     # Known Ant morphology transfer. The physical plant and MPPI planner use
-    # the same modified Ant geometry, while the pretrained PPO weights remain
-    # those learned on the nominal classic Ant. Exactly two legs are lengthened
+    # the same modified Ant geometry. Exactly two legs are lengthened
     # and the opposite pair shortened, without changing joints or actuators.
     leg_mismatch: str = "none"  # none | same_side | diagonal
     short_leg_scale: float = 0.75
@@ -147,8 +140,9 @@ class RaceEnvironmentConfig:
         """Return the known Ant leg scales used by both plant and MPPI planner."""
         if self.leg_mismatch == "none":
             return {}
-        if str(robot_name).strip().lower() != "ant":
-            raise ValueError("--leg-mismatch is currently supported only with --robot ant")
+        robot_key = str(robot_name).strip().lower().replace("_", "-")
+        if robot_key not in {"ant", "ant-bio"}:
+            raise ValueError("--leg-mismatch is currently supported only with Ant robot variants")
         short = float(self.short_leg_scale)
         long = float(self.long_leg_scale)
         # Classic Ant names: `back_leg` is rear-left and `right_back_leg` is
@@ -229,10 +223,8 @@ class RaceEnvironmentConfig:
         return "\n".join(x for x in parts if x)
 
     def planner_worldbody_xml(self, track) -> str:
-        # Test-time terrain/task geometry is known to MPPI.  The pretrained PPO
-        # policy remains unchanged and was trained only on flat-ground running.
-        # This makes terrain and box experiments task transfer, not hidden model
-        # mismatch experiments.
+        # Test-time terrain/task geometry is known to MPPI, so terrain and task
+        # experiments are not hidden model-mismatch experiments.
         parts: list[str] = []
         if self.terrain != "flat":
             parts.append(build_terrain_worldbody_xml(
@@ -657,7 +649,7 @@ def build_sled_model_xml(
 
     # This marker is consumed before MuJoCo compilation and replaced by a site
     # on the original robot root body. Keeping it in the environment fragment
-    # avoids modifying the pretrained robot XML on disk.
+    # avoids modifying the source robot XML on disk.
     root_site = ET.Element("race_root_site", {
         "name": TOW_ROBOT_SITE_NAME,
         "type": "sphere",
